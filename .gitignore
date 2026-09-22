@@ -1,0 +1,11 @@
+# Everything the Makefile produces: the kernel, the loader, the utilities,
+# the filesystem and the disk image. `make` rebuilds all of it from src.
+build/
+
+# The firmware's copy of its own variables, which `make run` puts beside the
+# build so that booting BaxOS does not write to the system's.
+*.fd
+
+# Screenshots and logs from driving a booted machine.
+*.ppm
+*.log

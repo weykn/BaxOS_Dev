@@ -1,0 +1,6 @@
+-Isrc/kernel
+-std=gnu11
+-ffreestanding
+-fno-pic
+-mno-red-zone
+-mgeneral-regs-only
