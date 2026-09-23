@@ -23,8 +23,10 @@
 #define SECTOR_SIZE 512
 #define PAGE_SIZE   4096
 
-static void window_map(void);
 static uint64_t write_protect(bool on);
+static void window_reset(void);
+static bool map_page(uint64_t addr);
+static bool loaded_flat;        /* the program is in the window, not a region */
 
 /* Linux answers a failed call with the negated error number, and a libc
    tells the two apart by the result being a small negative. -1 on its own
@@ -46,6 +48,12 @@ static uint64_t write_protect(bool on);
 #define ENOEXEC 8
 #define ENOTDIR 20
 #define ERANGE  34
+#define ECHILD 10
+#define ENOSPC 28
+#define EPERM   1
+#define ENOTEMPTY 39
+#define ENFILE 23
+#define EPIPE  32
 
 /* The arguments of the call being handled, all six of them. Handlers take
    the first three, which is all but a few of them want; the rest read the
@@ -55,7 +63,13 @@ static uint64_t write_protect(bool on);
 static uint64_t arg[6];
 
 /* Defined further down, where the loader and the page tables are. */
-static uint64_t sys_spawn(uint64_t path, uint64_t argv, uint64_t out);
+static uint64_t sys_execve(uint64_t path, uint64_t argv, uint64_t envp);
+static uint64_t sys_fork(uint64_t a, uint64_t b, uint64_t c);
+static uint64_t sys_clone(uint64_t flags, uint64_t stack, uint64_t parent_tid);
+static uint64_t sys_wait4(uint64_t pid, uint64_t status, uint64_t options);
+static uint64_t sys_pipe(uint64_t out, uint64_t b, uint64_t c);
+static uint64_t sys_pipe2(uint64_t out, uint64_t flags, uint64_t c);
+static uint64_t sys_getrandom(uint64_t buf, uint64_t length, uint64_t flags);
 static struct efi_boot_services *services(void);
 static bool fits(uint64_t addr, uint64_t size);
 static bool claim(uint64_t addr, uint64_t size);
@@ -69,13 +83,13 @@ static uint64_t started_base;   /* where the loader went, 0 without one */
    fits the fixed window; the big region is for what a Linux program needs,
    and a program that stays in the window is a program the kernel can put
    aside and give back, which is what lets the shell start another. */
-static bool loaded_flat;
 static uint64_t started_phdr, started_entry;
 static uint64_t started_phent, started_phnum;
 
 /* In syscall_entry.asm. */
 void syscall_entry(void);
-void fault_entry(void);
+extern const char trap_stubs[];     /* one 16-byte stub per exception vector */
+extern uint64_t user_cs, user_ss;   /* ring 3's selectors, for the iretq frame */
 void page_fault_entry(void);
 int  user_enter(uint64_t entry, uint64_t stack);
 __attribute__((noreturn)) void user_exit(int code);
@@ -164,11 +178,61 @@ static struct handle {
 #define CONSOLE_MARK 0xFFFFFFFDu    /* the screen and the keyboard */
 #define PROCDIR_MARK 0xFFFFFFFCu    /* /proc, which is not on the disk */
 #define PROC_MARK    0xFFFFFFFBu    /* one of the commands in it */
-#define FIRST_MARK   PROC_MARK      /* below this, a start is a sector */
+#define PIPE_MARK    0xFFFFFFFAu    /* one end of a pipe */
+#define DEV_MARK     0xFFFFFFF9u    /* one of the made-up files in /dev */
+#define FIRST_MARK   DEV_MARK       /* below this, a start is a sector */
 
 /* Where a made-up file's number starts, clear of any real one: those are
    sector numbers, and the disk is far smaller than this. */
 #define PROC_INO 0x01000000u
+
+/* ---- /dev ----------------------------------------------------------------
+ *
+ * The handful of files every Linux program expects to be able to open. None
+ * of them is on the disk and none of them needs to be: what they do is so
+ * little that they are a switch in read and another in write.
+ *
+ * /dev/null is where a shell sends output it does not want, and a program
+ * given nowhere to put something and no /dev/null to put it stops. */
+
+enum dev {
+    DEV_NULL = 1, DEV_ZERO, DEV_FULL, DEV_RANDOM, DEV_TTY,
+};
+
+static const struct {
+    const char *name;
+    enum dev    which;
+} devices[] = {
+    { "/dev/null",    DEV_NULL   },
+    { "/dev/zero",    DEV_ZERO   },
+    { "/dev/full",    DEV_FULL   },
+    { "/dev/random",  DEV_RANDOM },
+    { "/dev/urandom", DEV_RANDOM },
+    { "/dev/tty",     DEV_TTY    },
+    { "/dev/stdin",   DEV_TTY    },
+    { "/dev/stdout",  DEV_TTY    },
+    { "/dev/stderr",  DEV_TTY    },
+    { "/dev/console", DEV_TTY    },
+};
+
+#define DEVICES (sizeof devices / sizeof devices[0])
+
+/* Which of them a path names, or 0. */
+static enum dev dev_named(const char *name) {
+    if (name == NULL) {
+        return 0;
+    }
+    for (unsigned i = 0; i < DEVICES; i++) {
+        if (strcmp(name, devices[i].name) == 0) {
+            return devices[i].which;
+        }
+    }
+    return 0;
+}
+
+static bool dev_folder(const char *name) {
+    return name != NULL && (strcmp(name, "/dev") == 0 || strcmp(name, "/dev/") == 0);
+}
 
 static struct handle *handle_of(uint64_t fd) {
     if (fd >= PROGRAM_FILES) {
@@ -198,18 +262,105 @@ static void handles_reset(void) {
     }
 }
 
+/* ---- pipes ---------------------------------------------------------------
+ *
+ * A buffer with a read end and a write end, both ordinary descriptors. It
+ * grows as it is written to, since the program filling it has to finish
+ * before the one draining it starts and there is no way to push back. */
+
+#define PIPES      4
+#define PIPE_FIRST 8192
+#define PIPE_MAX   (1024 * 1024)
+
+static struct pipe {
+    char    *data;
+    uint32_t size, len, read_at;
+    unsigned refs;                  /* descriptors on either end */
+} pipes[PIPES];
+
+static struct pipe *pipe_of(const struct handle *h) {
+    return h != NULL && h->start == PIPE_MARK && h->folder > 0 &&
+           h->folder <= PIPES && pipes[h->folder - 1].data != NULL
+         ? &pipes[h->folder - 1] : NULL;
+}
+
+static void pipe_drop(struct pipe *p) {
+    if (p != NULL && p->refs > 0 && --p->refs == 0) {
+        services()->free_pool(p->data);
+        *p = (struct pipe){ 0 };
+    }
+}
+
+/* Every pipe the open files hold, counted once more or once less: what the
+   program being put aside still has open, so that a child closing its end
+   does not take the buffer out from under it. */
+static void pipes_hold(int by) {
+    for (unsigned fd = 0; fd < PROGRAM_FILES; fd++) {
+        struct pipe *p = handles[fd].used != 0 ? pipe_of(&handles[fd]) : NULL;
+
+        if (p == NULL) {
+            continue;
+        }
+        if (by > 0) {
+            p->refs++;
+        } else {
+            pipe_drop(p);
+        }
+    }
+}
+
+/* Adds to the buffer, growing it if there is room to. */
+static uint64_t pipe_write(struct pipe *p, const char *from, uint64_t count) {
+    struct efi_boot_services *bs = services();
+
+    if (p->len + count > p->size) {
+        uint32_t want = p->size;
+        void *bigger = NULL;
+
+        while (want < p->len + count && want < PIPE_MAX) {
+            want *= 2;
+        }
+        if (want < p->len + count) {
+            count = want - p->len;  /* as much of it as will ever fit */
+        }
+        if (count == 0) {
+            return ERR(EPIPE);
+        }
+        if (EFI_ERROR(bs->allocate_pool(EFI_LOADER_DATA, want, &bigger))) {
+            return ERR(ENOMEM);
+        }
+        memcpy(bigger, p->data, p->len);
+        bs->free_pool(p->data);
+        p->data = bigger;
+        p->size = want;
+    }
+    memcpy(p->data + p->len, from, (size_t)count);
+    p->len += (uint32_t)count;
+    return count;
+}
+
+static uint32_t pipe_left(const struct pipe *p) {
+    return p->len - p->read_at;
+}
+
+static uint64_t pipe_read(struct pipe *p, char *to, uint64_t count) {
+    uint32_t left = p->len - p->read_at;
+
+    if (count > left) {
+        count = left;
+    }
+    memcpy(to, p->data + p->read_at, (size_t)count);
+    p->read_at += (uint32_t)count;
+    return count;
+}
+
 static uint64_t sys_exit(uint64_t code, uint64_t b, uint64_t c) {
     (void)b;
     (void)c;
     user_exit((int)code);
 }
 
-static uint64_t sys_write(uint64_t fd, uint64_t text, uint64_t length) {
-    struct handle *h = handle_of(fd);
-
-    if (!user_range(text, length)) {
-        return ERR(EFAULT);
-    }
+static uint64_t write_to(struct handle *h, uint64_t text, uint64_t length) {
     if (h == NULL) {
         return ERR(EBADF);
     }
@@ -228,15 +379,32 @@ static uint64_t sys_write(uint64_t fd, uint64_t text, uint64_t length) {
         }
         return length;
     }
+    if (h->start == PIPE_MARK) {
+        struct pipe *p = pipe_of(h);
+
+        return p == NULL || h->size == 0 ? ERR(EBADF)
+                                         : pipe_write(p, (const char *)text, length);
+    }
+    if (h->start == DEV_MARK) {
+        /* Written to nowhere, and gone. /dev/full is the one that cannot
+           take it, which is what it is for. */
+        return h->folder == DEV_FULL ? ERR(ENOSPC) : length;
+    }
     if (h->start != CONSOLE_MARK) {
         return ERR(EBADF);          /* a file open for reading */
     }
-    /* The screen - and only from the program's own memory, or it could print
-       the kernel's. */
     for (uint64_t i = 0; i < length; i++) {
         vga_putc(((const char *)text)[i]);
     }
     return length;
+}
+
+static uint64_t sys_write(uint64_t fd, uint64_t text, uint64_t length) {
+    /* Only from the program's own memory, or it could print the kernel's. */
+    if (!user_range(text, length)) {
+        return ERR(EFAULT);
+    }
+    return write_to(handle_of(fd), text, length);
 }
 
 /* Which of a few descriptors can be read or written without waiting.
@@ -282,6 +450,13 @@ static uint64_t wait_ready(uint64_t nfds, uint64_t readfds, uint64_t writefds,
         }
         if (is_console(fd)) {
             console_bits |= bit;
+        } else if (handles[fd].start == PIPE_MARK) {
+            struct pipe *p = pipe_of(&handles[fd]);
+
+            /* A pipe with nothing left in it is at its end, which is a read
+               that returns nothing rather than a wait. */
+            (void)p;
+            ready |= bit;           /* what is in it, or its end */
         } else {
             ready |= bit;           /* a file is always there to be read */
         }
@@ -378,6 +553,23 @@ static uint64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count) {
         h->offset += (uint32_t)got;
         return got;
     }
+    if (h->start == PIPE_MARK) {
+        struct pipe *p = pipe_of(h);
+
+        /* The end of what is there is the end of the input: whatever filled
+           it has already finished by the time anything reads. */
+        return p == NULL || h->size != 0 ? ERR(EBADF) : pipe_read(p, (char *)buf, count);
+    }
+    if (h->start == DEV_MARK) {
+        if (h->folder == DEV_NULL) {
+            return 0;               /* nothing in it, ever */
+        }
+        if (h->folder == DEV_RANDOM) {
+            return sys_getrandom(buf, count, 0);
+        }
+        memset((void *)buf, 0, (size_t)count);
+        return count;
+    }
     if (h->start >= FIRST_MARK) {
         return ERR(EBADF);          /* a folder, or a file being written */
     }
@@ -405,9 +597,16 @@ static uint64_t give_handle(struct handle h) {
 static uint64_t open_name(const char *name, uint64_t flags) {
     struct fs_file file;
     unsigned folder;
+    enum dev which;
 
     if (name == NULL) {
         return ERR(EINVAL);
+    }
+    if ((which = dev_named(name)) != 0) {
+        if (which == DEV_TTY) {
+            return give_handle((struct handle){ .start = CONSOLE_MARK });
+        }
+        return give_handle((struct handle){ .start = DEV_MARK, .folder = which });
     }
     if ((flags & O_ACCMODE) != O_RDONLY) {
         /* Open for writing. The name is kept, because that is what a write
@@ -486,9 +685,51 @@ static uint64_t sys_open(uint64_t path, uint64_t flags, uint64_t mode) {
     return open_name(user_string(path), flags);
 }
 
+/* A relative path, spelled out from a folder a program already has open.
+ *
+ * Every call with "at" in its name takes one of those, and a program walking
+ * a tree uses nothing else: it opens a folder, reads it, and then asks about
+ * what it found relative to that descriptor rather than by a path from the
+ * root. `find` does exactly this, and ignoring the descriptor made it look
+ * for everything in the working directory.
+ *
+ * AT_FDCWD, and an absolute path whatever the descriptor says, are the
+ * working directory's business and go through untouched. */
+#define AT_FDCWD (-100)
+
+static const char *at_path(uint64_t dirfd, const char *name, char *out, size_t max) {
+    struct handle *h;
+    struct fs_file folder;
+    size_t n;
+
+    if (name == NULL || name[0] == '/' || (int32_t)dirfd == AT_FDCWD) {
+        return name;
+    }
+    h = handle_of(dirfd);
+    if (h == NULL || h->start != FOLDER_MARK) {
+        return name;                /* not a folder: nothing to be relative to */
+    }
+    if (h->folder == 0) {
+        folder.name[0] = '\0';      /* the root */
+    } else if (fs_file(h->folder - 1, &folder) != 0) {
+        return name;
+    }
+    /* The table spells a folder without a leading slash and with a trailing
+       one, which is the one place a path is put together here. */
+    n = strlen(folder.name);
+    if (n + strlen(name) + 2 > max) {
+        return NULL;
+    }
+    out[0] = '/';
+    memcpy(out + 1, folder.name, n);
+    strcpy(out + 1 + n, name);
+    return out;
+}
+
 static uint64_t sys_openat(uint64_t dirfd, uint64_t path, uint64_t flags) {
-    (void)dirfd;                    /* relative paths already follow the cwd */
-    return open_name(user_string(path), flags);
+    char joined[FS_NAME_LEN];
+
+    return open_name(at_path(dirfd, user_string(path), joined, sizeof joined), flags);
 }
 
 static uint64_t sys_close(uint64_t fd, uint64_t b, uint64_t c) {
@@ -500,6 +741,10 @@ static uint64_t sys_close(uint64_t fd, uint64_t b, uint64_t c) {
         return ERR(EBADF);
     }
     h->used = 0;
+    if (h->start == PIPE_MARK) {
+        pipe_drop(pipe_of(h));
+        return 0;
+    }
     /* The name a file is written back to goes only with the last descriptor
        holding it: a copy made with dup keeps the file open. */
     if (h->writer > 0) {
@@ -524,20 +769,34 @@ static uint64_t dup_to(uint64_t fd, uint64_t to) {
         return ERR(EBADF);
     }
     if (to != fd) {
+        struct pipe *p = pipe_of(h);
+
         if (handles[to].used != 0) {
             sys_close(to, 0, 0);
         }
         handles[to] = *h;
+        if (p != NULL) {
+            p->refs++;
+        }
     }
     return to;
 }
 
 static uint64_t sys_dup(uint64_t fd, uint64_t b, uint64_t c) {
     struct handle *h = handle_of(fd);
+    struct pipe *p = pipe_of(h);
+    uint64_t made;
 
     (void)b;
     (void)c;
-    return h == NULL ? ERR(EBADF) : give_handle(*h);
+    if (h == NULL) {
+        return ERR(EBADF);
+    }
+    made = give_handle(*h);
+    if ((int64_t)made >= 0 && p != NULL) {
+        p->refs++;
+    }
+    return made;
 }
 
 static uint64_t sys_dup2(uint64_t fd, uint64_t to, uint64_t c) {
@@ -619,6 +878,39 @@ static uint64_t sys_chdir(uint64_t path, uint64_t b, uint64_t c) {
     return fs_chdir(name) == 0 ? 0 : ERR(ENOENT);
 }
 
+/* A folder that is already open, named by its entry in the table. A program
+   that walks a tree keeps its way back open rather than by name, which is
+   what `df` does before it will report anything. */
+static uint64_t sys_fchdir(uint64_t fd, uint64_t b, uint64_t c) {
+    struct handle *h = handle_of(fd);
+    const char *name;
+
+    (void)b;
+    (void)c;
+    if (h == NULL || h->start != FOLDER_MARK) {
+        return ERR(EBADF);
+    }
+    if (h->folder == 0) {
+        return fs_chdir("/") == 0 ? 0 : ERR(ENOENT);
+    }
+    struct fs_file entry;
+    char path[FS_NAME_LEN + 1];
+
+    if (fs_file(h->folder - 1, &entry) != 0) {
+        return ERR(EBADF);
+    }
+    /* The table spells a folder with no leading slash, and a name without one
+       is resolved from where we are now - which is not where the descriptor
+       is. `mkdir -p a/b` saves the working directory, descends into a, and
+       comes back through here; given a relative name it came back to a/<the
+       directory it started in>, and nothing after that was where it looked
+       for it. */
+    path[0] = '/';
+    strcpy(path + 1, entry.name);
+    name = path;
+    return fs_chdir(name) == 0 ? 0 : ERR(ENOENT);
+}
+
 /* ---- what a libc asks for ------------------------------------------------
  *
  * These are the calls a program makes before it does anything of its own:
@@ -632,11 +924,12 @@ static uint64_t sys_chdir(uint64_t path, uint64_t b, uint64_t c) {
 static uint64_t program_break;   /* the heap's end */
 static uint64_t program_map;     /* where the next mmap goes */
 
-/* Where the heap starts, and where mmap starts handing memory out. Both sit
-   in the program's own region when there is one, well clear of anything
-   loaded; without one they share the old fixed window with the program. */
+/* Where the heap starts, and where mmap starts handing memory out: in the
+   program's own region where it has one, and otherwise sharing the fixed
+   window with the program, the heap from the top of it and mmap from the
+   far end growing down. */
 static void program_memory_start(uint64_t after) {
-    if (vm_base() != 0 && !loaded_flat) {
+    if (!loaded_flat) {
         program_break = vm_base() + USER_BRK;
         program_map = vm_base() + USER_MMAP;
         return;
@@ -667,6 +960,147 @@ static uint64_t sys_brk(uint64_t addr, uint64_t b, uint64_t c) {
 #define MAP_FIXED     0x10
 #define MAP_ANONYMOUS 0x20
 
+/* ---- mappings a page fault fills in ---------------------------------------
+ *
+ * A loader maps a library whole and then uses a fraction of it: `uname` runs
+ * on a few hundred kilobytes of a two-megabyte C library. Reading all of it,
+ * into pages cleared first and bought one by one, was most of what starting a
+ * program cost.
+ *
+ * So a file mapping is a promise rather than a copy. mmap writes down where
+ * the memory is and what belongs there, and nothing is read until the program
+ * touches it - then a chunk at a time, since a read costs its round trip to
+ * the firmware and not its bytes. Memory the program never looks at is never
+ * bought, never cleared and never read.
+ *
+ * The promises belong to the program, so they are put aside and brought back
+ * with everything else of its when it starts another. */
+
+#define MAPPINGS   16
+#define FILL_PAGES 16       /* pages read around the one that faulted */
+
+static struct mapping {
+    uint64_t at, end;       /* the memory it covers; at == end when free */
+    uint64_t offset;        /* where in the file `at` is */
+    uint32_t start, size;   /* the file: its first sector, and its length */
+} mappings[MAPPINGS];
+
+/* Forgets whatever was promised for addr .. addr + size, which is what a
+   mapping laid over an older one means. A hole in the middle of one leaves
+   the part before it, since that is the only part a loader ever goes back
+   to. */
+static void map_trim(uint64_t at, uint64_t size) {
+    uint64_t end = at + size;
+
+    for (unsigned i = 0; i < MAPPINGS; i++) {
+        struct mapping *m = &mappings[i];
+
+        if (m->at == m->end || end <= m->at || at >= m->end) {
+            continue;
+        }
+        if (at <= m->at && end >= m->end) {
+            m->at = m->end = 0;
+        } else if (at <= m->at) {
+            m->offset += end - m->at;
+            m->at = end;
+        } else {
+            m->end = at;
+        }
+    }
+}
+
+static bool map_record(uint64_t at, uint64_t size, uint32_t start, uint32_t bytes,
+                       uint64_t offset) {
+    map_trim(at, size);
+    for (unsigned i = 0; i < MAPPINGS; i++) {
+        if (mappings[i].at == mappings[i].end) {
+            mappings[i] = (struct mapping){ .at = at, .end = at + size,
+                                            .offset = offset,
+                                            .start = start, .size = bytes };
+            return true;
+        }
+    }
+    return false;               /* no room to promise: read it now instead */
+}
+
+/* Makes good on the promises covering the page that faulted: a chunk of
+   pages around it, with every file that has something to say about them read
+   into it.
+ *
+ * A promise need not start or end on a page boundary - an ELF segment rarely
+ * does - so the page that faulted is matched against the bytes a promise
+ * covers rather than against whole pages, and a page two promises share gets
+ * both of their stretches. */
+static bool map_fill(uint64_t addr) {
+    uint64_t page = addr & ~(uint64_t)(PAGE_SIZE - 1);
+    uint64_t chunk = FILL_PAGES * PAGE_SIZE;
+    uint64_t first = 0, last = 0;
+    bool found = false;
+
+    /* The chunk to fill: the one this page falls in, counting from the start
+       of the first promise that covers the page. */
+    for (unsigned i = 0; i < MAPPINGS && !found; i++) {
+        struct mapping *m = &mappings[i];
+        uint64_t base;
+
+        if (m->at == m->end || m->at >= page + PAGE_SIZE || m->end <= page) {
+            continue;
+        }
+        base = m->at & ~(uint64_t)(PAGE_SIZE - 1);
+        uint64_t top = (m->end + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
+
+        first = base + (page - base) / chunk * chunk;
+        last = first + chunk;
+        if (last > top) {
+            last = top;
+        }
+        found = true;
+    }
+    if (!found) {
+        return false;
+    }
+    /* A page already there has already been filled, and what the program has
+       since written to it is its own: this fault is a write to a page a fork
+       write-protected, and reading over it would undo the program's work. */
+    if (vm_mapped(page)) {
+        return false;
+    }
+    while (first < page && vm_mapped(first)) {
+        first += PAGE_SIZE;
+    }
+    while (last > page + PAGE_SIZE && vm_mapped(last - PAGE_SIZE)) {
+        last -= PAGE_SIZE;
+    }
+    if (!vm_reserve(first, last - first)) {
+        return false;
+    }
+    /* Whatever the pages are owed. Anything no promise covers, and anything
+       past the end of a file, is the zeroes the pages arrived as. */
+    for (unsigned i = 0; i < MAPPINGS; i++) {
+        struct mapping *m = &mappings[i];
+        struct fs_file file;
+        uint64_t from, into, count;
+
+        if (m->at == m->end || m->at >= last || m->end <= first) {
+            continue;
+        }
+        into = m->at > first ? m->at : first;
+        count = (m->end < last ? m->end : last) - into;
+        from = m->offset + (into - m->at);
+        file = (struct fs_file){ .start = m->start, .size = m->size };
+        if (from >= file.size) {
+            continue;
+        }
+        if (count > file.size - from) {
+            count = file.size - from;
+        }
+        if (read_at(&file, from, (void *)into, count) < 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static uint64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot) {
     uint64_t flags = arg[3], fd = arg[4], offset = arg[5];
     uint64_t size = (length + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
@@ -689,16 +1123,26 @@ static uint64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot) {
         program_map -= size;
         at = program_map;
     }
-    if (!fits(at, size) || !claim(at, size)) {
+    if (!fits(at, size)) {
         return ERR(ENOMEM);
     }
     if ((flags & MAP_ANONYMOUS) != 0) {
-        /* New memory is empty memory. The pages may well have been mapped
-           already - a loader reserves a library's whole span and then maps
-           pieces over it - so this is what makes the .bss of a library the
-           zeroes it is supposed to be rather than whatever the file had at
-           that offset. */
-        memset((void *)at, 0, size);
+        /* New memory is empty memory, and a page of this region arrives empty
+           - so somewhere of the program's choosing needs nothing done to it
+           at all until it is touched. A loader reserves a library's whole
+           span this way and then maps pieces over it; buying the span was
+           buying two megabytes to throw most of it away.
+
+           A fixed address is different: it is somewhere that may already hold
+           something, and the .bss of a library is exactly that - the tail of
+           a segment already read in, which has to read as zeroes. */
+        map_trim(at, size);
+        if ((flags & MAP_FIXED) != 0) {
+            if (!claim(at, size)) {
+                return ERR(ENOMEM);
+            }
+            memset((void *)at, 0, size);
+        }
         return at;
     }
 
@@ -707,6 +1151,12 @@ static uint64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot) {
 
     if (h == NULL || h->start >= CONSOLE_MARK) {
         return ERR(EBADF);
+    }
+    if (map_record(at, size, h->start, h->size, offset)) {
+        return at;                  /* read when, and if, it is touched */
+    }
+    if (!claim(at, size)) {
+        return ERR(ENOMEM);
     }
     if (offset < h->size) {
         count = h->size - offset;
@@ -726,6 +1176,7 @@ static uint64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot) {
 
 static uint64_t sys_munmap(uint64_t addr, uint64_t length, uint64_t c) {
     (void)c;
+    map_trim(addr, length);
     if (vm_holds(addr, length)) {
         vm_release(addr, length);   /* the pages go back to the firmware */
     }
@@ -754,37 +1205,72 @@ static uint64_t sys_zeroed(uint64_t out, uint64_t b, uint64_t c) {
     return 0;
 }
 
+/* What the filesystem said, as a program's libc expects to hear it. Getting
+   this wrong is not cosmetic: `mkdir -p a/b` creates the parent only when it
+   is told the parent is missing, and anything else it reports and stops. */
+static uint64_t fs_errno(int err) {
+    switch (err) {
+    case 0:            return 0;
+    case FS_ENOENT:    return ERR(ENOENT);
+    case FS_EEXIST:    return ERR(EEXIST);
+    case FS_ENOSPC:    return ERR(ENOSPC);
+    case FS_ENOTEMPTY: return ERR(ENOTEMPTY);
+    case FS_EINVAL:    return ERR(EINVAL);
+    case FS_EIO:       return ERR(EIO);
+    default:           return ERR(EACCES);
+    }
+}
+
 static uint64_t sys_unlink(uint64_t path, uint64_t b, uint64_t c) {
     const char *name = user_string(path);
-    int err;
 
     (void)b;
     (void)c;
     if (name == NULL) {
         return ERR(EFAULT);
     }
-    err = fs_remove(name);
-    return err == 0 ? 0 : err == FS_ENOENT ? ERR(ENOENT) : ERR(EACCES);
+    return fs_errno(fs_remove(name));
+}
+
+/* The same, from a folder the program already has open - which is what a
+   libc actually calls. coreutils' rm is unlinkat and nothing else. */
+static uint64_t sys_unlinkat(uint64_t dirfd, uint64_t path, uint64_t flags) {
+    char joined[FS_NAME_LEN];
+    const char *name = at_path(dirfd, user_string(path), joined, sizeof joined);
+
+    (void)flags;                    /* AT_REMOVEDIR: a folder goes the same way */
+    if (name == NULL) {
+        return ERR(EFAULT);
+    }
+    return fs_errno(fs_remove(name));
 }
 
 static uint64_t sys_mkdir(uint64_t path, uint64_t mode, uint64_t c) {
     const char *name = user_string(path);
-    int err;
 
     (void)mode;
     (void)c;
     if (name == NULL) {
         return ERR(EFAULT);
     }
-    err = fs_mkdir(name);
-    return err == 0 ? 0 : err == FS_EEXIST ? ERR(EEXIST) : ERR(EACCES);
+    return fs_errno(fs_mkdir(name));
+}
+
+static uint64_t sys_mkdirat(uint64_t dirfd, uint64_t path, uint64_t mode) {
+    char joined[FS_NAME_LEN];
+    const char *name = at_path(dirfd, user_string(path), joined, sizeof joined);
+
+    (void)mode;
+    if (name == NULL) {
+        return ERR(EFAULT);
+    }
+    return fs_errno(fs_mkdir(name));
 }
 
 static uint64_t sys_rename(uint64_t from, uint64_t to, uint64_t c) {
     const char *old_name = user_string(from);
     char kept[FS_NAME_LEN];
     const char *new_name;
-    int err;
 
     (void)c;
     if (old_name == NULL || strlen(old_name) + 1 > sizeof kept) {
@@ -797,9 +1283,7 @@ static uint64_t sys_rename(uint64_t from, uint64_t to, uint64_t c) {
     if (new_name == NULL) {
         return ERR(EFAULT);
     }
-    err = fs_rename(kept, new_name);
-    return err == 0 ? 0 : err == FS_ENOENT ? ERR(ENOENT)
-         : err == FS_EEXIST ? ERR(EEXIST) : ERR(EACCES);
+    return fs_errno(fs_rename(kept, new_name));
 }
 
 /* How much disk there is and how much of it is spoken for. */
@@ -810,12 +1294,13 @@ struct statfs {
     int64_t  namelen, frsize, flags, spare[4];
 };
 
-static uint64_t sys_statfs(uint64_t path, uint64_t out, uint64_t c) {
+/* The same figures whichever file is asked about: there is one filesystem,
+   and every path on the machine is on it. */
+static uint64_t statfs_fill(uint64_t out) {
     struct statfs *stats = (struct statfs *)out;
     struct fs_stats disk;
 
-    (void)c;
-    if (user_string(path) == NULL || !user_range(out, sizeof *stats)) {
+    if (!user_range(out, sizeof *stats)) {
         return ERR(EFAULT);
     }
     if (fs_get_stats(&disk) != 0) {
@@ -832,6 +1317,11 @@ static uint64_t sys_statfs(uint64_t path, uint64_t out, uint64_t c) {
     stats->ffree = FS_MAX_FILES - disk.files;
     stats->namelen = FS_NAME_LEN - 1;
     return 0;
+}
+
+static uint64_t sys_statfs(uint64_t path, uint64_t out, uint64_t c) {
+    (void)c;
+    return user_string(path) == NULL ? ERR(EFAULT) : statfs_fill(out);
 }
 
 /* Switching the machine off, or starting it again, the way Linux spells it:
@@ -991,15 +1481,33 @@ static uint64_t sys_access(uint64_t path, uint64_t mode, uint64_t c) {
 
     (void)mode;
     (void)c;
-    if (name != NULL && (proc_command(name) != NULL || proc_folder(name))) {
+    if (name == NULL) {
+        return ERR(EFAULT);
+    }
+    if (proc_command(name) != NULL || proc_folder(name) ||
+        dev_named(name) != 0 || dev_folder(name)) {
         return 0;
     }
-    return name != NULL && fs_stat(name, &file) == 0 ? 0 : ERR(ENOENT);
+    if (fs_stat(name, &file) == 0) {
+        return 0;
+    }
+    return fs_folder_at(name, &(unsigned){ 0 }) == 0 ? 0 : ERR(ENOENT);
 }
 
 static uint64_t sys_faccessat(uint64_t dirfd, uint64_t path, uint64_t mode) {
-    (void)dirfd;
-    return sys_access(path, mode, 0);
+    char joined[FS_NAME_LEN];
+    const char *name = at_path(dirfd, user_string(path), joined, sizeof joined);
+    struct fs_file file;
+
+    (void)mode;
+    if (name == NULL) {
+        return ERR(EFAULT);
+    }
+    if (proc_command(name) != NULL || proc_folder(name) ||
+        dev_named(name) != 0 || dev_folder(name) || fs_stat(name, &file) == 0) {
+        return 0;
+    }
+    return fs_folder_at(name, &(unsigned){ 0 }) == 0 ? 0 : ERR(ENOENT);
 }
 
 /* One thread, so nothing can ever be waiting to be woken and nothing that
@@ -1067,79 +1575,10 @@ static uint64_t sys_umask(uint64_t mask, uint64_t b, uint64_t c) {
     return 022;
 }
 
+#define S_IFIFO 0010000
 #define S_IFCHR 0020000
 #define S_IFDIR 0040000
 #define S_IFREG 0100000
-
-/* The newer stat, which takes the same answers in a different shape. */
-struct statx_timestamp {
-    int64_t  seconds;
-    uint32_t nanoseconds, pad;
-};
-
-struct statx {
-    uint32_t mask, blksize;
-    uint64_t attributes;
-    uint32_t nlink, uid, gid;
-    uint16_t mode, pad;
-    uint64_t ino, size, blocks, attributes_mask;
-    struct statx_timestamp atime, btime, ctime, mtime;
-    uint32_t rdev_major, rdev_minor, dev_major, dev_minor;
-    uint64_t rest[14];
-};
-
-#define STATX_BASIC 0x7ff
-
-static uint64_t sys_statx(uint64_t dirfd, uint64_t path, uint64_t flags) {
-    struct statx *out = (struct statx *)arg[4];
-    const char *name = user_string(path);
-    struct fs_file file;
-    bool folder = false;
-
-    (void)dirfd;
-    (void)flags;
-    if (name == NULL || !user_range(arg[4], sizeof *out)) {
-        return ERR(EINVAL);
-    }
-    const struct proc_cmd *cmd = proc_command(name);
-
-    if (cmd != NULL || proc_folder(name)) {
-        memset(out, 0, sizeof *out);
-        out->mask = STATX_BASIC;
-        out->blksize = SECTOR_SIZE;
-        out->nlink = 1;
-        out->mode = (uint16_t)(cmd != NULL ? S_IFREG | 0755 : S_IFDIR | 0755);
-        out->ino = PROC_INO;
-        out->size = cmd != NULL ? proc_read(cmd, 0, NULL, 0) : 0;
-        out->dev_minor = 1;
-        return 0;
-    }
-    if (fs_stat(name, &file) != 0) {
-        char with_slash[FS_NAME_LEN];
-        size_t n = strlen(name);
-
-        if (n + 2 > FS_NAME_LEN) {
-            return ERR(ENOENT);
-        }
-        memcpy(with_slash, name, n);
-        with_slash[n] = '/';
-        with_slash[n + 1] = '\0';
-        if (fs_stat(with_slash, &file) != 0) {
-            return ERR(ENOENT);
-        }
-        folder = true;
-    }
-    memset(out, 0, sizeof *out);
-    out->mask = STATX_BASIC;
-    out->blksize = SECTOR_SIZE;
-    out->nlink = 1;
-    out->mode = (uint16_t)(folder ? S_IFDIR | 0755 : S_IFREG | 0644);
-    out->ino = file.start != 0 ? file.start : 1;
-    out->size = folder ? 0 : file.size;
-    out->blocks = (file.size + 511) / 512;
-    out->dev_minor = 1;
-    return 0;
-}
 
 /* Descriptors have no flags worth keeping here: a program setting
    close-on-exec is told it worked, and one asking gets nothing back. The
@@ -1183,6 +1622,8 @@ struct iovec {
     uint64_t length;
 };
 
+static uint64_t sys_readv(uint64_t fd, uint64_t vectors, uint64_t count);
+
 static uint64_t sys_writev(uint64_t fd, uint64_t vectors, uint64_t count) {
     uint64_t written = 0;
 
@@ -1205,6 +1646,92 @@ static uint64_t sys_writev(uint64_t fd, uint64_t vectors, uint64_t count) {
    There is no entropy source on the machine, so this is the clock stirred
    about - enough to keep the guard from being the same value every boot, and
    no more than that. */
+/* The same as read, into several buffers in turn. A short read on one of
+   them ends the whole call, as Linux's does. */
+static uint64_t sys_readv(uint64_t fd, uint64_t vectors, uint64_t count) {
+    const struct iovec *v = (const struct iovec *)vectors;
+    uint64_t total = 0;
+
+    if (!user_range(vectors, count * sizeof *v)) {
+        return ERR(EFAULT);
+    }
+    for (uint64_t i = 0; i < count; i++) {
+        uint64_t got;
+
+        if (v[i].length == 0) {
+            continue;
+        }
+        got = sys_read(fd, (uint64_t)v[i].base, v[i].length);
+        if ((int64_t)got < 0) {
+            return total > 0 ? total : got;
+        }
+        total += got;
+        if (got < v[i].length) {
+            break;
+        }
+    }
+    return total;
+}
+
+/* A write that does not move the descriptor, which is where it is written.
+   Only a file open for writing has anywhere to put one. */
+static uint64_t sys_pwrite64(uint64_t fd, uint64_t text, uint64_t count) {
+    struct handle *h = handle_of(fd);
+    uint64_t offset = arg[3];
+
+    if (!user_range(text, count)) {
+        return ERR(EFAULT);
+    }
+    if (h == NULL || h->start != WRITE_MARK) {
+        return ERR(EBADF);
+    }
+    if (fs_write_at(writer_names[h->writer - 1], (uint32_t)offset,
+                    (const void *)text, count) < 0) {
+        return ERR(EIO);
+    }
+    if (offset + count > h->size) {
+        h->size = (uint32_t)(offset + count);
+    }
+    return count;
+}
+
+/* poll, which is select spelled differently. Everything here is ready. */
+struct pollfd {
+    int32_t  fd;
+    int16_t  events, revents;
+};
+
+#define POLLIN  0x001
+#define POLLOUT 0x004
+
+static uint64_t sys_poll(uint64_t fds, uint64_t count, uint64_t timeout) {
+    struct pollfd *p = (struct pollfd *)fds;
+    uint64_t ready = 0;
+
+    (void)timeout;
+    if (!user_range(fds, count * sizeof *p)) {
+        return ERR(EFAULT);
+    }
+    for (uint64_t i = 0; i < count; i++) {
+        p[i].revents = 0;
+        if (handle_of((uint64_t)p[i].fd) == NULL) {
+            continue;
+        }
+        /* Reading the console waits for a key, so it is only ready once one
+           has been typed; everything else is there the moment it is asked
+           about. */
+        if ((p[i].events & POLLIN) != 0 &&
+            (!is_console((uint64_t)p[i].fd) || console_ready())) {
+            p[i].revents |= POLLIN;
+        }
+        if ((p[i].events & POLLOUT) != 0) {
+            p[i].revents |= POLLOUT;
+        }
+        ready += p[i].revents != 0;
+    }
+    return ready;
+}
+
 static uint64_t sys_getrandom(uint64_t buf, uint64_t length, uint64_t flags) {
     uint64_t state = efi_seconds() * 6364136223846793005ull + 1442695040888963407ull;
 
@@ -1253,13 +1780,74 @@ static uint64_t sys_prlimit64(uint64_t pid, uint64_t resource, uint64_t new_limi
            of the way puts it just under this, and one told it may have
            millions would ask for a descriptor this kernel has no room for. */
         old[0] = resource == RLIMIT_NOFILE ? PROGRAM_FILES
-               : PROGRAM_STACK - PROGRAM_BASE;
+               : loaded_flat ? PROGRAM_BYTES : USER_STACK_BYTES;
         old[1] = (uint64_t)-1;      /* RLIM64_INFINITY */
     }
     return 0;
 }
 
+/* Renaming from two folders a program already has open. renameat2's flags -
+   refusing to replace, swapping the two - are not offered: a shell's mv asks
+   for them, finds they are not there, and falls back to asking plainly. */
+static uint64_t sys_renameat(uint64_t olddir, uint64_t oldpath, uint64_t newdir) {
+    char joined[FS_NAME_LEN], kept[FS_NAME_LEN];
+    const char *old_name = at_path(olddir, user_string(oldpath), joined, sizeof joined);
+    const char *new_name;
+
+    if (old_name == NULL || strlen(old_name) + 1 > sizeof kept) {
+        return ERR(EFAULT);
+    }
+    memcpy(kept, old_name, strlen(old_name) + 1);
+    new_name = at_path(newdir, user_string(arg[3]), joined, sizeof joined);
+    if (new_name == NULL) {
+        return ERR(EFAULT);
+    }
+    return fs_errno(fs_rename(kept, new_name));
+}
+
+/* Nothing on this disk is a link, and nothing can be made one: a program told
+   so goes on to copy rather than stopping. */
+static uint64_t sys_no_links(uint64_t a, uint64_t b, uint64_t c) {
+    (void)a;
+    (void)b;
+    (void)c;
+    return ERR(EPERM);
+}
+
+/* Emptying a file by name, which is the only length anything truncates one
+   to here. */
+static uint64_t sys_truncate(uint64_t path, uint64_t length, uint64_t c) {
+    const char *name = user_string(path);
+
+    (void)c;
+    if (name == NULL) {
+        return ERR(EFAULT);
+    }
+    if (length != 0) {
+        return ERR(EINVAL);
+    }
+    return fs_write(name, NULL, 0) < 0 ? ERR(EIO) : 0;
+}
+
 /* Nothing here has a /proc to read a link out of. */
+/* The older pair, which name the resource and the place to put it rather
+   than a process as well. */
+static uint64_t sys_getrlimit(uint64_t resource, uint64_t out, uint64_t c) {
+    uint64_t kept = arg[3];
+    uint64_t result;
+
+    (void)c;
+    arg[3] = out;
+    result = sys_prlimit64(0, resource, 0);
+    arg[3] = kept;
+    return result;
+}
+
+static uint64_t sys_fstatfs(uint64_t fd, uint64_t out, uint64_t c) {
+    (void)c;
+    return handle_of(fd) == NULL ? ERR(EBADF) : statfs_fill(out);
+}
+
 static uint64_t sys_readlinkat(uint64_t dirfd, uint64_t path, uint64_t buf) {
     (void)dirfd;
     (void)path;
@@ -1286,6 +1874,27 @@ _Static_assert(sizeof(struct stat) == 144, "struct stat is what Linux's is");
    and inode of the file against the ones it holds, and would take two
    different libraries for the same one if they shared a number. The first
    sector serves, since no two files start in the same place. */
+/* The number a folder is known by, from its entry in the table, counting
+   from one. Nought is the root, which has no entry of its own - so every
+   folder's number is one past its entry's, leaving 1 for the root. A file
+   goes by its first sector instead, and those start far higher than the
+   table has entries, so the two can never collide.
+
+   Getting this wrong is not a small thing: a program walking a tree takes
+   two folders with one number for a loop, and stops. */
+static uint32_t folder_ino(unsigned one_based) {
+    return one_based + 1;
+}
+
+/* Whether a table entry is a folder: the filesystem spells one with a slash
+   on the end, and gives it no first sector - so the entry alone cannot be
+   told from an empty file without looking at the name. */
+static bool is_folder_entry(const struct fs_file *file) {
+    size_t n = strlen(file->name);
+
+    return n > 0 && file->name[n - 1] == '/';
+}
+
 static void fill_stat(struct stat *out, uint64_t size, bool folder, uint32_t start) {
     memset(out, 0, sizeof *out);
     out->dev = 1;
@@ -1297,19 +1906,19 @@ static void fill_stat(struct stat *out, uint64_t size, bool folder, uint32_t sta
     out->blocks = (int64_t)((size + 511) / 512);
 }
 
-static uint64_t sys_fstat(uint64_t fd, uint64_t out, uint64_t c) {
+/* What a descriptor is, for whoever is asking: fstat, and a statx of an
+   empty path, which is what a libc's fstat has become. */
+static uint64_t stat_of_handle(uint64_t fd, struct stat *st) {
     struct handle *h = handle_of(fd);
-    struct stat *st = (struct stat *)out;
 
-    (void)c;
-    if (!user_range(out, sizeof *st)) {
-        return ERR(EFAULT);
-    }
     if (h == NULL) {
         return ERR(EBADF);
     }
+    /* A folder is numbered by its table entry, one-based - the same number
+       getdents64 and newfstatat give it, so that a program walking a tree
+       can tell one folder from another. */
     fill_stat(st, h->size, h->start == FOLDER_MARK || h->start == PROCDIR_MARK,
-              h->start == FOLDER_MARK ? h->folder + 1 :
+              h->start == FOLDER_MARK ? folder_ino(h->folder) :
               h->start == PROC_MARK ? PROC_INO + h->folder :
               h->start == PROCDIR_MARK ? PROC_INO : h->start);
     if (h->start == CONSOLE_MARK) {
@@ -1319,17 +1928,128 @@ static uint64_t sys_fstat(uint64_t fd, uint64_t out, uint64_t c) {
         st->size = 0;
         st->blocks = 0;
         st->rdev = 0x0500 | fd;     /* a terminal, as Linux numbers them */
+    } else if (h->start == PIPE_MARK) {
+        struct pipe *p = pipe_of(h);
+
+        st->mode = S_IFIFO | 0600;
+        st->size = p == NULL ? 0 : pipe_left(p);
+        st->blocks = 0;
+    } else if (h->start == DEV_MARK) {
+        st->mode = S_IFCHR | 0666;
+        st->size = 0;
+        st->blocks = 0;
+        st->rdev = 0x0103;
     }
+    return 0;
+}
+
+static uint64_t sys_fstat(uint64_t fd, uint64_t out, uint64_t c) {
+    (void)c;
+    if (!user_range(out, sizeof(struct stat))) {
+        return ERR(EFAULT);
+    }
+    return stat_of_handle(fd, (struct stat *)out);
+}
+
+/* The newer stat, which takes the same answers in a different shape. */
+struct statx_timestamp {
+    int64_t  seconds;
+    uint32_t nanoseconds, pad;
+};
+
+struct statx {
+    uint32_t mask, blksize;
+    uint64_t attributes;
+    uint32_t nlink, uid, gid;
+    uint16_t mode, pad;
+    uint64_t ino, size, blocks, attributes_mask;
+    struct statx_timestamp atime, btime, ctime, mtime;
+    uint32_t rdev_major, rdev_minor, dev_major, dev_minor;
+    uint64_t rest[14];
+};
+
+#define STATX_BASIC 0x7ff
+
+static uint64_t sys_statx(uint64_t dirfd, uint64_t path, uint64_t flags) {
+    struct statx *out = (struct statx *)arg[4];
+    char joined[FS_NAME_LEN];
+    const char *given = user_string(path);
+    const char *name = at_path(dirfd, given, joined, sizeof joined);
+    struct fs_file file;
+    bool folder = false;
+
+    (void)flags;
+    if (name == NULL || !user_range(arg[4], sizeof *out)) {
+        return ERR(EINVAL);
+    }
+    /* An empty path is the descriptor itself - which is what a libc's fstat
+       has become, so this is the common case rather than a corner of one. */
+    if (given != NULL && given[0] == '\0') {
+        struct stat st;
+        uint64_t err = stat_of_handle(dirfd, &st);
+
+        if ((int64_t)err < 0) {
+            return err;
+        }
+        memset(out, 0, sizeof *out);
+        out->mask = STATX_BASIC;
+        out->blksize = (uint32_t)st.blksize;
+        out->nlink = 1;
+        out->mode = st.mode;
+        out->ino = st.ino;
+        out->size = st.size;
+        out->blocks = (uint64_t)st.blocks;
+        out->rdev_minor = (uint32_t)(st.rdev & 0xFF);
+        out->dev_minor = 1;
+        return 0;
+    }
+    const struct proc_cmd *cmd = proc_command(name);
+    enum dev which = dev_named(name);
+
+    if (cmd != NULL || proc_folder(name) || which != 0 || dev_folder(name)) {
+        memset(out, 0, sizeof *out);
+        out->mask = STATX_BASIC;
+        out->blksize = SECTOR_SIZE;
+        out->nlink = 1;
+        out->mode = (uint16_t)(which != 0 ? S_IFCHR | 0666 :
+                               cmd != NULL ? S_IFREG | 0755 : S_IFDIR | 0755);
+        out->ino = PROC_INO;
+        out->size = cmd != NULL ? proc_read(cmd, 0, NULL, 0) : 0;
+        out->dev_minor = 1;
+        return 0;
+    }
+    if (fs_stat(name, &file) != 0 || is_folder_entry(&file)) {
+        unsigned index = 0;
+
+        if (fs_folder_at(name, &index) != 0) {
+            return ERR(ENOENT);
+        }
+        file = (struct fs_file){ .start = folder_ino(index) };
+        folder = true;
+    }
+    memset(out, 0, sizeof *out);
+    out->mask = STATX_BASIC;
+    out->blksize = SECTOR_SIZE;
+    out->nlink = 1;
+    out->mode = (uint16_t)(folder ? S_IFDIR | 0755 : S_IFREG | 0644);
+    out->ino = file.start != 0 ? file.start : 1;
+    out->size = folder ? 0 : file.size;
+    out->blocks = (file.size + 511) / 512;
+    out->dev_minor = 1;
     return 0;
 }
 
 static uint64_t sys_newfstatat(uint64_t dirfd, uint64_t path, uint64_t out) {
     struct fs_file file;
-    const char *name = user_string(path);
+    char joined[FS_NAME_LEN];
+    const char *name = at_path(dirfd, user_string(path), joined, sizeof joined);
 
-    (void)dirfd;
     if (name == NULL || !user_range(out, sizeof(struct stat))) {
         return ERR(EFAULT);
+    }
+    /* An empty name with AT_EMPTY_PATH is the descriptor itself. */
+    if (name[0] == '\0') {
+        return sys_fstat(dirfd, out, 0);
     }
     const struct proc_cmd *cmd = proc_command(name);
 
@@ -1343,27 +2063,34 @@ static uint64_t sys_newfstatat(uint64_t dirfd, uint64_t path, uint64_t out) {
         fill_stat((struct stat *)out, 0, true, PROC_INO);
         return 0;
     }
-    if (fs_stat(name, &file) == 0) {
+    if (dev_named(name) != 0) {
+        fill_stat((struct stat *)out, 0, false, PROC_INO);
+        ((struct stat *)out)->mode = S_IFCHR | 0666;
+        ((struct stat *)out)->rdev = 0x0103;     /* what Linux calls /dev/null */
+        return 0;
+    }
+    if (dev_folder(name)) {
+        fill_stat((struct stat *)out, 0, true, PROC_INO);
+        return 0;
+    }
+    if (fs_stat(name, &file) == 0 && !is_folder_entry(&file)) {
         fill_stat((struct stat *)out, file.size, false, file.start);
         return 0;
     }
-    /* A folder is spelled with a slash on the end in the table. */
-    char folder[FS_NAME_LEN];
-    size_t n = strlen(name);
+    /* Not a file: a folder, which the filesystem knows by its own spelling -
+       and which is how the root, having no entry of its own, is one. */
+    unsigned folder = 0;
 
-    if (n + 2 > FS_NAME_LEN) {
-        return ERR(ENOENT);
-    }
-    memcpy(folder, name, n);
-    folder[n] = '/';
-    folder[n + 1] = '\0';
-    if (fs_stat(folder, &file) != 0) {
+    if (fs_folder_at(name, &folder) != 0) {
         /* Nothing of that name. -1 on its own is EPERM, and a program told
            that reports the file as one it is not allowed to read rather than
            one that is not there. */
         return ERR(ENOENT);
     }
-    fill_stat((struct stat *)out, 0, true, file.start + 1);
+    /* Its table entry, one-based, which is the number getdents64 gives it
+       too: a program walking a tree compares the two, and one that cannot
+       tell two folders apart takes the second for a loop and stops. */
+    fill_stat((struct stat *)out, 0, true, folder_ino(folder));
     return 0;
 }
 
@@ -1451,7 +2178,7 @@ static uint64_t sys_getdents64(uint64_t fd, uint64_t buf, uint64_t count) {
             break;                  /* the rest waits for the next call */
         }
         struct dirent64 *out = (struct dirent64 *)(buf + used);
-        out->ino = index + 1;
+        out->ino = is_folder ? folder_ino((unsigned)index + 1) : entry.start;
         out->off = (int64_t)(index + 1);
         out->reclen = (uint16_t)reclen;
         out->type = is_folder ? DT_DIR : DT_REG;
@@ -1502,7 +2229,7 @@ static uint64_t sys_sysinfo(uint64_t out, uint64_t b, uint64_t c) {
 }
 
 static uint64_t sys_uname(uint64_t out, uint64_t b, uint64_t c) {
-    static const char *const fields[] = { "BaxOS", "baxos", "1", "1", "x86_64", "" };
+    static const char *const fields[] = { "Tuxlet", "tuxlet", "1", "1", "x86_64", "" };
     char *field = (char *)out;
 
     (void)b;
@@ -1659,6 +2386,11 @@ static void gdt_init(void) {
        its descriptors were copied in at the very same offsets - so there is
        nothing to reload. */
     __asm__ volatile("ltr %w0" : : "r"((uint16_t)(used + sizeof descriptors)));
+
+    /* Ring 3's two selectors, with the bits that say ring 3 already on: what
+       the frame an IRETQ returns through has to carry. */
+    user_ss = (uint64_t)(kernel_cs + 16) | 3;
+    user_cs = (uint64_t)(kernel_cs + 24) | 3;
 }
 
 /* The firmware's interrupt table is kept and only the first thirty-two
@@ -1684,7 +2416,8 @@ static void traps_init(void) {
 
     uint64_t cr0 = write_protect(false);
     for (unsigned i = 0; i < EXCEPTIONS; i++) {
-        uint64_t handler = (uint64_t)(i == VEC_PAGE_FAULT ? page_fault_entry : fault_entry);
+        uint64_t handler = i == VEC_PAGE_FAULT ? (uint64_t)page_fault_entry
+                                               : (uint64_t)trap_stubs + i * 16;
         idt[i] = (struct idt_gate){
             .offset_low  = (uint16_t)handler,
             .selector    = kernel_cs,
@@ -1717,8 +2450,7 @@ void syscall_init(void) {
     gdt_init();
     sse_init();
     traps_init();
-    window_map();
-    vm_start();                     /* the big region, for Linux programs */
+    vm_start();                     /* the region a program runs in */
     wrmsr(MSR_EFER, rdmsr(MSR_EFER) | EFER_SCE);
     /* syscall takes its code segment from one half and sysret counts on from
        the other: the four descriptors gdt_init laid down, in their order. */
@@ -1801,6 +2533,7 @@ void syscall_init(void) {
     syscall_register(SYS_STAT, sys_stat);
     syscall_register(SYS_LSTAT, sys_stat);
     syscall_register(SYS_CHDIR, sys_chdir);
+    syscall_register(SYS_FCHDIR, sys_fchdir);
     syscall_register(SYS_DUP, sys_dup);
     syscall_register(SYS_DUP2, sys_dup2);
     syscall_register(SYS_DUP3, sys_dup2);
@@ -1819,7 +2552,43 @@ void syscall_init(void) {
     syscall_register(SYS_GETRESGID, sys_getresuid);
     syscall_register(SYS_SELECT, sys_select);
     syscall_register(SYS_PSELECT6, sys_select);
-    syscall_register(SYS_SPAWN, sys_spawn);
+    syscall_register(SYS_FORK, sys_fork);
+    syscall_register(SYS_VFORK, sys_fork);
+    syscall_register(SYS_CLONE, sys_clone);
+    syscall_register(SYS_EXECVE, sys_execve);
+    syscall_register(SYS_WAIT4, sys_wait4);
+    syscall_register(SYS_PIPE, sys_pipe);
+    syscall_register(SYS_PIPE2, sys_pipe2);
+    /* The calls a libc makes for the plainest commands there are: rm is
+       unlinkat, mkdir is mkdirat, mv is renameat2. */
+    syscall_register(SYS_UNLINKAT, sys_unlinkat);
+    syscall_register(SYS_MKDIRAT, sys_mkdirat);
+    syscall_register(SYS_RENAMEAT, sys_renameat);
+    syscall_register(SYS_RENAMEAT2, sys_renameat);
+    syscall_register(SYS_LINKAT, sys_no_links);
+    syscall_register(SYS_SYMLINKAT, sys_no_links);
+    syscall_register(SYS_LINK, sys_no_links);
+    syscall_register(SYS_SYMLINK, sys_no_links);
+    syscall_register(SYS_MKNODAT, sys_no_links);
+    syscall_register(SYS_TRUNCATE, sys_truncate);
+    syscall_register(SYS_READV, sys_readv);
+    syscall_register(SYS_PWRITE64, sys_pwrite64);
+    syscall_register(SYS_POLL, sys_poll);
+    syscall_register(SYS_PPOLL, sys_poll);
+    syscall_register(SYS_FSTATFS, sys_fstatfs);
+    syscall_register(SYS_GETRLIMIT, sys_getrlimit);
+    syscall_register(SYS_SETRLIMIT, sys_ok);
+    syscall_register(SYS_FLOCK, sys_ok);
+    syscall_register(SYS_FALLOCATE, sys_ok);
+    syscall_register(SYS_MSYNC, sys_ok);
+    syscall_register(SYS_SYNCFS, sys_ok);
+    syscall_register(SYS_GETCPU, sys_zeroed);
+    syscall_register(SYS_GETGROUPS, sys_root);
+    syscall_register(SYS_SCHED_GETSCHEDULER, sys_root);
+    syscall_register(SYS_SCHED_SETSCHEDULER, sys_ok);
+    syscall_register(SYS_SCHED_GETPARAM, sys_zeroed);
+    syscall_register(SYS_GETPRIORITY, sys_root);
+    syscall_register(SYS_SETPRIORITY, sys_ok);
 }
 
 int syscall_register(uint64_t number, syscall_fn fn) {
@@ -1868,7 +2637,6 @@ uint64_t syscall_dispatch(uint64_t a, uint64_t b, uint64_t c,
                           uint64_t d, uint64_t e, uint64_t f, uint64_t number) {
     struct log_entry *entry = log_begin(number, a, b, c);
     uint64_t result = ERR(ENOSYS);
-
     arg[0] = a;
     arg[1] = b;
     arg[2] = c;
@@ -1890,21 +2658,22 @@ uint64_t syscall_dispatch(uint64_t a, uint64_t b, uint64_t c,
 
 /* ---- program memory ------------------------------------------------------
  *
- * A program's window is bought from the firmware a page at a time, as it is
- * touched, and given back the moment the program ends. An idle machine holds
- * none of it, and a program costs the pages it uses rather than the two
- * megabytes its addresses span.
+ * Every page a program has comes from vm.c: its own region, hung off a slot
+ * of the firmware's top-level page table, bought a page at a time as it is
+ * touched and handed back the moment the program ends. An idle machine holds
+ * none of it.
  *
- * Each page is asked for at the very address that faulted, so the window
- * maps one to one. That matters for more than simplicity: firmware drivers
- * are still running, and a page we merely mapped without owning might be one
- * of theirs - taking it is what makes it ours to hand to ring 3.
+ * There is a second arrangement as well, for the one thing a region cannot
+ * do. A program linked to run at a fixed address - a flat binary written for
+ * this machine, or a static Linux executable, both of which land at 0x400000 -
+ * has to be at that address, and a region begins half a terabyte up. So the
+ * old fixed window is still here: two megabytes at PROGRAM_BASE, with a page
+ * table of its own hung off the tables the firmware already built, bought a
+ * page at a time as the program touches it.
  *
- * The page tables themselves are the firmware's. Replacing them wholesale
- * would mean identity-mapping everything its drivers touch, which is most of
- * the low four gigabytes; instead the window's own table is hung off the
- * tables that are already there, and every other mapping is left alone. One
- * page of tables, against the thirty-odd that the other way would cost. */
+ * A program in the window cannot fork: there is one window, so there would be
+ * nothing to put the parent's copy in. Nothing in it wants to - they are the
+ * small fixed-address programs - and fork tells them so. */
 
 #define PAGE_2MIB    0x200000
 #define PAGE_PRESENT 0x01
@@ -1916,18 +2685,27 @@ uint64_t syscall_dispatch(uint64_t a, uint64_t b, uint64_t c,
 
 #define WINDOW_PAGES (PROGRAM_BYTES / PAGE_SIZE)
 
-static uint64_t program_pt[PAGE_SIZE / 8] __attribute__((aligned(PAGE_SIZE)));
-static size_t   spawn_held;     /* windows put aside while a program runs */
+/* The window's page table, and the page directory that has to be split to
+   hang it off the firmware's. Both are bought from the firmware the first
+   time something needs the window rather than kept in the kernel: every
+   program here is position-independent and gets a region instead, so on most
+   machines they are never bought at all. */
+static uint64_t *program_pt;
 static uint64_t *split_pd;      /* only if the firmware used a huge page */
-static bool      window_ready;
+static bool      window_tried;
 static unsigned  window_pages;  /* how many are out on loan right now */
 
+/* The tables that are the machine's rather than any program's: the fixed
+   window's, which stay until the machine is switched off. The tables
+   describing a region come and go with the program they describe, so they
+   are counted as the program's - which is what keeps what the machine costs
+   the same figure whoever asks and whatever is running. */
 size_t program_tables(void) {
-    return sizeof program_pt + (split_pd != NULL ? PAGE_SIZE : 0) + vm_tables();
+    return (program_pt != NULL ? PAGE_SIZE : 0) + (split_pd != NULL ? PAGE_SIZE : 0);
 }
 
 size_t program_memory(void) {
-    return (size_t)window_pages * PAGE_SIZE + vm_memory() + spawn_held;
+    return (size_t)window_pages * PAGE_SIZE + vm_memory() + vm_tables();
 }
 
 static struct efi_boot_services *services(void) {
@@ -1942,9 +2720,9 @@ static void flush_tlb(void) {
     __asm__ volatile("mov %%cr3, %%rax\n\tmov %%rax, %%cr3" : : : "rax", "memory");
 }
 
-/* The firmware write-protects its own page tables - CR0.WP, which makes even
-   ring 0 respect a read-only page - so editing them means turning that off
-   for as long as the edit takes. */
+/* The firmware write-protects its own page tables and its own descriptors -
+   CR0.WP, which makes even ring 0 respect a read-only page - so editing one
+   means turning that off for as long as the edit takes. */
 static uint64_t write_protect(bool on) {
     uint64_t cr0;
 
@@ -1958,7 +2736,17 @@ static uint64_t write_protect(bool on) {
 static void window_map(void) {
     uint64_t cr3;
     uint64_t *pml4, *pdpt, *pd;
+    uint64_t table = 0;
 
+    if (window_tried) {
+        return;
+    }
+    window_tried = true;
+    if (EFI_ERROR(services()->allocate_pages(EFI_ALLOCATE_ANY, EFI_LOADER_DATA, 1,
+                                             &table))) {
+        return;
+    }
+    memset((void *)table, 0, PAGE_SIZE);
     __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
     pml4 = (uint64_t *)(cr3 & PAGE_ADDR);
     if (!(pml4[0] & PAGE_PRESENT)) {
@@ -1995,15 +2783,18 @@ static void window_map(void) {
     pdpt[0] |= PAGE_USER;
 
     pd = table_at(pdpt[0]);
-    pd[PROGRAM_BASE / PAGE_2MIB] = (uint64_t)program_pt | PAGE_USER_RW;
+    pd[PROGRAM_BASE / PAGE_2MIB] = table | PAGE_USER_RW;
 
     __asm__ volatile("mov %0, %%cr0" : : "r"(cr0) : "memory");
     flush_tlb();
-    window_ready = true;
+    program_pt = (uint64_t *)table;
 }
 
 /* Empties the window, handing every page it borrowed back to the firmware. */
 static void window_reset(void) {
+    if (program_pt == NULL) {
+        return;
+    }
     for (unsigned i = 0; i < WINDOW_PAGES; i++) {
         if (program_pt[i] != 0) {
             services()->free_pages(program_pt[i] & PAGE_ADDR, 1);
@@ -2012,8 +2803,6 @@ static void window_reset(void) {
     }
     window_pages = 0;
     flush_tlb();
-    memset(handles, 0, sizeof handles);     /* nothing is open yet */
-    memset(writer_names, 0, sizeof writer_names);
 }
 
 /* Lets ring 3 have the window page holding addr, buying it from the firmware
@@ -2021,12 +2810,14 @@ static void window_reset(void) {
    nothing of whatever used it last shows through. */
 static bool map_page(uint64_t addr) {
     uint64_t page = addr & ~(uint64_t)(PAGE_SIZE - 1);
-    uint64_t *entry = &program_pt[(page - PROGRAM_BASE) / PAGE_SIZE];
     uint64_t at = page;
+    uint64_t *entry;
 
-    if (!window_ready) {
+    window_map();                   /* the first time anything wants it */
+    if (program_pt == NULL) {
         return false;
     }
+    entry = &program_pt[(page - PROGRAM_BASE) / PAGE_SIZE];
     if (*entry == 0) {
         /* At this exact address, so that the window maps one to one and the
            memory is genuinely ours rather than something firmware is using. */
@@ -2042,13 +2833,37 @@ static bool map_page(uint64_t addr) {
     return true;
 }
 
+/* Called by a trap stub with the vector that fired, just before the program
+   is ended. Naming it is the difference between "something went wrong" and
+   knowing a program used an instruction this machine never turned on. */
+void trap_report(unsigned vector, const uint64_t *frame) {
+    static const char *const named[] = {
+        [0] = "divide by zero", [1] = "debug", [3] = "breakpoint",
+        [4] = "overflow", [5] = "bound range", [6] = "illegal instruction",
+        [7] = "no maths unit", [8] = "double fault", [10] = "bad task switch",
+        [11] = "segment not there", [12] = "bad stack", [13] = "protection fault",
+        [16] = "maths error", [17] = "misaligned", [19] = "SSE error",
+    };
+    const char *name = vector < sizeof named / sizeof named[0] && named[vector] != NULL
+                     ? named[vector] : "exception";
+
+    /* Past the RDI the stub kept, the processor's own frame: an error code
+       for the vectors that have one, then where it was. */
+    bool coded = vector == 8 || (vector >= 10 && vector <= 14) || vector == 17 ||
+                 vector == 21 || vector == 29 || vector == 30;
+
+    const uint64_t *cpu = frame + (coded ? 2 : 1);
+
+    dbg("trap %u (%s) at %x code %x: killed\n", (uint64_t)vector, name,
+        cpu[0], coded ? frame[1] : 0);
+}
+
 /* Called by page_fault_entry with the address that faulted, and where from. */
 void page_fault(uint64_t addr, uint64_t rip) {
-    if (vm_holds(addr, 0)) {
-        if (vm_fault(addr)) {
-            return;
-        }
-    } else if (addr >= PROGRAM_BASE && addr < PROGRAM_STACK && map_page(addr)) {
+    /* Something promised to a mapping comes first: the page is not merely
+       empty, it has a stretch of a file that belongs in it. */
+    if (map_fill(addr) || vm_fault(addr) ||
+        (addr >= PROGRAM_BASE && addr < PROGRAM_STACK && map_page(addr))) {
         return;
     }
     dbg("fault at %x from %x: killed\n", addr, rip);
@@ -2139,8 +2954,8 @@ static int read_at(const struct fs_file *file, uint64_t offset, void *dest, uint
 }
 
 /* True if addr .. addr + size is room a program may load into or start at:
-   the old fixed window, for a program linked to run at a fixed address, or
-   anywhere in the region vm.c hands out. */
+   its own region, or the fixed window for one linked to run at a fixed
+   address. */
 static bool fits(uint64_t addr, uint64_t size) {
     if (vm_holds(addr, size)) {
         return true;
@@ -2167,6 +2982,14 @@ static bool claim(uint64_t addr, uint64_t size) {
    does not cover is already the .bss it should be. */
 static int load_segment(const struct fs_file *file, uint64_t offset, uint64_t vaddr,
                         uint64_t file_size, uint64_t mem_size) {
+    /* A promise rather than a copy, the same as a mapping a program asks for
+       itself: a loader's own half-megabyte and a program's whole image are
+       read only where they are used. The window has no such machinery, and
+       a segment is small enough there not to want it. */
+    if (vm_holds(vaddr, mem_size) && file_size > 0 &&
+        map_record(vaddr, file_size, file->start, file->size, offset)) {
+        return 0;
+    }
     if (!claim(vaddr, mem_size)) {
         dbg("  segment: no memory for %x\n", vaddr);
         return FS_ENOSPC;
@@ -2278,12 +3101,29 @@ static int find_library(const char *path, struct fs_file *out) {
     return FS_ENOENT;
 }
 
+/* What program_load needs to hold while it works: three hundred bytes of
+   headers and paths, borrowed rather than put on the kernel stack, since a
+   program may start a program which starts a program. */
+struct load_work {
+    struct elf_header header, loader_header;
+    struct fs_file    loader;
+    char              interp[FS_NAME_LEN];
+};
+
 int program_load(const struct fs_file *file, uint64_t *entry) {
-    struct elf_header header;
-    char interp[FS_NAME_LEN] = "";
+    struct load_work *w = NULL;
     int err;
 
+    if (EFI_ERROR(services()->allocate_pool(EFI_LOADER_DATA, sizeof *w, (void **)&w))) {
+        return FS_ENOSPC;
+    }
+
+#define header (w->header)
+#define interp (w->interp)
+
+    interp[0] = '\0';
     dbg("load: %s size %u\n", file->name, (uint64_t)file->size);
+    memset(mappings, 0, sizeof mappings);   /* nothing of the last one is owed */
     window_reset();
     vm_reset();
     loaded_end = PROGRAM_BASE;
@@ -2298,14 +3138,17 @@ int program_load(const struct fs_file *file, uint64_t *entry) {
            position-independent goes where we put it. */
         uint64_t bias = header.type == ET_DYN ? vm_base() + USER_EXEC : 0;
 
+        /* Something linked to run at a fixed address goes there, in the
+           window; anything position-independent goes in a region. */
         if (header.type == ET_DYN && vm_base() == 0) {
-            return PROGRAM_EINVAL;
+            err = PROGRAM_EINVAL;
+            goto done;
         }
-        loaded_flat = false;
+        loaded_flat = header.type != ET_DYN;
         err = load_elf_at(file, &header, bias, entry, &started_phdr,
-                          interp, sizeof interp);
+                          interp, FS_NAME_LEN);
         if (err < 0) {
-            return err;
+            goto done;
         }
         started_phent = header.phentsize;
         started_phnum = header.phnum;
@@ -2314,19 +3157,18 @@ int program_load(const struct fs_file *file, uint64_t *entry) {
         if (interp[0] != '\0') {
             /* It is dynamically linked: its loader runs first, and does the
                rest of the work itself through these same syscalls. */
-            struct fs_file loader;
-            struct elf_header loader_header;
-
             dbg("load: interpreter %s\n", interp);
-            if (find_library(interp, &loader) < 0 ||
-                read_at(&loader, 0, &loader_header, sizeof loader_header) < 0) {
-                return PROGRAM_ENOINTERP;
+            if (find_library(interp, &w->loader) < 0 ||
+                read_at(&w->loader, 0, &w->loader_header,
+                        sizeof w->loader_header) < 0) {
+                err = PROGRAM_ENOINTERP;
+                goto done;
             }
             started_base = vm_base() + USER_INTERP;
-            err = load_elf_at(&loader, &loader_header, started_base, entry, NULL,
-                              NULL, 0);
+            err = load_elf_at(&w->loader, &w->loader_header, started_base, entry,
+                              NULL, NULL, 0);
             if (err < 0) {
-                return err;
+                goto done;
             }
         }
     } else {
@@ -2339,8 +3181,12 @@ int program_load(const struct fs_file *file, uint64_t *entry) {
     if (err == 0) {
         program_memory_start(loaded_end);
     }
+done:
+    services()->free_pool(w);
     return err;
 }
+#undef header
+#undef interp
 
 /* ---- the stack a program starts on ---------------------------------------
  *
@@ -2359,28 +3205,40 @@ enum {
     AT_SECURE = 23, AT_RANDOM = 25, AT_EXECFN = 31,
 };
 
-/* The environment a program starts with. There is no shell to inherit one
-   from, so it is made up here - and LD_LIBRARY_PATH is the whole reason a
-   loader off a Linux system can find its libraries on this disk. */
+/* The environment the first program starts with - the shell, since nothing
+   runs before it. Everything after that inherits what the shell passes to
+   execve, so this is only ever the shell's own.
+   LD_LIBRARY_PATH is the whole reason a loader off a Linux system can find
+   its libraries on this disk, and TERMINFO the reason readline believes the
+   screen can move a cursor. */
 static const char *const environment[] = {
     "LD_LIBRARY_PATH=/pkg/linux-coreutils/lib",
-    /* Where a program looks for a program. The shell does not read this -
-       where it looks is /conf/sys/path.conf and nothing else - but anything
-       it starts does, `more` among them, and /proc holds commands that can
-       be run like any other. */
-    "PATH=/proc:/pkg/bax-coreutils:/pkg/linux-coreutils",
+    "PATH=/proc:/pkg/linux-coreutils",
+    "TERM=linux",
+    "TERMINFO=/pkg/linux-coreutils/terminfo",
     "HOME=/home",
     "TMPDIR=/tmp",
-    "TERM=dumb",
     "LANG=C",
+    "PS1=\\[\\e[36m\\]\\w\\[\\e[0m\\] $ ",
 };
 
 #define ENV_COUNT (sizeof environment / sizeof environment[0])
 
-static uint64_t build_stack(unsigned argc, const char *const *argv) {
+/* Where build_stack keeps its working-out. Borrowed from the firmware rather
+   than put on the kernel stack: it is a page and a half of it, and a program
+   may start a program which starts a program - the kernel's own stack would
+   have to be sized for the deepest that can ever go. */
+struct stack_work {
     struct { uint64_t type, value; } aux[20];
-    uint64_t strings[ENV_COUNT + PROGRAM_ARGS];
-    bool big = vm_base() != 0 && !loaded_flat;
+    uint64_t strings[EXEC_ENV + EXEC_ARGS];
+};
+
+/* argc, the arguments, the environment and the auxiliary vector, laid out
+   where the program will start. */
+static uint64_t build_stack(unsigned argc, const char *const *argv,
+                            unsigned envc, const char *const *envv) {
+    struct stack_work *work = NULL;
+    bool big = !loaded_flat;
     uint64_t top = big ? vm_base() + USER_STACK : PROGRAM_STACK;
     uint64_t random_at, rsp;
     uint64_t *out;
@@ -2389,13 +3247,30 @@ static uint64_t build_stack(unsigned argc, const char *const *argv) {
     if (big && !vm_reserve(top - USER_STACK_BYTES, USER_STACK_BYTES)) {
         return 0;
     }
-    if (argc > PROGRAM_ARGS) {
-        argc = PROGRAM_ARGS;        /* more than a command line can hold */
+    if (EFI_ERROR(services()->allocate_pool(EFI_LOADER_DATA, sizeof *work,
+                                            (void **)&work))) {
+        return 0;
+    }
+
+    uint64_t *const strings = work->strings;
+
+#define aux (work->aux)
+
+    if (argc > EXEC_ARGS) {
+        argc = EXEC_ARGS;           /* more than a command line can hold */
+    }
+    if (envc == 0) {
+        envv = environment;         /* the first program, with nothing to
+                                       inherit an environment from */
+        envc = ENV_COUNT;
+    }
+    if (envc > EXEC_ENV) {
+        envc = EXEC_ENV;
     }
 
     /* The strings go at the very top, and the vector is built below them. */
-    for (unsigned i = 0; i < argc + ENV_COUNT; i++) {
-        const char *text = i < argc ? argv[i] : environment[i - argc];
+    for (unsigned i = 0; i < argc + envc; i++) {
+        const char *text = i < argc ? argv[i] : envv[i - argc];
         size_t length = strlen(text) + 1;
 
         top -= length;
@@ -2429,7 +3304,7 @@ static uint64_t build_stack(unsigned argc, const char *const *argv) {
     /* argc, the arguments, their terminator, the environment and its
        terminator, then the pairs - and all of it has to leave the stack
        sixteen-byte aligned. */
-    rsp = (top - (1 + argc + 1 + ENV_COUNT + 1 + count * 2) * 8) & ~15ull;
+    rsp = (top - (1 + argc + 1 + envc + 1 + count * 2) * 8) & ~15ull;
     out = (uint64_t *)rsp;
 
     out[n++] = argc;
@@ -2437,7 +3312,7 @@ static uint64_t build_stack(unsigned argc, const char *const *argv) {
         out[n++] = strings[i];
     }
     out[n++] = 0;
-    for (unsigned i = 0; i < ENV_COUNT; i++) {
+    for (unsigned i = 0; i < envc; i++) {
         out[n++] = strings[argc + i];
     }
     out[n++] = 0;
@@ -2445,16 +3320,25 @@ static uint64_t build_stack(unsigned argc, const char *const *argv) {
         out[n++] = aux[i].type;
         out[n++] = aux[i].value;
     }
+    services()->free_pool(work);
     return rsp;
 }
+#undef aux
 
-int program_run(uint64_t entry, unsigned argc, const char *const *argv) {
-    uint64_t rsp = build_stack(argc, argv);
+int program_run(uint64_t entry, unsigned argc, const char *const *argv,
+                unsigned envc, const char *const *envv, bool fresh) {
+    uint64_t rsp = build_stack(argc, argv, envc, envv);
     char was[LOG_NAME] = "";
     const char *before;
 
-    handles_reset();
-    console_reset();
+    /* A program started from nothing gets a clean terminal and nothing open
+       but the console. One that a fork ran execve on keeps both: the files
+       are what the shell set up between the two, which is what a redirection
+       is made of. */
+    if (fresh) {
+        handles_reset();
+        console_reset();
+    }
 
     dbg("run: entry %x rsp %x phdr %x base %x\n", entry, rsp, started_phdr,
         started_base);
@@ -2485,87 +3369,161 @@ int program_run(uint64_t entry, unsigned argc, const char *const *argv) {
 
 /* ---- one program starting another ----------------------------------------
  *
- * There is no fork here, and nothing to fork into: one program, one window,
- * one address it is loaded at. But the shell is a program like any other
- * now, and a shell that cannot start a program is no shell - so a program
- * may run a program, and wait for it.
+ * A shell runs a command by forking and then, in the child, replacing itself
+ * with the program. There is no scheduler here and never will be, so the two
+ * halves of that cannot run side by side - but they do not have to. What
+ * happens instead is that fork runs its child there and then, to the end, and
+ * only gives the parent its answer once the child is finished.
  *
- * What makes that possible without a second window is that the first one's
- * is put aside: the pages it has actually touched are copied out, the window
- * is emptied for the program being started, and the copies go back where
- * they came from once it has finished. A shell touches a handful of pages,
- * so what this costs is a handful of pages and two memcpys - not the two
- * megabytes the window spans.
+ * What makes that safe is that the child, until it calls execve, is running
+ * in its parent's own memory: every page of it is write-protected at the
+ * fork, and the first write to one copies what was under it aside (vm.c). The
+ * child's scribbles are undone page by page when it finishes, and the parent
+ * carries on as if it had only ever been waiting. A shell between fork and
+ * execve touches a handful of pages, so that costs a handful of pages.
  *
- * A program using the big region has no such luck: that is where a Linux
- * program's libraries and heap live, and there is far too much of it to
- * copy. One of those cannot start a program, and is told so. */
+ * execve is where the child stops being its parent: it takes a region of its
+ * own, the parent's is left exactly as the fork found it, and the program
+ * that is loaded there runs until it exits. Its exit code goes back to fork,
+ * which hands it to the next wait4.
+ *
+ * What a pipeline needs is the one thing this cannot do - two programs at
+ * once - so a pipe is a buffer rather than a channel: the first program fills
+ * it and finishes, and the second reads it. `a | b` works, and so does the
+ * command substitution a shell does constantly; what does not is a pipeline
+ * whose first half never ends. */
 
-#define SPAWN_DEPTH 4       /* programs inside programs, at most */
-#define SPAWN_LINE  512     /* the arguments handed over, in bytes */
-#define SPAWN_OUT   4096    /* the most of a program's output that can be taken */
+#define NEST_DEPTH 4        /* programs inside programs, at most */
+#define STACK_MARGIN 2048   /* kernel stack a fork will not go below */
 
-/* Everything about the program that is running which the next one would
-   overwrite: what it had open, where its heap had got to, the terminal as it
-   left it, and the pages of the window it had touched.
- *
- * All of it is borrowed from the firmware for as long as the other program
- * runs, rather than kept on the kernel stack. A program may start a program
- * which starts a program, and at seventeen hundred bytes a time the kernel's
- * stack would have to be sized for the deepest that can ever go - where this
- * way the cost is what is actually nested, and only while it is. */
+/* start.asm's, for measuring what is left of it. */
+extern char stack_bottom[];
+#define EXEC_LINE  4096     /* arguments and environment handed over, in bytes */
+#define EXEC_ARGS  64
+#define EXEC_ENV   64
+#define PROC_OUT   16384    /* the most of a kernel command's output that
+                               can be sent somewhere other than the screen */
+
+/* Everything about the program that is running which the program it starts
+   would otherwise overwrite: what it had open, where its heap had got to, and
+   the terminal as it left it. Its memory is not in here - the child runs in a
+   region of its own, and vm.c puts back whatever it changed of its parent's
+   before that.
+
+   Borrowed from the firmware rather than kept on the kernel stack: a program
+   may start a program which starts a program, and at a kilobyte a time the
+   kernel's stack would have to be sized for the deepest that can ever go. */
 struct saved {
     struct handle handles[PROGRAM_FILES];
     char      writers[WRITERS][FS_NAME_LEN];
     char      settings[TERMIOS_NEW];
     char      cwd[FS_NAME_LEN + 1];
     uint64_t  brk, map;
-    unsigned  count;        /* pages of the window kept behind it */
-    uint16_t  at[];         /* which page of the window each of them was */
+    uint64_t  fs_base;      /* where its libc keeps its thread's own data */
+    bool      flat;         /* whether it is the one in the fixed window */
+    struct mapping maps[MAPPINGS];  /* what its mmaps still owe it */
 };
 
-static unsigned spawn_depth;
+static unsigned nest;               /* how deep we are in that */
 
-/* The pages follow the list of their numbers, rounded up to where a page's
-   worth of bytes may as well start. */
-static size_t saved_head(unsigned count) {
-    return (sizeof(struct saved) + (size_t)count * sizeof(uint16_t) + 7) & ~(size_t)7;
+static uint64_t sys_pipe2(uint64_t out, uint64_t flags, uint64_t c) {
+    struct efi_boot_services *bs = services();
+    uint32_t *fds = (uint32_t *)out;
+    unsigned slot;
+    uint64_t read_fd, write_fd;
+    void *data = NULL;
+
+    (void)flags;
+    (void)c;
+    if (!user_range(out, 8)) {
+        return ERR(EFAULT);
+    }
+    for (slot = 0; slot < PIPES && pipes[slot].data != NULL; slot++) {
+    }
+    if (slot == PIPES || EFI_ERROR(bs->allocate_pool(EFI_LOADER_DATA, PIPE_FIRST, &data))) {
+        return ERR(ENFILE);
+    }
+    pipes[slot] = (struct pipe){ .data = data, .size = PIPE_FIRST, .refs = 2 };
+
+    struct handle h = { .start = PIPE_MARK, .folder = slot + 1 };
+
+    read_fd = give_handle(h);
+    h.size = 1;                     /* the writing end */
+    write_fd = give_handle(h);
+    if ((int64_t)read_fd < 0 || (int64_t)write_fd < 0) {
+        if ((int64_t)read_fd >= 0) {
+            handles[read_fd].used = 0;
+        }
+        bs->free_pool(data);
+        pipes[slot] = (struct pipe){ 0 };
+        return ERR(EMFILE);
+    }
+    fds[0] = (uint32_t)read_fd;
+    fds[1] = (uint32_t)write_fd;
+    return 0;
 }
 
-static char *saved_pages(struct saved *s) {
-    return (char *)s + saved_head(s->count);
+static uint64_t sys_pipe(uint64_t out, uint64_t b, uint64_t c) {
+    return sys_pipe2(out, 0, b + c - b - c);
 }
 
-/* Puts the running program aside: one block holding everything about it,
-   which is given back when it is put back. NULL if there is no memory for
-   it, which leaves the program exactly as it was. */
+/* ---- what a child leaves behind ----------------------------------------- */
+
+#define CHILDREN 8
+
+static struct child {
+    int pid, status;
+    bool waited;
+} children[CHILDREN];
+
+static int last_pid = 1;            /* the shell itself is 1 */
+
+static void child_done(int pid, int code) {
+    static unsigned next;
+
+    /* Linux's wait status: the exit code in the second byte, or the signal
+       that ended it in the low seven bits. */
+    children[next] = (struct child){
+        .pid = pid,
+        .status = code == PROGRAM_KILLED ? 11 : (code & 0xFF) << 8,
+    };
+    next = (next + 1) % CHILDREN;
+}
+
+static uint64_t sys_wait4(uint64_t pid, uint64_t status, uint64_t options) {
+    (void)options;
+    for (unsigned i = 0; i < CHILDREN; i++) {
+        struct child *ch = &children[i];
+
+        if (ch->pid == 0 || ch->waited) {
+            continue;
+        }
+        if ((int64_t)pid > 0 && ch->pid != (int)pid) {
+            continue;
+        }
+        ch->waited = true;
+        if (status != 0) {
+            if (!user_range(status, 4)) {
+                return ERR(EFAULT);
+            }
+            *(int32_t *)status = ch->status;
+        }
+        return (uint64_t)ch->pid;
+    }
+    return ERR(ECHILD);
+}
+
+/* ---- putting a program aside -------------------------------------------- */
+
 static struct saved *context_save(void) {
     struct efi_boot_services *bs = services();
     struct saved *s;
     void *block = NULL;
-    unsigned n = 0;
 
-    for (unsigned i = 0; i < WINDOW_PAGES; i++) {
-        n += program_pt[i] != 0;
-    }
-    size_t bytes = saved_head(n) + (size_t)n * PAGE_SIZE;
-
-    if (EFI_ERROR(bs->allocate_pool(EFI_LOADER_DATA, bytes, &block))) {
+    if (EFI_ERROR(bs->allocate_pool(EFI_LOADER_DATA, sizeof *s, &block))) {
         return NULL;
     }
     s = block;
-    s->count = n;
-
-    char *pages = saved_pages(s);
-    unsigned kept = 0;
-
-    for (unsigned i = 0; i < WINDOW_PAGES; i++) {
-        if (program_pt[i] != 0) {
-            memcpy(pages + (size_t)kept * PAGE_SIZE,
-                   (const void *)(PROGRAM_BASE + (uint64_t)i * PAGE_SIZE), PAGE_SIZE);
-            s->at[kept++] = (uint16_t)i;
-        }
-    }
     memcpy(s->handles, handles, sizeof handles);
     memcpy(s->writers, writer_names, sizeof writer_names);
     console_get(s->settings, sizeof s->settings);
@@ -2573,66 +3531,147 @@ static struct saved *context_save(void) {
     strcpy(s->cwd + 1, fs_cwd());
     s->brk = program_break;
     s->map = program_map;
-    spawn_held += bytes;
+    /* Every thread-local a libc reads is at an offset from FS, and the
+       program being started sets FS to its own. Putting this back is what
+       lets the one underneath find its own again. */
+    s->fs_base = rdmsr(MSR_FS_BASE);
+    s->flat = loaded_flat;
+    memcpy(s->maps, mappings, sizeof mappings);
+    pipes_hold(1);                  /* it still holds its ends of them */
     return s;
 }
 
-/* Puts it back, each page at the address it came from, and gives the block
-   up. */
 static void context_restore(struct saved *s) {
-    struct efi_boot_services *bs = services();
-    const char *pages = saved_pages(s);
-
-    for (unsigned i = 0; i < s->count; i++) {
-        uint64_t page = PROGRAM_BASE + (uint64_t)s->at[i] * PAGE_SIZE;
-
-        if (map_page(page)) {
-            memcpy((void *)page, pages + (size_t)i * PAGE_SIZE, PAGE_SIZE);
-        }
-    }
+    pipes_hold(-1);                 /* the ends the child was left holding */
     memcpy(handles, s->handles, sizeof handles);
     memcpy(writer_names, s->writers, sizeof writer_names);
     console_set(s->settings, sizeof s->settings);
     fs_chdir(s->cwd);
     program_break = s->brk;
     program_map = s->map;
-
-    spawn_held -= saved_head(s->count) + (size_t)s->count * PAGE_SIZE;
-    bs->free_pool(s);
+    wrmsr(MSR_FS_BASE, s->fs_base);
+    loaded_flat = s->flat;
+    memcpy(mappings, s->maps, sizeof mappings);
+    services()->free_pool(s);
 }
 
-/* Copies the arguments out of the program's memory, since its memory is
-   about to be put aside. They land in line as one run of strings, with out
-   pointing into it. */
-static unsigned spawn_args(uint64_t argv, char *line, const char **out) {
-    unsigned argc = 0;
-    size_t len = 0;
+/* ---- fork and execve ----------------------------------------------------- */
 
-    line[0] = '\0';
-    if (argv == 0 || !user_range(argv, 8)) {
+/* The registers of the program that made the call, as syscall_entry left
+   them on the kernel stack. Only fork reads them, and only to start its
+   child from the same place with a different answer in RAX. */
+struct user_regs {
+    uint64_t rax, pad, r15, r14, r13, r12, rbp, rbx;
+    uint64_t r10, r9, r8, rdx, rsi, rdi;
+    uint64_t rflags, rip, rsp;
+};
+
+extern struct user_regs *user_frame;
+extern int user_resume(const struct user_regs *regs, uint64_t rax);
+
+static uint64_t sys_fork(uint64_t a, uint64_t b, uint64_t c) {
+    struct user_regs *child = NULL;
+    struct saved *state;
+    unsigned was_level = vm_level();
+    int pid, code;
+
+    (void)a;
+    (void)b;
+    (void)c;
+    /* A program starting a program starting a program is a stack of syscalls
+       inside each other, and all of them are on the kernel's own stack. How
+       much each costs depends on what they do, so the room left is measured
+       rather than guessed: a fork with less than this much stack under it is
+       refused, and a shell reports that the way it reports any machine that
+       cannot start a process. Guessing wrong the other way would be the
+       kernel writing past the bottom of its own stack. */
+    if (nest >= NEST_DEPTH ||
+        (uintptr_t)&state - (uintptr_t)stack_bottom < STACK_MARGIN) {
+        return ERR(EAGAIN);
+    }
+    if (loaded_flat) {
+        /* There is one window, so there is nowhere to put the parent's copy
+           of it. Nothing that runs there wants to fork. */
+        return ERR(ENOSYS);
+    }
+    /* The child's registers are borrowed rather than kept on the kernel
+       stack: the child runs inside this call, and everything it does is
+       nested inside it. */
+    if (EFI_ERROR(services()->allocate_pool(EFI_LOADER_DATA, sizeof *child,
+                                            (void **)&child))) {
+        return ERR(ENOMEM);
+    }
+    *child = *user_frame;
+    if ((state = context_save()) == NULL) {
+        services()->free_pool(child);
+        return ERR(ENOMEM);
+    }
+    /* From here every page the child writes is copied aside first, so that
+       what it does to its parent's memory can be undone. */
+    if (!vm_undo_begin()) {
+        context_restore(state);
+        services()->free_pool(child);
+        return ERR(ENOMEM);
+    }
+    pid = ++last_pid;
+    nest++;
+    code = user_resume(child, 0);   /* the child, from this very syscall */
+    nest--;
+    services()->free_pool(child);
+
+    /* It may have been killed inside a program of its own, which leaves that
+       program's region still on the stack of them. */
+    vm_unwind(was_level);
+    vm_undo_end(true);
+    context_restore(state);
+    child_done(pid, code);
+    return (uint64_t)pid;
+}
+
+/* glibc's fork is a clone, and so is anything else that starts a process.
+   The flags that would make it a thread are refused - there is one of those
+   here and there always will be - and the rest is a fork. */
+#define CLONE_VM     0x00000100
+#define CLONE_THREAD 0x00010000
+
+static uint64_t sys_clone(uint64_t flags, uint64_t stack, uint64_t parent_tid) {
+    (void)stack;
+    (void)parent_tid;
+    if (flags & (CLONE_VM | CLONE_THREAD)) {
+        return ERR(ENOSYS);
+    }
+    return sys_fork(0, 0, 0);
+}
+
+/* Copies a program's argument or environment list out of its memory, since
+   its memory is about to be put aside. They land in line as one run of
+   strings, with out pointing into it. Returns how many there were. */
+static unsigned copy_list(uint64_t list, char *line, size_t room, size_t *used,
+                          const char **out, unsigned max) {
+    unsigned n = 0;
+
+    if (list == 0 || !user_range(list, 8)) {
+        out[0] = NULL;
         return 0;
     }
-    for (const uint64_t *p = (const uint64_t *)argv;
-         argc < PROGRAM_ARGS - 1 && user_range((uint64_t)p, 8) && *p != 0; p++) {
+    for (const uint64_t *p = (const uint64_t *)list;
+         n < max - 1 && user_range((uint64_t)p, 8) && *p != 0; p++) {
         const char *word = user_string(*p);
-        size_t n = word == NULL ? 0 : strlen(word);
+        size_t len = word == NULL ? 0 : strlen(word) + 1;
 
-        if (word == NULL || len + n + 1 > SPAWN_LINE) {
+        if (word == NULL || *used + len > room) {
             break;
         }
-        out[argc++] = line + len;
-        memcpy(line + len, word, n + 1);
-        len += n + 1;
+        out[n++] = line + *used;
+        memcpy(line + *used, word, len);
+        *used += len;
     }
-    out[argc] = NULL;
-    line[len] = '\0';              /* where a line with no arguments ends */
-    return argc;
+    out[n] = NULL;
+    return n;
 }
 
-/* The words after the first, joined back up: a built-in is handed the rest
-   of the line rather than a list of words. The NULs between them become
-   spaces again, which leaves the list pointing into the middle of it - so
-   this runs only once nothing is going to read that list. */
+/* The words after the first, joined back up: a built-in is handed the rest of
+   the line rather than a list of words. */
 static char *join_args(char *line, unsigned argc) {
     size_t first = strlen(line) + 1;
 
@@ -2647,23 +3686,67 @@ static char *join_args(char *line, unsigned argc) {
     return line + first;
 }
 
-static uint64_t sys_spawn(uint64_t path, uint64_t argv, uint64_t out) {
+/* Everything execve has to carry from the old program's memory to the new
+   one's, in one block borrowed from the firmware. */
+struct exec_args {
+    char        line[EXEC_LINE];
+    char        name[FS_NAME_LEN];
+    char        script[FS_NAME_LEN];    /* the file, once "#!" has named the
+                                           program that is to run it */
+    char        shebang[FS_NAME_LEN * 2];
+    const char *words[EXEC_ARGS];
+    const char *env[EXEC_ENV];
+    const char *rest[EXEC_ARGS];        /* the list "#!" builds, before it
+                                           replaces the one above */
+};
+
+/* "#!" at the front of a file names the program that runs it, the way Linux
+   has read it since the seventies - and optionally one argument to hand that
+   program before the file itself. Reports the two, pointing into out, or
+   false if the file does not begin that way. */
+static bool shebang(const struct fs_file *file, char *out, size_t max,
+                    const char **interp, const char **extra) {
+    size_t n = 0;
+
+    *interp = *extra = NULL;
+    if (file->size < 3 || read_at(file, 0, out, file->size < max - 1 ? file->size
+                                                                     : max - 1) < 0) {
+        return false;
+    }
+    out[file->size < max - 1 ? file->size : max - 1] = '\0';
+    if (out[0] != '#' || out[1] != '!') {
+        return false;
+    }
+    for (n = 2; out[n] == ' ' || out[n] == '\t'; n++) {
+    }
+    *interp = out + n;
+    while (out[n] != '\0' && out[n] != '\n' && out[n] != ' ' && out[n] != '\t') {
+        n++;
+    }
+    if (out[n] == ' ' || out[n] == '\t') {
+        out[n++] = '\0';
+        while (out[n] == ' ' || out[n] == '\t') {
+            n++;
+        }
+        if (out[n] != '\0' && out[n] != '\n') {
+            *extra = out + n;
+            while (out[n] != '\0' && out[n] != '\n') {
+                n++;
+            }
+        }
+    }
+    out[n] = '\0';                  /* the end of the line, either way */
+    return **interp != '\0';
+}
+
+static uint64_t sys_execve(uint64_t path, uint64_t argv, uint64_t envp) {
     const char *given = user_string(path);
-    const struct proc_cmd *cmd;
     struct efi_boot_services *bs = services();
-    uint64_t out_max = arg[3];
-    /* The name, the arguments, and the list pointing into them. Borrowed
-       rather than kept on the stack: a program may start a program which
-       starts a program, and a kilobyte of stack a time is what the kernel's
-       own stack would then have to be sized for. */
-    struct args {
-        char        line[SPAWN_LINE];
-        char        name[FS_NAME_LEN];
-        const char *words[PROGRAM_ARGS];
-    } *held = NULL;
-    void *taken = NULL;
+    const struct proc_cmd *cmd;
+    struct exec_args *held = NULL;
     struct fs_file file;
-    struct saved *state;
+    size_t used = 0;
+    unsigned argc, envc;
     uint64_t entry;
     int code;
 
@@ -2673,77 +3756,84 @@ static uint64_t sys_spawn(uint64_t path, uint64_t argv, uint64_t out) {
     if (EFI_ERROR(bs->allocate_pool(EFI_LOADER_DATA, sizeof *held, (void **)&held))) {
         return ERR(ENOMEM);
     }
-    char *const name = held->name;
-    char *const line = held->line;
-    const char **const words = held->words;
-
-    if (out != 0) {
-        if (out_max > SPAWN_OUT) {
-            out_max = SPAWN_OUT;
-        }
-        if (!user_range(out, out_max) || out_max == 0) {
-            bs->free_pool(held);
-            return ERR(EFAULT);
-        }
-        if (EFI_ERROR(bs->allocate_pool(EFI_LOADER_DATA, out_max, &taken))) {
-            bs->free_pool(held);
-            return ERR(ENOMEM);
-        }
-    }
-    strcpy(name, given);
-    unsigned argc = spawn_args(argv, line, words);
-
+    strcpy(held->name, given);
+    argc = copy_list(argv, held->line, sizeof held->line, &used, held->words, EXEC_ARGS);
+    envc = copy_list(envp, held->line, sizeof held->line, &used, held->env, EXEC_ENV);
     if (argc == 0) {
-        words[0] = name;            /* called with no name of its own */
-        words[1] = NULL;
+        held->words[0] = held->name;
+        held->words[1] = NULL;
         argc = 1;
     }
-    if (taken != NULL) {
-        vga_capture(taken, out_max);
-    }
 
-    /* A built-in is kernel code: there is no window to put aside, and
-       nothing to load. It simply runs. */
-    if ((cmd = proc_command(name)) != NULL) {
-        proc_run(cmd, join_args(line, argc));
-        code = 0;
-        goto done;
-    }
-    if (fs_stat(name, &file) != 0 || file.size == 0) {
-        code = -1;
-        goto done;
-    }
-    if (vm_memory() != 0 || spawn_depth == SPAWN_DEPTH) {
-        code = -2;                  /* too deep, or too much to put aside */
-        goto done;
-    }
-    if ((state = context_save()) == NULL) {
-        code = -3;
-        goto done;
-    }
-    spawn_depth++;
+    /* A kernel built-in is not a file: there is nothing to load, and nothing
+       to give a region of its own. It simply runs, and that is the program.
+       It prints rather than writing to a descriptor, so when the shell has
+       sent its output somewhere else what it prints is taken and written
+       there - which is what makes `mem | head` and `uptime > file` work. */
+    if ((cmd = proc_command(held->name)) != NULL) {
+        void *taken = NULL;
 
-    code = program_load(&file, &entry);
-    code = code < 0 ? code : program_run(entry, argc, words);
-
-    spawn_depth--;
-    context_restore(state);
-
-done:
-    if (taken != NULL) {
-        vga_capture_end();
-        memcpy((void *)out, taken, out_max);
-        bs->free_pool(taken);
+        if (!is_console(1) &&
+            !EFI_ERROR(bs->allocate_pool(EFI_LOADER_DATA, PROC_OUT, &taken))) {
+            vga_capture(taken, PROC_OUT);
+        }
+        proc_run(cmd, join_args(held->line, argc));
+        if (taken != NULL) {
+            vga_capture_end();
+            write_to(handle_of(1), (uint64_t)taken, strlen(taken));
+            bs->free_pool(taken);
+        }
+        bs->free_pool(held);
+        user_exit(0);
     }
-    bs->free_pool(held);
-    if (code == -1) {
+    if (fs_stat(held->name, &file) != 0 || file.size == 0) {
+        bs->free_pool(held);
         return ERR(ENOENT);
     }
-    if (code == -2 || code == -3) {
+
+    const char *interp, *extra;
+
+    if (shebang(&file, held->shebang, sizeof held->shebang, &interp, &extra)) {
+        const char **rest = held->rest;
+        unsigned n = 0;
+
+        strcpy(held->script, held->name);
+        rest[n++] = interp;
+        if (extra != NULL) {
+            rest[n++] = extra;
+        }
+        rest[n++] = held->script;   /* what it is being asked to run */
+        for (unsigned i = 1; i < argc && n < EXEC_ARGS - 1; i++) {
+            rest[n++] = held->words[i];
+        }
+        rest[n] = NULL;
+        memcpy(held->words, rest, (n + 1) * sizeof rest[0]);
+        argc = n;
+        if (strlen(interp) + 1 > FS_NAME_LEN) {
+            bs->free_pool(held);
+            return ERR(EINVAL);
+        }
+        strcpy(held->name, interp);
+        if (fs_stat(held->name, &file) != 0 || file.size == 0) {
+            bs->free_pool(held);
+            return ERR(ENOENT);
+        }
+    }
+    /* A region of its own, so that whoever forked this child keeps theirs. */
+    if (!vm_push()) {
+        bs->free_pool(held);
         return ERR(ENOMEM);
     }
-    if (code == PROGRAM_EINVAL || code == PROGRAM_ENOINTERP) {
-        return ERR(ENOEXEC);
+    code = program_load(&file, &entry);
+    if (code == 0) {
+        /* Its files are what the fork left it - a shell sets those up between
+           the fork and here, and that is what a redirection is. */
+        code = program_run(entry, argc, held->words, envc, held->env, false);
+    } else {
+        dbg("exec: %s could not be loaded (%d)\n", held->name, (uint64_t)code);
+        code = 127;
     }
-    return code < 0 ? ERR(EIO) : (uint64_t)code;
+    vm_pop();
+    bs->free_pool(held);
+    user_exit(code);
 }

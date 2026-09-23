@@ -22,11 +22,6 @@
 #define KERNEL_BASE   0x200000          /* the kernel image, its bss and stack */
 #define KERNEL_BYTES  0x200000
 
-/* The ring 3 window, at PROGRAM_BASE. The loader does not reserve it: the
-   kernel buys it from the firmware a page at a time as a program touches it,
-   so an idle machine holds none of it. */
-#define PROGRAM_BYTES 0x200000
-
 struct boot_info {
     uint64_t magic;
 

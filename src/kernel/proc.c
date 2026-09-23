@@ -185,13 +185,35 @@ static void cmd_mem(char *args) {
     vga_putc('\n');
     detail("console", m.console);
     vga_putc('\n');
+    if (m.disk_cache > 0) {
+        detail("disk cache", m.disk_cache);
+        vga_putc('\n');
+    }
     if (m.wallpaper > 0) {
         detail("wallpaper", m.wallpaper);
         vga_putc('\n');
     }
-    detail("program window", m.window);
+    detail("the program", m.window);
     vga_putc('\n');
     color(COL_TEXT);
+}
+
+/* Switching the machine off, and starting it again. Both are one call to the
+   firmware, so there is nothing for a program on the disk to be: the power
+   menu in the status bar types these at the prompt like anything else. */
+static void cmd_poweroff(char *args) {
+    (void)args;
+    efi_power_off();
+}
+
+static void cmd_reboot(char *args) {
+    (void)args;
+    efi_restart();
+}
+
+static void cmd_clear(char *args) {
+    (void)args;
+    vga_clear();
 }
 
 /* How long the machine has been up, counted from the first thing the loader
@@ -215,7 +237,7 @@ static void cmd_uptime(char *args) {
 /* ---- remaps --------------------------------------------------------------
  *
  * One folder standing in for another, which is how a program that knows only
- * where Linux keeps things finds where this disk keeps them: /conf/sys/remap.conf
+ * where Linux keeps things finds where this disk keeps them: /conf/sys/remap
  * sends /.config to /conf/pkg, so a program writing its settings to
  * /.config/<name> writes them to /conf/pkg/<name> without knowing it. The
  * swap happens in the filesystem, so it holds for every command and every
@@ -316,6 +338,9 @@ static const struct proc_cmd commands[] = {
     { "uptime", "",                  cmd_uptime },
     { "remap",  "[folder folder]",   cmd_remap  },
     { "log",    "[on|off|clear]",    cmd_log },
+    { "clear",  "",                  cmd_clear },
+    { "reboot", "",                  cmd_reboot },
+    { "poweroff", "",                cmd_poweroff },
 };
 
 #define COMMAND_COUNT (sizeof commands / sizeof commands[0])

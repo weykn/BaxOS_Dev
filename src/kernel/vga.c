@@ -45,7 +45,7 @@ static uint32_t gop_taken = 0xFFFFFFFF;     /* the mode the console was laid out
    and comparing against it is what keeps unchanged cells from being redrawn
    into a framebuffer that is slow to write.
  *
- * One row past the cells on screen is scratch, where the title bar is built.
+ * The whole screen is text: there is no row reserved for anything else.
  * It is firmware memory: a console can want anything from twelve to sixty
  * kilobytes depending on the mode and the font, which is far too much to set
  * aside for the largest case. */
@@ -63,7 +63,7 @@ static char     mode_name[16];                  /* "1024x768", for vga_mode */
 static char     list_name[16];                  /* one entry of the mode list */
 
 static unsigned width;          /* columns */
-static size_t   cells;          /* on screen, title bar included */
+static size_t   cells;          /* on screen */
 static size_t   cursor;         /* row * width + column */
 static uint8_t  color = VGA_LIGHTGRAY;
 
@@ -198,7 +198,7 @@ static void cursor_draw(bool on) {
 
 /* Writes a cell. Drawing a glyph costs a cell's worth of pixels, so one that
    already holds what it is being given is left alone - which is most of the
-   title bar, every second, and most of a scroll. */
+   screen, and most of a scroll. */
 static void put(size_t i, uint16_t value) {
     if (screen[i] != value) {
         screen[i] = value;
@@ -231,7 +231,7 @@ uint32_t vga_rgb(uint8_t r, uint8_t g, uint8_t b) {
 static bool layout(void) {
     unsigned columns = fb_width / cell_w;
     unsigned rows = fb_height / cell_h;
-    size_t bytes = (size_t)columns * (rows + 1) * sizeof(uint16_t);
+    size_t bytes = (size_t)columns * rows * sizeof(uint16_t);
     struct efi_boot_services *bs = efi_boot()->system->boot;
     void *memory;
 
@@ -252,7 +252,7 @@ static bool layout(void) {
     /* The screen holds whatever it held before, so agree with it: every cell
        blank and black, and the whole of it painted to match. Otherwise put()
        would skip cells it wrongly believed were already drawn. */
-    for (size_t i = 0; i < cells + width; i++) {
+    for (size_t i = 0; i < cells; i++) {
         screen[i] = 0;
     }
     fill_background(0, fb_height);
@@ -325,26 +325,6 @@ static const struct efi_gop_info *gop_mode(unsigned i) {
     return mode;
 }
 
-/* ---- the pointer ---------------------------------------------------------
- *
- * An arrow eight pixels wide and twelve tall: one bitmap for the white
- * inside, one for the black edge that keeps it visible against anything. It
- * is erased by redrawing the cells it covered out of the shadow, which is
- * why the shadow has to say what is on screen at all times. */
-
-#define POINTER_W 8
-#define POINTER_H 12
-
-static const uint8_t pointer_edge[POINTER_H] = {
-    0x80, 0xC0, 0xA0, 0x90, 0x88, 0x84, 0x82, 0x81, 0x8F, 0xAA, 0xCA, 0x06,
-};
-static const uint8_t pointer_fill[POINTER_H] = {
-    0x00, 0x00, 0x40, 0x60, 0x70, 0x78, 0x7C, 0x7E, 0x70, 0x44, 0x04, 0x00,
-};
-
-static unsigned pointer_x, pointer_y;
-static bool     pointer_on;
-
 unsigned vga_pixel_width(void) {
     return fb_width;
 }
@@ -353,111 +333,15 @@ unsigned vga_pixel_height(void) {
     return fb_height;
 }
 
-/* Puts back the cells the arrow was covering. */
-static void pointer_erase(void) {
-    unsigned first_row, last_row, first_col, last_col;
-
-    if (!pointer_on || cell_w == 0) {
-        return;
-    }
-    first_row = pointer_y / cell_h;
-    last_row = (pointer_y + POINTER_H - 1) / cell_h;
-    first_col = pointer_x / cell_w;
-    last_col = (pointer_x + POINTER_W - 1) / cell_w;
-
-    for (unsigned r = first_row; r <= last_row && r * width < cells; r++) {
-        for (unsigned c = first_col; c <= last_col && c < width; c++) {
-            size_t i = (size_t)r * width + c;
-
-            if (i < cells) {
-                draw_cell(i, screen[i]);
-            }
-        }
-    }
-    pointer_on = false;
-}
-
-static void pointer_draw(void) {
-    for (unsigned y = 0; y < POINTER_H && pointer_y + y < fb_height; y++) {
-        volatile uint32_t *line = row(pointer_y + y);
-
-        for (unsigned x = 0; x < POINTER_W && pointer_x + x < fb_width; x++) {
-            uint8_t bit = (uint8_t)(0x80 >> x);
-
-            if (pointer_fill[y] & bit) {
-                line[pointer_x + x] = palette[VGA_WHITE];
-            } else if (pointer_edge[y] & bit) {
-                line[pointer_x + x] = palette[VGA_BLACK];
-            }
-        }
-    }
-    pointer_on = true;
-}
-
-/* Cheap to call in a polling loop: if the arrow is already drawn where it
-   belongs, there is nothing to do. */
-void vga_pointer(unsigned x, unsigned y) {
-    if (pointer_on && x == pointer_x && y == pointer_y) {
-        return;
-    }
-    pointer_erase();
-    pointer_x = x;
-    pointer_y = y;
-    pointer_draw();
-}
-
-void vga_pointer_off(void) {
-    pointer_erase();
-}
-
-/* The run of non-blank characters under the pixel, which is what a click on
-   a name in a listing should pick up. Returns its length. */
-size_t vga_word_at(unsigned x, unsigned y, char *out, size_t max) {
-    unsigned r, c, first, last;
-    size_t n = 0;
-
-    if (cell_w == 0 || y / cell_h == 0) {
-        return 0;                   /* the title bar is not text to take */
-    }
-    r = y / cell_h;
-    c = x / cell_w;
-    if (c >= width || (size_t)r * width >= cells) {
-        return 0;
-    }
-    size_t base = (size_t)r * width;
-    if ((screen[base + c] & 0xFF) == ' ') {
-        return 0;
-    }
-    for (first = c; first > 0 && (screen[base + first - 1] & 0xFF) != ' '; first--) {
-    }
-    for (last = c; last + 1 < width && (screen[base + last + 1] & 0xFF) != ' '; last++) {
-    }
-    for (unsigned i = first; i <= last && n + 1 < max; i++) {
-        out[n++] = (char)(screen[base + i] & 0xFF);
-    }
-    out[n] = '\0';
-    return n;
-}
-
 static void repaint(void);
 
 void vga_background(const uint32_t *new_picture) {
     picture = new_picture;
-    pointer_on = false;             /* the pixels under it are about to go */
     /* Only the scan lines below the last row of text: repainting the cells
        covers everything above, and a screen's worth of writes into a
        framebuffer is slow enough to be worth not doing twice. */
     fill_background((unsigned)(cells / width) * cell_h, fb_height);
     repaint();
-}
-
-bool vga_cell_at(unsigned x, unsigned y, unsigned *column, unsigned *row) {
-    if (cell_w == 0 || x / cell_w >= width || (size_t)(y / cell_h) * width >= cells) {
-        return false;
-    }
-    *column = x / cell_w;
-    *row = y / cell_h;
-    return true;
 }
 
 uint16_t vga_get(unsigned column, unsigned row) {
@@ -470,7 +354,6 @@ void vga_put(unsigned column, unsigned row, uint16_t value) {
     size_t i = (size_t)row * width + column;
 
     if (column < width && i < cells) {
-        pointer_erase();            /* the glyph would draw over it */
         put(i, value);
     }
 }
@@ -625,32 +508,18 @@ void vga_set_color(enum vga_color fg, enum vga_color bg) {
 }
 
 void vga_clear(void) {
-    pointer_on = false;             /* whatever it covered is about to go */
-    /* Everything below the title bar in one sweep, the leftover scan lines
-       under the last full row included, and then the cells to match. */
+    /* The whole screen in one sweep, the leftover scan lines under the last
+       full row included, and then the cells to match. */
     if ((color >> 4 & 0x0F) == VGA_BLACK) {
-        fill_background(cell_h, fb_height);
+        fill_background(0, fb_height);
     } else {
-        fill_rows(cell_h, fb_height, palette[color >> 4 & 0x0F]);
+        fill_rows(0, fb_height, palette[color >> 4 & 0x0F]);
     }
-    for (size_t i = width; i < cells; i++) {
+    for (size_t i = 0; i < cells; i++) {
         screen[i] = cell(' ');
     }
-    cursor = width;
+    cursor = 0;
     cursor_draw(true);
-}
-
-void vga_title_cell(unsigned column, char c, uint8_t attr) {
-    if (column < width) {
-        screen[cells + column] = (uint16_t)((uint8_t)c | attr << 8);
-    }
-}
-
-void vga_title(void) {
-    pointer_erase();                /* the bar would draw straight over it */
-    for (size_t i = 0; i < width; i++) {
-        put(i, screen[cells + i]);
-    }
 }
 
 /* ---- escape sequences ----------------------------------------------------
@@ -669,6 +538,7 @@ void vga_title(void) {
 
 static enum { PLAIN, AFTER_ESC, IN_CSI } escape;
 static unsigned params[PARAMS], param_count;
+static bool     private;        /* a sequence about the terminal, not the screen */
 
 /* ANSI numbers colours in its own order, which is VGA's with red and blue
    swapped; bright is the same eight again with bit three set. */
@@ -695,6 +565,10 @@ static void set_graphics(void) {
             color = (uint8_t)((color & 0x0F) | ansi_colors[n - 40] << 4);
         } else if (n >= 100 && n <= 107) {
             color = (uint8_t)((color & 0x0F) | (ansi_colors[n - 100] | 0x08) << 4);
+        } else if (n == 7 || n == 27) {
+            /* Reverse video, which is one attribute byte with its two halves
+               the other way round. Turning it off is turning it on again. */
+            color = (uint8_t)((color >> 4 & 0x0F) | (color & 0x0F) << 4);
         }
     }
 }
@@ -705,17 +579,82 @@ static void erase(char what) {
         vga_clear();
         return;
     }
-    size_t last = what == 'J' ? cells : cursor + (width - cursor % width);
+    size_t first = cursor, last = cursor + (width - cursor % width);
 
-    for (size_t i = cursor; i < last; i++) {
+    if (what == 'J') {
+        last = cells;
+    } else if (param_count > 0 && params[0] == 1) {
+        first = cursor - cursor % width;
+        last = cursor + 1;
+    } else if (param_count > 0 && params[0] == 2) {
+        first = cursor - cursor % width;
+    }
+    for (size_t i = first; i < last; i++) {
         put(i, cell(' '));
     }
 }
 
-/* Row 1 is the first row under the title bar, which is not a program's to
-   draw on. */
+/* The first parameter, or one when there is none: what every sequence that
+   takes a count means by leaving it out. */
+static size_t count_param(void) {
+    return param_count > 0 && params[0] > 0 ? params[0] : 1;
+}
+
+/* Moves the cursor about the screen without printing anything. Row 0 is the
+   title bar, which is not a program's to draw on. */
+static void move_by(char what) {
+    size_t row = cursor / width, column = cursor % width;
+    size_t n = count_param();
+
+    switch (what) {
+    case 'A':
+        row = row > n ? row - n : 0;
+        break;
+    case 'B':
+        row = row + n < vga_height() ? row + n : vga_height() - 1;
+        break;
+    case 'C':
+        column = column + n < width ? column + n : width - 1;
+        break;
+    case 'D':
+        column = column > n ? column - n : 0;
+        break;
+    case 'G':
+        column = n - 1 < width ? n - 1 : width - 1;
+        break;
+    default:
+        return;
+    }
+    cursor = row * width + column;
+}
+
+/* Opens a gap in the line at the cursor, or closes one: what a terminal does
+   for a program editing a line in the middle of it. The rest of the line
+   moves, and nothing beyond the line is touched. */
+static void shift_line(bool open) {
+    size_t start = cursor, end = cursor - cursor % width + width;
+    size_t n = count_param();
+
+    if (n > end - start) {
+        n = end - start;
+    }
+    if (open) {
+        for (size_t i = end; i-- > start + n;) {
+            put(i, screen[i - n]);
+        }
+        for (size_t i = start; i < start + n; i++) {
+            put(i, cell(' '));
+        }
+    } else {
+        for (size_t i = start; i < end; i++) {
+            put(i, i + n < end ? screen[i + n] : cell(' '));
+        }
+    }
+}
+
+/* Rows and columns are counted from one, as a terminal counts them. */
 static void move_cursor(void) {
-    size_t row = param_count > 0 && params[0] > 0 ? params[0] : 1;
+    size_t row = param_count > 0 && params[0] > 0 ? params[0] - 1 : 0;
     size_t column = param_count > 1 && params[1] > 0 ? params[1] - 1 : 0;
 
     if (row * width + column < cells) {
@@ -724,9 +663,6 @@ static void move_cursor(void) {
 }
 
 /* One character of a sequence. True if it was taken. */
-/* Something to do with how far through its work a program says it is: the
-   loading screen's bar. */
-static void (*progress_hook)(unsigned done, unsigned total);
 
 static bool escaped(char c) {
     if (escape == PLAIN) {
@@ -741,6 +677,15 @@ static bool escaped(char c) {
            sequence this does not know, and is dropped with it. */
         escape = c == '[' ? IN_CSI : PLAIN;
         params[0] = param_count = 0;
+        private = false;
+        return true;
+    }
+    if (c == '?' || c == '<' || c == '=' || c == '>') {
+        /* A terminal's own settings rather than anything drawn - bracketed
+           paste, which readline turns on, is "escape [ ? 2 0 0 4 h". None of
+           them mean anything to this screen, and the whole sequence is
+           swallowed rather than half-read. */
+        private = true;
         return true;
     }
     if (c >= '0' && c <= '9') {
@@ -760,6 +705,10 @@ static bool escaped(char c) {
         return true;
     }
     escape = PLAIN;                 /* the final letter ends it either way */
+    if (private) {
+        private = false;
+        return true;
+    }
     switch (c) {
     case 'm':
         set_graphics();
@@ -772,14 +721,18 @@ static bool escaped(char c) {
     case 'f':
         move_cursor();
         break;
-    case 'q':
-        /* Not a terminal's: this machine's own, for how far through its
-           start-up script the shell is. It is a sequence rather than a
-           syscall because the shell already has the console open, and
-           because printing it costs a program nothing to leave in. */
-        if (progress_hook != NULL) {
-            progress_hook(params[0], param_count > 1 ? params[1] : 0);
-        }
+    case 'A':
+    case 'B':
+    case 'C':
+    case 'D':
+    case 'G':
+        move_by(c);
+        break;
+    case '@':
+        shift_line(true);
+        break;
+    case 'P':
+        shift_line(false);
         break;
     default:
         break;                      /* something else: dropped */
@@ -789,9 +742,13 @@ static bool escaped(char c) {
 
 /* ---- capture -------------------------------------------------------------
  *
- * Output can be taken into a buffer instead of onto the screen, which is how
- * the shell reads what a command printed: everything that shows on screen
- * comes through here, whether the kernel printed it or a program wrote it. */
+ * Output can be taken into a buffer instead of onto the screen. A kernel
+ * command prints rather than writing to a descriptor - it is kernel code, and
+ * there is nothing else for it to print on - so this is how what one prints
+ * reaches a pipe or a file when the shell has redirected it.
+ *
+ * Colour is dropped on the way: nothing is being coloured, and a sequence
+ * meant for a screen is noise in a file. */
 
 static char  *capture;
 static size_t capture_max, capture_len;
@@ -807,22 +764,9 @@ void vga_capture_end(void) {
     capture = NULL;
 }
 
-/* Something to do before the next character reaches the screen - taking a
-   loading screen down, so that what is printed lands on a clear one. It is
-   asked once and then forgotten. */
-static void (*print_hook)(void);
-
-void vga_on_print(void (*hook)(void)) {
-    print_hook = hook;
-}
-
-void vga_on_progress(void (*hook)(unsigned done, unsigned total)) {
-    progress_hook = hook;
-}
-
 void vga_putc(char c) {
     if (capture != NULL) {
-        if (capture_len + 1 < capture_max) {
+        if (!escaped(c) && capture_len + 1 < capture_max) {
             capture[capture_len++] = c;
             capture[capture_len] = '\0';
         }
@@ -834,30 +778,40 @@ void vga_putc(char c) {
     if (escaped(c)) {
         return;
     }
-    if (print_hook != NULL) {
-        void (*hook)(void) = print_hook;
-
-        print_hook = NULL;          /* before it runs, so it may print */
-        hook();
-    }
     dbg_screen(c);
-    pointer_erase();
     cursor_draw(false);
 
     if (c == '\n') {
         cursor += width - cursor % width;
+    } else if (c == '\r') {
+        cursor -= cursor % width;
     } else if (c == '\b') {
-        if (cursor > width) {
-            put(--cursor, cell(' '));
+        /* A move, not an erase: that is what a terminal does with it, and
+           what a program editing a line in place counts on. Rubbing a
+           character out is "\b \b", which is what the console echoes. */
+        if (cursor % width > 0) {
+            cursor--;
         }
+    } else if (c == '\t') {
+        do {
+            put(cursor++, cell(' '));
+        } while (cursor % 8 != 0 && cursor % width != 0);
+    } else if ((unsigned char)c < 0x20 || c == 0x7F) {
+        /* A control character this screen has no answer for - the bell most
+           of all, which readline rings whenever an edit does nothing, a
+           backspace at the start of a line among them. The font has a glyph
+           at every code, so printing one drew a stray dot on the line being
+           typed. A terminal shows nothing for these, and nor does this. */
+        cursor_draw(true);
+        return;
     } else {
         put(cursor++, cell(c));
     }
 
-    /* Off the bottom: scroll everything under the title bar up a row. Reading
-       a row ahead of the one being written keeps this a single pass. */
+    /* Off the bottom: scroll everything up a row. Reading a row ahead of the
+       one being written keeps this a single pass. */
     if (cursor >= cells) {
-        for (size_t i = width; i < cells; i++) {
+        for (size_t i = 0; i < cells; i++) {
             put(i, i < cells - width ? screen[i + width] : cell(' '));
         }
         cursor -= width;

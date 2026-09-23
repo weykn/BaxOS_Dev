@@ -13,13 +13,11 @@
 
 #define STATUS_OUTPUT 0x01      /* a byte is waiting */
 #define STATUS_INPUT  0x02      /* the controller is still taking the last one */
-#define STATUS_AUX    0x20      /* and it came from the mouse, not the keyboard */
+#define STATUS_AUX    0x20      /* and it came from the second port, not the keyboard */
 
 #define CMD_READ_CONFIG  0x20
 #define CMD_WRITE_CONFIG 0x60
-#define CMD_ENABLE_AUX   0xA8
 #define CMD_ENABLE_KBD   0xAE
-#define CMD_TO_AUX       0xD4
 
 #define CONFIG_IRQS      0x03   /* interrupts, which nothing here takes */
 #define CONFIG_CLOCKS    0x30   /* set, they switch a port off */
@@ -27,17 +25,15 @@
 
 #define DEV_ENABLE   0xF4
 
-/* ACPI's names for PS/2 devices, compressed the EISA way: PNP03xx is a
-   keyboard, PNP0Fxx a mouse. */
+/* ACPI's name for a PS/2 keyboard, compressed the EISA way: PNP03xx. */
 #define EISA_PNP      0x41D0
 #define PNP_KEYBOARD  0x03
-#define PNP_MOUSE     0x0F
 
 static bool present;
 
 /* ---- stopping the firmware's drivers ------------------------------------ */
 
-/* Whether a handle's device path ends at a PS/2 keyboard or mouse. */
+/* Whether a handle's device path ends at a PS/2 keyboard. */
 static bool is_ps2(efi_handle handle) {
     struct efi_guid guid = EFI_DEVICE_PATH_GUID;
     struct efi_device_path *node;
@@ -53,7 +49,7 @@ static bool is_ps2(efi_handle handle) {
             uint32_t hid = *(uint32_t *)((uint8_t *)node + 4);
             unsigned kind = hid >> 24;      /* PNP0303 is 0x030341D0 */
 
-            if ((hid & 0xFFFF) == EISA_PNP && (kind == PNP_KEYBOARD || kind == PNP_MOUSE)) {
+            if ((hid & 0xFFFF) == EISA_PNP && kind == PNP_KEYBOARD) {
                 return true;
             }
         }
@@ -141,7 +137,7 @@ bool ps2_init(void) {
     present = true;
     drain();
 
-    /* Both ports on, set 1 scancodes, no interrupts: it is polled. */
+    /* The keyboard port on, set 1 scancodes, no interrupts: it is polled. */
     command(CMD_READ_CONFIG);
     int config = read_byte(false);
     if (config < 0) {
@@ -151,26 +147,12 @@ bool ps2_init(void) {
     command(CMD_WRITE_CONFIG);
     data((uint8_t)config);
     command(CMD_ENABLE_KBD);
-    command(CMD_ENABLE_AUX);
 
     data(DEV_ENABLE);               /* the firmware may have left it quiet */
     (void)read_byte(false);
 
     dbg("ps2: config %x\n", (uint64_t)config);
     return true;
-}
-
-int ps2_aux_send(uint8_t value) {
-    if (!present) {
-        return -1;
-    }
-    command(CMD_TO_AUX);
-    data(value);
-    return read_byte(true);
-}
-
-int ps2_aux_read(void) {
-    return present ? read_byte(true) : -1;
 }
 
 /* ---- the keyboard ------------------------------------------------------- */
@@ -219,6 +201,31 @@ static char    keys[KEYS];
 static uint8_t key_head, key_tail;
 static bool    shift, ctrl, caps, extended;
 
+static void key_push(char c) {
+    if (c != 0 && (uint8_t)(key_tail - key_head) < KEYS) {
+        keys[key_tail++ % KEYS] = c;
+    }
+}
+
+/* What a key with no character of its own sends: the escape sequence every
+   terminal has sent for it since the VT100, which is what a program doing
+   its own line editing - a shell's readline - is watching for. */
+static const char *grey_key(uint8_t code) {
+    switch (code) {
+    case 0x48: return "\033[A";     /* up */
+    case 0x50: return "\033[B";     /* down */
+    case 0x4D: return "\033[C";     /* right */
+    case 0x4B: return "\033[D";     /* left */
+    case 0x47: return "\033[H";     /* home */
+    case 0x4F: return "\033[F";     /* end */
+    case 0x52: return "\033[2~";    /* insert */
+    case 0x53: return "\033[3~";    /* delete */
+    case 0x49: return "\033[5~";    /* page up */
+    case 0x51: return "\033[6~";    /* page down */
+    default:   return NULL;
+    }
+}
+
 static void key_byte(uint8_t code) {
     uint8_t key = code & ~SC_RELEASE;
     bool was_extended = extended;
@@ -246,7 +253,15 @@ static void key_byte(uint8_t code) {
         return;
     }
     if (was_extended) {
-        /* Of the grey keys, only the keypad's Enter and slash type anything. */
+        const char *text = grey_key(code);
+
+        if (text != NULL) {
+            while (*text != '\0') {
+                key_push(*text++);
+            }
+            return;
+        }
+        /* Of the rest, only the keypad's Enter and slash type anything. */
         c = code == 0x1C ? '\n' : code == 0x35 ? '/' : 0;
     } else if (code < sizeof unshifted) {
         c = shift ? shifted[code] : unshifted[code];
@@ -260,12 +275,8 @@ static void key_byte(uint8_t code) {
            what to do with the rest. Letters come out the same either case. */
         c = (char)(c >= 'a' ? c - 'a' + 1 : c - '@');
     }
-    if (c != 0 && (uint8_t)(key_tail - key_head) < KEYS) {
-        keys[key_tail++ % KEYS] = c;
-    }
+    key_push(c);
 }
-
-/* ---- both --------------------------------------------------------------- */
 
 void ps2_poll(void) {
     if (!present) {
@@ -279,10 +290,8 @@ void ps2_poll(void) {
         }
         uint8_t byte = inb(PS2_DATA);
 
-        if (status & STATUS_AUX) {
-            mouse_ps2_byte(byte);
-        } else {
-            key_byte(byte);
+        if (!(status & STATUS_AUX)) {
+            key_byte(byte);         /* anything from the other port is nobody's */
         }
     }
 }

@@ -15,7 +15,7 @@
  * move. tools/mkfs is built from this file too, to create the disk image. */
 
 #define SECTOR_SIZE    FS_SECTOR
-#define TABLE_SECTORS  12           /* what the table spans */
+#define TABLE_SECTORS  15           /* what the table spans */
 #define TABLE_BYTES    (TABLE_SECTORS * SECTOR_SIZE)
 #define DATA_LBA       (FS_LBA + TABLE_SECTORS)
 

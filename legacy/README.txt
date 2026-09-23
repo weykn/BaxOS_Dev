@@ -1,6 +1,6 @@
 The BIOS boot path. Kept, not built.
 
-BaxOS boots through UEFI now: the screen comes from the firmware's Graphics
+Tuxlet OS boots through UEFI now: the screen comes from the firmware's Graphics
 Output Protocol, the keyboard from its text input protocol, the disk from its
 block I/O protocol and the clock from its runtime services - all of which is
 in src/kernel/efi.c, with the loader in src/boot/uefi.c.

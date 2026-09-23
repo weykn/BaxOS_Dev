@@ -1,4 +1,4 @@
-/* The BaxOS UEFI loader: BOOTX64.EFI.
+/* The Tuxlet OS UEFI loader: BOOTX64.EFI.
  *
  * Firmware hands us a machine already in long mode with everything mapped,
  * so there is no mode switching to do - only finding the things the kernel
@@ -32,7 +32,7 @@ static void say(const uint16_t *text) {
 
 /* Prints the message and stops, leaving it on screen to be read. */
 static void fail(const uint16_t *text) {
-    say(u"BaxOS: ");
+    say(u"Tuxlet OS: ");
     say(text);
     say(u"\r\n");
     for (;;) {
@@ -203,8 +203,7 @@ efi_status EFIAPI efi_main(efi_handle image, struct efi_system_table *table) {
     /* The firmware only binds drivers to what it needed to boot - which
        includes the disk it read this file off, so the filesystem beside us
        on it is usually there for the asking. Only a firmware that has not
-       done that pays for binding the rest here; the kernel does that for the
-       sake of the mouse, later, where the wait is nobody's. */
+       done that pays for binding the rest here. */
     if (!find_disk()) {
         connect_everything();
         find_disk();

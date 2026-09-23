@@ -3,7 +3,7 @@
 build/
 
 # The firmware's copy of its own variables, which `make run` puts beside the
-# build so that booting BaxOS does not write to the system's.
+# build so that booting Tuxlet OS does not write to the system's.
 *.fd
 
 # Screenshots and logs from driving a booted machine.

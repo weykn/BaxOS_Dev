@@ -57,30 +57,12 @@ const char *vga_font_name(unsigned i);
 /* The size in use. */
 const char *vga_font(void);
 
-/* Row 0 is a title bar, which clearing and scrolling leave alone. */
-
-/* Blanks the screen below the title bar and moves the cursor under it. */
+/* Blanks the screen and puts the cursor in its corner. */
 void vga_clear(void);
 
-/* The title bar is built a cell at a time and then drawn in one go, so that
-   only the cells that actually changed are redrawn. The half-built bar is
-   kept in video memory rather than RAM, as the console itself is. */
-void vga_title_cell(unsigned column, char c, uint8_t attr);
-void vga_title(void);
-
-/* The screen in pixels, which is what the pointer is measured in. */
+/* The screen in pixels, which is what a picture behind the text is drawn in. */
 unsigned vga_pixel_width(void);
 unsigned vga_pixel_height(void);
-
-/* Draws the pointer at a pixel, putting back whatever the last one covered;
-   vga_pointer_off just puts it back. Printing anything takes the pointer off
-   the screen, so the two never fight over the same pixels. */
-void vga_pointer(unsigned x, unsigned y);
-void vga_pointer_off(void);
-
-/* The run of non-blank characters under a pixel - the name a click landed
-   on. Copies it into out and returns its length. */
-size_t vga_word_at(unsigned x, unsigned y, char *out, size_t max);
 
 /* Packs a colour the way this screen's pixels want it. */
 uint32_t vga_rgb(uint8_t r, uint8_t g, uint8_t b);
@@ -94,9 +76,6 @@ void vga_background(const uint32_t *picture);
 /* Whether a wallpaper is in use. It is dropped if the screen changes size
    under it, so whoever owns the pixels has to look. */
 bool vga_has_background(void);
-
-/* The cell under a pixel. False if there is none there. */
-bool vga_cell_at(unsigned x, unsigned y, unsigned *column, unsigned *row);
 
 /* Reads and writes one cell anywhere on screen, title bar included, as a
    character in the low byte and an attribute in the high one. For things
@@ -117,18 +96,11 @@ size_t vga_memory(void);
 void vga_follow(void);
 
 /* Takes everything printed into buf, up to max bytes and NUL-terminated,
-   rather than onto the screen, until vga_capture_end. What a command prints
-   is read this way; it does not nest. */
+   rather than onto the screen, until vga_capture_end. Colour is left out.
+   What a kernel command prints is read this way when the shell has sent its
+   output somewhere other than the screen; it does not nest. */
 void vga_capture(char *buf, size_t max);
 void vga_capture_end(void);
-
-/* Calls hook once, just before the next character is drawn on screen, and
-   forgets it. NULL cancels. Captured output does not count as drawn. */
-void vga_on_print(void (*hook)(void));
-
-/* Something to do when a program reports its progress - ESC [ done ; total q
-   - which is how the shell drives the loading screen's bar. */
-void vga_on_progress(void (*hook)(unsigned done, unsigned total));
 
 void vga_set_color(enum vga_color fg, enum vga_color bg);
 void vga_putc(char c);

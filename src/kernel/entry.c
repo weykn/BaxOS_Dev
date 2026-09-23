@@ -4,7 +4,6 @@
 #include "fs.h"
 #include "io.h"
 #include "shell.h"
-#include "status.h"
 #include "syscall.h"
 #include "vga.h"
 
@@ -16,7 +15,7 @@ void kernel_main(struct boot_info *info) {
         halt_forever();
     }
     efi_init(info);
-    dbg("baxos: kernel up\n");
+    dbg("tuxlet: kernel up\n");
     if (vga_start(info) < 0) {
         halt_forever();
     }
@@ -26,9 +25,6 @@ void kernel_main(struct boot_info *info) {
         kprintf("fs: %s\n", fs_error(err));
     }
     syscall_init();
-    status_init();
 
-    /* The mouse waits with the drivers it may need: the shell starts both
-       once it is idle, rather than the machine starting slower for them. */
     shell_run();                    /* never returns: poweroff is a command */
 }

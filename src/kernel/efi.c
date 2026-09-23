@@ -1,3 +1,5 @@
+#include "debug.h"
+#include "string.h"
 #include "efi.h"
 
 #include <stddef.h>
@@ -27,36 +29,33 @@ const struct boot_info *efi_boot(void) {
     return boot;
 }
 
-/* ---- the devices --------------------------------------------------------
- *
- * The firmware binds drivers only to what it needed to boot: the screen, the
- * keyboard and the disk it was read from. Everything else - a mouse most of
- * all - turns up only when it is asked to bind the rest, and on a machine
- * with much plugged in that takes most of half a second.
- *
- * So it is not done on the way up. The shell asks for it once it is waiting
- * for its first key, by which time the prompt is on screen and the wait
- * belongs to nobody. */
-
-void efi_connect_devices(void) {
-    struct efi_boot_services *bs = boot->system->boot;
-    efi_handle *handles;
-    efi_uintn count = 0;
-
-    if (EFI_ERROR(bs->locate_handle_buffer(0 /* all handles */, 0, 0, &count, &handles))) {
-        return;
-    }
-    for (efi_uintn i = 0; i < count; i++) {
-        bs->connect_controller(handles[i], 0, 0, 1);
-    }
-    bs->free_pool(handles);
-}
-
 /* ---- the keyboard ------------------------------------------------------- */
 
-/* UEFI hands back a key as a character where it has one, which is all this
-   shell wants; the arrow and function keys arrive as scan codes with no
-   character and are dropped, as they were before. */
+/* A key with no character of its own arrives from the firmware as a scan
+   code, and goes on as the escape sequence a terminal sends for it - which is
+   what a program doing its own line editing watches for. The sequence is
+   handed over a character at a time, since that is how a key is read. */
+static const char *pending;
+
+static const char *firmware_key(uint16_t scan) {
+    switch (scan) {
+    case 0x01: return "\033[A";     /* up */
+    case 0x02: return "\033[B";     /* down */
+    case 0x03: return "\033[C";     /* right */
+    case 0x04: return "\033[D";     /* left */
+    case 0x05: return "\033[H";     /* home */
+    case 0x06: return "\033[F";     /* end */
+    case 0x07: return "\033[2~";    /* insert */
+    case 0x08: return "\033[3~";    /* delete */
+    case 0x09: return "\033[5~";    /* page up */
+    case 0x0A: return "\033[6~";    /* page down */
+    case 0x17: return "\033";       /* escape */
+    default:   return NULL;
+    }
+}
+
+/* UEFI hands back a key as a character where it has one, and as a scan code
+   where it has not. */
 char keyboard_poll_char(char (*idle)(void)) {
     struct efi_text_input *in = boot->system->con_in;
     struct efi_input_key key;
@@ -65,13 +64,29 @@ char keyboard_poll_char(char (*idle)(void)) {
     if (c != 0) {
         return c;
     }
+    if (pending != NULL) {
+        c = *pending++;
+        if (*pending == '\0') {
+            pending = NULL;
+        }
+        return c;
+    }
     /* A PS/2 keyboard is read here; one on USB still by the firmware. */
     c = ps2_key();
     if (c != 0) {
         return c;
     }
-    if (EFI_ERROR(in->read_key(in, &key)) || key.unicode_char == 0) {
+    if (EFI_ERROR(in->read_key(in, &key))) {
         return 0;
+    }
+    if (key.unicode_char == 0) {
+        const char *text = firmware_key(key.scan_code);
+
+        if (text == NULL) {
+            return 0;
+        }
+        pending = text[1] != '\0' ? text + 1 : NULL;
+        return text[0];
     }
     if (key.unicode_char == '\r') {
         return '\n';                    /* firmware reports Enter as a return */
@@ -102,34 +117,44 @@ char keyboard_read_char(char (*idle)(void)) {
    straight through. */
 
 int ata_read(uint32_t lba, void *buffer) {
-    struct efi_block_io *disk = boot->disk;
-
-    if (disk == NULL ||
-        EFI_ERROR(disk->read_blocks(disk, boot->media_id, lba, 512, buffer))) {
-        return -1;
-    }
-    return 0;
+    return ata_read_many(lba, 1, buffer);   /* through the cache, like the rest */
 }
 
-/* Sectors in one request. A firmware driver has a limit of its own on how
-   much it will take at once - a virtio disk answers "bogus descriptor or out
-   of resources" when asked for a whole library in one go - and the protocol
-   does not say what that limit is, so everything here is asked for in
-   helpings this size: large enough that a megabyte is a handful of calls,
-   small enough that no driver has to find room for it all at once. */
-#define BLOCK_RUN 256
+/* Sectors in one request.
+ *
+ * What a read costs is the round trip, not the bytes: firmware drivers were
+ * written for a machine that reads a loader once and then gets out of the
+ * way, and asking one for a sector costs about what asking it for a thousand
+ * does. So everything is asked for in as few calls as it can be - the two
+ * megabytes of C library behind every program is the difference between a
+ * fifth of a second and a fiftieth.
+ *
+ * How much a driver will take at once is its own business and the protocol
+ * does not say: a virtio disk answers "bogus descriptor or out of resources"
+ * when asked for a whole library in one go. So the size is found rather than
+ * assumed - it starts high and halves whenever a driver refuses, which costs
+ * one failed call on a machine that cannot take the full amount. */
+#define BLOCK_RUN_MAX 8192      /* four megabytes */
+#define BLOCK_RUN_MIN 8
 
-int ata_read_many(uint32_t lba, unsigned count, void *buffer) {
+static unsigned block_run = BLOCK_RUN_MAX;
+
+/* Straight to the disk, with no cache in the way. */
+static int read_now(uint32_t lba, unsigned count, void *buffer) {
     struct efi_block_io *disk = boot->disk;
 
     if (disk == NULL || count == 0) {
         return -1;
     }
     while (count > 0) {
-        unsigned n = count < BLOCK_RUN ? count : BLOCK_RUN;
+        unsigned n = count < block_run ? count : block_run;
 
-            if (EFI_ERROR(disk->read_blocks(disk, boot->media_id, lba,
+        if (EFI_ERROR(disk->read_blocks(disk, boot->media_id, lba,
                                         (efi_uintn)n * 512, buffer))) {
+            if (block_run > BLOCK_RUN_MIN) {
+                block_run /= 2;     /* more than this driver will take */
+                continue;
+            }
             return -1;
         }
         buffer = (char *)buffer + (size_t)n * 512;
@@ -137,6 +162,145 @@ int ata_read_many(uint32_t lba, unsigned count, void *buffer) {
         count -= n;
     }
     return 0;
+}
+
+/* ---- what the disk said last time ----------------------------------------
+ *
+ * A read costs about the same whatever its size - three hundred microseconds
+ * of round trip through a firmware driver - so what makes a program slow to
+ * start is how many times the disk is asked, not how much it is asked for.
+ *
+ * And it is asked for the same thing over and over: every command is the same
+ * C library and the same loader, read again from the same sectors. So they
+ * are kept. A command that has been run before, or that uses the library the
+ * one before it used, starts without going near the disk.
+ *
+ * The cache is a handful of large lines rather than many small ones, because
+ * a miss costs a whole line and a line costs one call however big it is. Each
+ * is bought from the firmware the first time it is needed, so a machine that
+ * never reads twice never pays for it, and how many there are is scaled to
+ * the memory the machine has. */
+
+#define LINE_SECTORS 256                /* 128 KiB a line */
+#define LINES_MAX    16                 /* ... so two megabytes at most */
+
+static struct line {
+    uint32_t first;                     /* its first sector; 0 when unused */
+    uint32_t used;                      /* when it was last read, for the LRU */
+    char    *data;
+} lines[LINES_MAX];
+
+static unsigned line_count;             /* how many this machine may have */
+static uint32_t line_clock;
+static bool     line_sized;
+
+static void cache_start(void) {
+    line_sized = true;
+    uint64_t kib = boot->memory_kib;
+
+    /* A sixty-fourth of the machine, up to four megabytes, and nothing at all
+       on a machine small enough to want the memory for itself. */
+    line_count = kib < 32 * 1024 ? 0 : (unsigned)(kib / 64 / (LINE_SECTORS / 2));
+    if (line_count > LINES_MAX) {
+        line_count = LINES_MAX;
+    }
+}
+
+/* The line holding lba, read in if it is not there yet. NULL if the machine
+   has no cache, or if this line could not be had. */
+static struct line *cache_line(uint32_t lba) {
+    uint32_t first = lba - lba % LINE_SECTORS;
+    struct line *spare = NULL;
+
+    if (line_count == 0) {
+        return NULL;
+    }
+    for (unsigned i = 0; i < line_count; i++) {
+        if (lines[i].data != NULL && lines[i].first == first) {
+            lines[i].used = ++line_clock;
+            return &lines[i];
+        }
+        if (lines[i].data == NULL) {
+            spare = &lines[i];          /* one not bought yet */
+        } else if (spare == NULL || (spare->data != NULL &&
+                                     lines[i].used < spare->used)) {
+            spare = &lines[i];          /* or the one used longest ago */
+        }
+    }
+    if (spare->data == NULL) {
+        uint64_t at = 0;
+
+        if (EFI_ERROR(boot->system->boot->allocate_pages(
+                EFI_ALLOCATE_ANY, EFI_LOADER_DATA, LINE_SECTORS / 8, &at))) {
+            line_count = 0;             /* no memory for one: do without */
+            return NULL;
+        }
+        spare->data = (char *)at;
+    }
+    spare->first = 0;
+    if (read_now(first, LINE_SECTORS, spare->data) < 0) {
+        return NULL;
+    }
+    spare->first = first;
+    spare->used = ++line_clock;
+    return spare;
+}
+
+/* Forgets whatever was kept of lba .. lba + count, which a write makes
+   stale. The line is dropped rather than patched: a write is rare and a
+   dropped line costs one read to get back. */
+static void cache_forget(uint32_t lba, unsigned count) {
+    for (unsigned i = 0; i < line_count; i++) {
+        if (lines[i].data != NULL && lines[i].first < lba + count &&
+            lba < lines[i].first + LINE_SECTORS) {
+            lines[i].first = 0;
+            lines[i].used = 0;
+        }
+    }
+}
+
+int ata_read_many(uint32_t lba, unsigned count, void *buffer) {
+    char *out = buffer;
+
+    if (count == 0) {
+        return -1;
+    }
+    if (!line_sized) {
+        cache_start();
+    }
+    /* More than the cache could hold anyway: straight to the disk, which is
+       one call rather than a line at a time. */
+    if (line_count == 0 || count > LINE_SECTORS * 2) {
+        return read_now(lba, count, buffer);
+    }
+    while (count > 0) {
+        struct line *line = cache_line(lba);
+        unsigned within, take;
+
+        if (line == NULL) {
+            return read_now(lba, count, out);
+        }
+        within = lba - line->first;
+        take = LINE_SECTORS - within;
+        if (take > count) {
+            take = count;
+        }
+        memcpy(out, line->data + (size_t)within * 512, (size_t)take * 512);
+        out += (size_t)take * 512;
+        lba += take;
+        count -= take;
+    }
+    return 0;
+}
+
+/* What the cache costs, for the `mem` command. */
+size_t ata_cache_memory(void) {
+    size_t held = 0;
+
+    for (unsigned i = 0; i < line_count; i++) {
+        held += lines[i].data != NULL ? LINE_SECTORS * 512 : 0;
+    }
+    return held;
 }
 
 int ata_write(uint32_t lba, const void *buffer) {
@@ -149,11 +313,16 @@ int ata_write_many(uint32_t lba, unsigned count, const void *buffer) {
     if (disk == NULL || count == 0) {
         return -1;
     }
+    cache_forget(lba, count);
     while (count > 0) {
-        unsigned n = count < BLOCK_RUN ? count : BLOCK_RUN;
+        unsigned n = count < block_run ? count : block_run;
 
         if (EFI_ERROR(disk->write_blocks(disk, boot->media_id, lba,
                                          (efi_uintn)n * 512, buffer))) {
+            if (block_run > BLOCK_RUN_MIN) {
+                block_run /= 2;
+                continue;
+            }
             return -1;
         }
         buffer = (const char *)buffer + (size_t)n * 512;

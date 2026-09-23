@@ -10,7 +10,7 @@
 
 #define LOG_DIR      "/log"
 #define LOG_MAX      32768      /* a program's file, before it starts over */
-#define LOG_CHUNK    1024       /* text held back before one write to disk */
+#define LOG_CHUNK    512        /* text held back before one write to disk */
 #define LOG_PROGRAMS 6          /* names alive at once: a program, and any
                                    that started it */
 
@@ -77,7 +77,13 @@ static const struct {
     { SYS_PRLIMIT64,      "prlimit64",     { LOG_INT, LOG_INT, LOG_HEX } },
     { SYS_GETRANDOM,      "getrandom",     { LOG_HEX, LOG_INT, LOG_HEX } },
     { SYS_READLINKAT,     "readlinkat",    { LOG_FD, LOG_PATH, LOG_HEX } },
-    { SYS_SPAWN,          "spawn",         { LOG_PATH, LOG_HEX, LOG_HEX } },
+    { SYS_FORK,           "fork",          { LOG_NONE, LOG_NONE, LOG_NONE } },
+    { SYS_VFORK,          "vfork",         { LOG_NONE, LOG_NONE, LOG_NONE } },
+    { SYS_CLONE,          "clone",         { LOG_HEX, LOG_HEX, LOG_HEX } },
+    { SYS_EXECVE,         "execve",        { LOG_PATH, LOG_HEX, LOG_HEX } },
+    { SYS_WAIT4,          "wait4",         { LOG_INT, LOG_HEX, LOG_INT } },
+    { SYS_PIPE,           "pipe",          { LOG_HEX, LOG_NONE, LOG_NONE } },
+    { SYS_PIPE2,          "pipe2",         { LOG_HEX, LOG_HEX, LOG_NONE } },
     { SYS_UNLINK,         "unlink",        { LOG_PATH, LOG_NONE, LOG_NONE } },
     { SYS_MKDIR,          "mkdir",         { LOG_PATH, LOG_INT, LOG_NONE } },
     { SYS_RENAME,         "rename",        { LOG_PATH, LOG_PATH, LOG_NONE } },
@@ -169,7 +175,7 @@ const char *log_program(const char *name) {
         who_now = 0;
         return was;
     }
-    /* The last part of a path: /pkg/bax-coreutils/ls logs as ls, which is
+    /* The last part of a path: /pkg/linux-coreutils/ls logs as ls, which is
        also the name its file takes. */
     for (const char *p = name; *p != '\0'; p++) {
         if (*p == '/') {

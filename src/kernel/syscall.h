@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -8,18 +9,20 @@
 
 /* User programs, and the syscalls they make.
  *
- * A program is either a flat binary, loaded at PROGRAM_BASE and entered at
- * its first byte, or an ELF64 executable, loaded where its program headers
- * say and entered at the address in its header. PROGRAM_BASE is where a
- * plain `ld` puts things, so no linker flags are needed.
+ * A program is an ELF64 executable, loaded where its program headers say and
+ * entered at the address in its header, or a flat binary loaded at
+ * PROGRAM_BASE and entered at its first byte. A dynamically linked one
+ * arrives with the path of its loader, and that is loaded too and entered
+ * instead.
  *
- * It runs in ring 3 in a 2 MiB window from PROGRAM_BASE to PROGRAM_STACK,
- * which is all of memory it can see: code, data and stack alike
- * read-write-execute, the stack starting at the top and growing down. Only
- * the pages it touches take up RAM (see syscall.c), so it can spread over
- * the whole window on a machine with far less than that free. Reaching
- * outside the window, running out of RAM, or raising any other CPU exception
- * ends it with exit code PROGRAM_KILLED.
+ * It runs in ring 3 in a region of its own (vm.c), which is all of memory it
+ * can see: code, data and stack alike read-write-execute. Only the pages it
+ * touches take up RAM, so it can spread over the whole region on a machine
+ * with far less than that free. Something linked to run at a fixed address
+ * gets the fixed window from PROGRAM_BASE to PROGRAM_STACK instead, since a
+ * region begins half a terabyte up and such a program has to be where it was
+ * linked. Reaching outside what it was given, running out of RAM, or raising
+ * any other CPU exception ends it with exit code PROGRAM_KILLED.
  *
  * It makes a syscall with the syscall instruction: the number in RAX, up to
  * three arguments in RDI, RSI and RDX, and the result back in RAX. The
@@ -32,8 +35,13 @@
  * Every call that takes a pointer checks it points into the program's own
  * memory, and returns -1 rather than reading or writing the kernel's. */
 
+/* The fixed window, for a program linked to run at a fixed address.
+   PROGRAM_BASE is where a plain `ld` puts things, so no linker flags are
+   needed for one. */
 #define PROGRAM_BASE   0x400000
 #define PROGRAM_STACK  0x600000
+#define PROGRAM_BYTES  (PROGRAM_STACK - PROGRAM_BASE)
+
 #define PROGRAM_KILLED 139      /* what a Linux shell shows for a segfault */
 
 /* Where things go in the region vm.c hands out, as offsets into it. A
@@ -52,7 +60,7 @@
    too small - the registrations past it simply do not happen, and the calls
    they were for answer ENOSYS - so it is kept well clear of the number
    syscall_init actually makes. */
-#define SYSCALL_SLOTS 128
+#define SYSCALL_SLOTS 144
 
 /* Linux's numbers, and Linux's arguments. Only the handful the machine can
    actually answer are here: there is one process, no devices but the screen
@@ -126,6 +134,38 @@ enum {
     SYS_MKDIR      = 83,    /* (path, mode) */
     SYS_RMDIR      = 84,    /* (path) */
     SYS_UNLINK     = 87,    /* (path): deletes a file */
+    /* The same again, relative to a folder a program already has open. These
+       are what a libc actually calls: coreutils' rm is unlinkat, its mkdir is
+       mkdirat, its mv is renameat2. Left out, they answered "function not
+       implemented" for the plainest commands there are. */
+    SYS_UNLINKAT   = 263,   /* (dirfd, path, flags) */
+    SYS_MKDIRAT    = 258,   /* (dirfd, path, mode) */
+    SYS_RENAMEAT   = 264,   /* (olddirfd, old, newdirfd, new) */
+    SYS_RENAMEAT2  = 316,   /* the same, with flags */
+    SYS_LINKAT     = 265,   /* nothing here is a link */
+    SYS_SYMLINKAT  = 266,
+    SYS_SYMLINK    = 88,
+    SYS_LINK       = 86,
+    SYS_MKNODAT    = 259,
+    SYS_TRUNCATE   = 76,    /* (path, length) */
+    SYS_READV      = 19,    /* (fd, iovec *, count) */
+    SYS_PWRITE64   = 18,    /* (fd, buf, count, offset) */
+    SYS_POLL       = 7,     /* (pollfd *, count, timeout) */
+    SYS_PPOLL      = 271,
+    SYS_FSTATFS    = 138,   /* (fd, struct statfs *) */
+    SYS_GETRLIMIT  = 97,
+    SYS_SETRLIMIT  = 160,
+    SYS_FLOCK      = 73,    /* one program: nothing to lock against */
+    SYS_FALLOCATE  = 285,   /* a file here grows as it is written */
+    SYS_MSYNC      = 26,
+    SYS_SYNCFS     = 306,
+    SYS_GETCPU     = 309,
+    SYS_GETGROUPS  = 115,
+    SYS_SCHED_GETSCHEDULER = 145,
+    SYS_SCHED_SETSCHEDULER = 144,
+    SYS_SCHED_GETPARAM     = 143,
+    SYS_GETPRIORITY = 140,
+    SYS_SETPRIORITY = 141,
     SYS_FTRUNCATE  = 77,    /* (fd, length) */
     SYS_STATFS     = 137,   /* (path, struct statfs *): how big the disk is */
     SYS_REBOOT     = 169,   /* (magic, magic, command, arg) */
@@ -143,6 +183,7 @@ enum {
     SYS_STAT       = 4,     /* (path, struct stat *) */
     SYS_LSTAT      = 6,     /* (path, struct stat *): nothing is a link */
     SYS_CHDIR      = 80,    /* (path): a program moving the working folder */
+    SYS_FCHDIR     = 81,    /* (fd): the same, by a folder already open */
     SYS_DUP3       = 292,
     SYS_UMASK      = 95,
     SYS_GETTIMEOFDAY = 96,  /* (struct timeval *, struct timezone *) */
@@ -159,10 +200,16 @@ enum {
     SYS_SELECT     = 23,    /* (nfds, read, write, except, timeval *) */
     SYS_PSELECT6   = 270,   /* the same, with a timespec and a signal mask */
 
-    /* Not Linux's: this machine's own, for the one thing a Linux program
-       does with fork and execve that there is no fork here to do. The shell
-       is a program like any other, so it needs a way to run one. */
-    SYS_SPAWN      = 1000,  /* (path, argv, out, out_size): runs it and waits */
+    /* Starting a program, the way a Linux shell starts one. There is no
+       scheduler here, so fork runs its child to the end before it answers -
+       see syscall.c, which is where that is made to work. */
+    SYS_FORK       = 57,
+    SYS_VFORK      = 58,
+    SYS_CLONE      = 56,    /* (flags, stack, ...): glibc's fork is one */
+    SYS_EXECVE     = 59,    /* (path, argv, envp) */
+    SYS_WAIT4      = 61,    /* (pid, status *, options, rusage *) */
+    SYS_PIPE       = 22,    /* (int fds[2]) */
+    SYS_PIPE2      = 293,   /* (int fds[2], flags) */
 };
 
 /* Open flags, as Linux numbers them. */
@@ -181,11 +228,12 @@ enum {
    counted in. */
 #define PROGRAM_FILES 16
 
-/* Arguments a program can be given, the name it was called by counted in.
-   The list is copied out of the program starting another onto the kernel
-   stack, and again onto the new program's, so it is what anybody types with
-   room to spare rather than as many as could possibly fit. */
-#define PROGRAM_ARGS 32
+/* Arguments and environment variables a program can be given, the name it
+   was called by counted in. The lists are copied out of the program starting
+   another and again onto the new program's stack, so they are what anybody
+   types with room to spare rather than as many as could possibly fit. */
+#define EXEC_ARGS 64
+#define EXEC_ENV  64
 
 #define PROGRAM_EINVAL (-7) /* not an executable this kernel can run */
 #define PROGRAM_ENOINTERP (-8)  /* it wants a loader that is not on the disk */
@@ -202,14 +250,17 @@ void syscall_init(void);
    is past what one holds. Unregistered numbers return -1 to the program. */
 int syscall_register(uint64_t number, syscall_fn fn);
 
-/* Loads a program file into memory and stores its entry point in *entry: an
-   ELF64 executable by its program headers, anything else as a flat binary at
-   PROGRAM_BASE. Returns 0, FS_EIO, FS_ENOSPC if RAM runs out, or
+/* Loads a program file into memory by its program headers and stores its
+   entry point in *entry. Returns 0, FS_EIO, FS_ENOSPC if RAM runs out, or
    PROGRAM_EINVAL. */
 int program_load(const struct fs_file *file, uint64_t *entry);
 
-/* Runs a loaded program until it exits, and returns its exit code. */
-int program_run(uint64_t entry, unsigned argc, const char *const *argv);
+/* Runs a loaded program until it exits, and returns its exit code. envc of 0
+   gives it the machine's own environment, which is what the first program
+   gets; fresh says to hand it a clean terminal and nothing open but the
+   console, which is what everything but an execve wants. */
+int program_run(uint64_t entry, unsigned argc, const char *const *argv,
+                unsigned envc, const char *const *envv, bool fresh);
 
 /* What the window's page tables cost, and what a running program has
    borrowed for itself, for the `mem` command. */

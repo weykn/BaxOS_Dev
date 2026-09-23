@@ -1,4 +1,4 @@
-/* Host tool: builds the BaxOS filesystem, or updates one in place.
+/* Host tool: builds the Tuxlet OS filesystem, or updates one in place.
  *
  *   mkfs IMAGE SECTORS ROOT KERNEL_BIN [PATH...]
  *
@@ -8,7 +8,7 @@
  * folders it needs are made on the way. A PATH that is itself a folder is
  * made and left empty, which is the only way one with nothing in it yet can
  * reach the disk. Files already there are left alone, so what was saved from
- * inside BaxOS survives a rebuild.
+ * inside Tuxlet OS survives a rebuild.
  *
  * The kernel goes to kernel/kernel.bin rather than into the root: the disk's
  * own policy, in ROBOT.md, keeps the root for folders and gives the kernel

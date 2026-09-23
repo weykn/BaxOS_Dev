@@ -23,7 +23,11 @@
  * filled would be a disk write in the middle of a running program, and that
  * is felt as one. */
 
-#define LOG_SIZE 64             /* entries held before they go to disk */
+/* Entries held before they go to disk. Enough that what a program did
+   survives until the machine is next idle: a command makes a few dozen calls
+   and the shell a few more before anything is written, and a ring smaller
+   than the two together loses the command's before its file is made. */
+#define LOG_SIZE 64
 #define LOG_LINE 128            /* one formatted line, at its longest */
 #define LOG_NAME 20             /* a program's name in the log, with its NUL */
 

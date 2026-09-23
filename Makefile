@@ -1,4 +1,4 @@
-# BaxOS - a UEFI-booted x86-64 kernel.
+# Tuxlet OS - a UEFI-booted x86-64 kernel.
 #
 # The disk image is a GPT disk with two partitions: an EFI system partition
 # holding the loader, which carries the kernel inside it, and a partition
@@ -20,16 +20,14 @@ BUILD := build
 # call to itself. -Oz, link-time optimisation, and per-function sections with
 # --gc-sections keep the kernel - which sits in RAM whole - as small as
 # possible: anything unreferenced is dropped.
-# -DDEBUG turns on src/kernel/debug.c, which writes to the emulator's debug
-# port and nowhere else. Drop it and every dbg() call compiles to nothing.
-# A utility has no libc and no kernel behind it: freestanding, its own
-# address, and small.
-UTILFLAGS := -Isrc/util -std=gnu11 -Oz -Wall -Wextra -ffreestanding \
-             -fno-builtin -nostdlib -fno-pic -fno-pie -mno-red-zone \
-             -fno-stack-protector -fno-asynchronous-unwind-tables \
-             -ffunction-sections -fdata-sections
+# DEBUG=1 turns on src/kernel/debug.c, which writes to the emulator's debug
+# port and nowhere else - and mirrors everything the console prints there, so
+# that the machine can be driven and read without a screen. It is off by
+# default because it is not free: a write to a port is a trap out of the
+# virtual machine, and a program that starts by printing half a kilobyte of
+# what it loaded spends longer on those traps than on the loading.
 
-CFLAGS := -Isrc/kernel $(if $(filter 0,$(DEBUG)),,-DDEBUG) -std=gnu11 -Oz -flto -Wall -Wextra \
+CFLAGS := -Isrc/kernel $(if $(filter 1,$(DEBUG)),-DDEBUG) -std=gnu11 -Oz -flto -Wall -Wextra \
           -ffreestanding -fno-builtin -nostdlib \
           -fno-pic -fno-pie -mno-red-zone -mgeneral-regs-only \
           -fno-stack-protector -fno-asynchronous-unwind-tables \
@@ -57,16 +55,6 @@ KOBJS := $(KSRCS:src/%.c=$(BUILD)/%.o) $(KASMS:src/%.asm=$(BUILD)/%.o)
 # because that is the address the loader jumps to.
 START_OBJ := $(BUILD)/kernel/start.o
 
-# The native utilities: ordinary C, but linked as raw images rather than
-# executables - no headers, no sections, nothing to relocate. The kernel
-# loads one at PROGRAM_BASE and jumps to its first byte, which util.ld makes
-# sure is the entry stub. They are built here and land on the disk under
-# /pkg/bax-coreutils, so src/disk itself stays a folder of files, not of
-# build output.
-UTIL_SRCS := $(wildcard src/util/*.c)
-UTILS     := $(patsubst src/util/%.c,$(BUILD)/util/%,$(UTIL_SRCS))
-UTIL_ON_DISK := $(foreach u,$(UTILS),pkg/bax-coreutils/$(notdir $(u))=$(u))
-
 # Everything under src/disk goes onto the disk exactly as it is, keeping the
 # folders it sits in - the folders themselves included, so that one with
 # nothing in it yet still arrives. src/disk/ROBOT.md says what each is for.
@@ -80,15 +68,15 @@ KERNEL_OBJ := $(BUILD)/kernel_blob.o
 LOADER     := $(BUILD)/BOOTX64.EFI
 MKFS       := $(BUILD)/mkfs
 FS_IMG     := $(BUILD)/fs.img
-IMAGE      := $(BUILD)/BaxOS.img
+IMAGE      := $(BUILD)/TuxletOS.img
 
 # Sizes, in the units their names give. FS_SECTORS is FS_MIB as sectors. Nothing may follow these on the line:
 # a trailing comment leaves its spaces inside the value, and these get stuck
 # straight onto sector numbers and onto sgdisk's "+48M".
-FS_SECTORS := 65536
+FS_SECTORS := 131072
 ESP_MIB    := 48
-FS_MIB     := 32
-DISK_MIB   := 96
+FS_MIB     := 64
+DISK_MIB   := 128
 ESP_LBA    := 2048
 
 FS_LBA      := $(shell expr $(ESP_LBA) + $(ESP_MIB) \* 2048)
@@ -131,33 +119,16 @@ $(MKFS): tools/mkfs.c src/kernel/fs.c src/kernel/fs.h src/kernel/ata.h
 	$(HOSTCC) -std=gnu11 -O2 -Wall -Wextra -iquote src/kernel tools/mkfs.c src/kernel/fs.c -o $@
 
 # The filesystem partition is updated in place rather than recreated, so files
-# saved from inside BaxOS survive a rebuild. `make clean` wipes them.
-# A utility is one object plus the entry stub, laid out by util.ld and then
-# stripped of everything that made it an ELF.
-$(BUILD)/util/%.o: src/util/%.c src/util/util.h
-	@mkdir -p $(@D)
-	$(CC) $(UTILFLAGS) -c $< -o $@
-
-$(BUILD)/util/start.o: src/util/start.asm
-	@mkdir -p $(@D)
-	$(NASM) -f elf64 $< -o $@
-
-$(BUILD)/util/%.elf: $(BUILD)/util/%.o $(BUILD)/util/start.o src/util/util.ld
-	$(CC) -nostdlib -static -no-pie -Wl,-T,src/util/util.ld -Wl,--build-id=none \
-	      -Wl,--no-warn-rwx-segments -o $@ $(BUILD)/util/start.o $<
-
-$(BUILD)/util/%: $(BUILD)/util/%.elf
-	$(OBJCOPY) -O binary $< $@
-
-$(FS_IMG): $(KERNEL_BIN) $(MKFS) $(DISK_FILES) $(UTILS)
-	$(MKFS) $@ $(FS_SECTORS) $(DISK_ROOT) $(KERNEL_BIN) $(DISK_FILES) $(UTIL_ON_DISK)
+# saved from inside Tuxlet OS survive a rebuild. `make clean` wipes them.
+$(FS_IMG): $(KERNEL_BIN) $(MKFS) $(DISK_FILES)
+	$(MKFS) $@ $(FS_SECTORS) $(DISK_ROOT) $(KERNEL_BIN) $(DISK_FILES)
 
 $(IMAGE): $(LOADER) $(FS_IMG)
 	@rm -f $@
 	@dd if=/dev/zero of=$@ bs=1M count=$(DISK_MIB) status=none
 	@sgdisk -o -n 1:$(ESP_LBA):+$(ESP_MIB)M -t 1:ef00 -c 1:"EFI System" \
-	        -n 2:$(FS_LBA):+$(FS_MIB)M -t 2:8300 -c 2:"BaxOS" $@ > /dev/null
-	@mformat -i $(ESP_AT) -T $(ESP_SECTORS) -F -v BAXOS ::
+	        -n 2:$(FS_LBA):+$(FS_MIB)M -t 2:8300 -c 2:"Tuxlet OS" $@ > /dev/null
+	@mformat -i $(ESP_AT) -T $(ESP_SECTORS) -F -v TUXLET ::
 	@mmd -i $(ESP_AT) ::/EFI ::/EFI/BOOT
 	@mcopy -i $(ESP_AT) $(LOADER) ::/EFI/BOOT/BOOTX64.EFI
 	@dd if=$(FS_IMG) of=$@ bs=512 seek=$(FS_LBA) conv=notrunc status=none
@@ -170,9 +141,14 @@ $(IMAGE): $(LOADER) $(FS_IMG)
 OVMF_CODE := /usr/share/edk2/x64/OVMF_CODE.4m.fd
 OVMF_VARS := /usr/share/edk2/x64/OVMF_VARS.4m.fd
 
+# Hardware virtualisation where the machine has it. Without it QEMU interprets
+# every instruction, and a program built for Linux spends most of its startup
+# being interpreted rather than run: the same command takes five times as long.
+ACCEL := $(shell test -w /dev/kvm && echo "-enable-kvm -cpu host")
+
 run: $(IMAGE)
 	@cp -n $(OVMF_VARS) $(BUILD)/ovmf_vars.fd 2>/dev/null || true
-	qemu-system-x86_64 \
+	qemu-system-x86_64 $(ACCEL) \
 	    -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 	    -drive if=pflash,format=raw,file=$(BUILD)/ovmf_vars.fd \
 	    -drive format=raw,file=$(IMAGE) -net none -m 256M

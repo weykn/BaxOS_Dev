@@ -1,5 +1,6 @@
 #include "mem.h"
 
+#include "ata.h"
 #include "bg.h"
 #include "boot.h"
 #include "efi_kernel.h"
@@ -20,6 +21,7 @@ void mem_get_stats(struct mem_stats *stats) {
     stats->data = span(__bss_start, __bss_end) - stats->stack;
     stats->page_tables = (uint32_t)program_tables();
     stats->console = (uint32_t)vga_memory();
+    stats->disk_cache = (uint32_t)ata_cache_memory();
     stats->wallpaper = bg_memory();
     stats->window = (uint32_t)program_memory();
     /* What the machine costs, which is everything above but the window: that
@@ -29,7 +31,8 @@ void mem_get_stats(struct mem_stats *stats) {
        agree with a program that measured memory while running. The window is
        reported on its own, by whatever wants to show it. */
     stats->used_kib = (stats->image + stats->data + stats->stack + stats->page_tables +
-                       stats->console + stats->wallpaper + 1023) / 1024;
+                       stats->console + stats->wallpaper + stats->disk_cache +
+                       1023) / 1024;
 
     /* The stack started out zeroed, so its deepest non-zero byte marks how
        far it has ever grown. */

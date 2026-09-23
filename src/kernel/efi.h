@@ -39,10 +39,6 @@ struct efi_guid {
     { 0x964e5b22, 0x6459, 0x11d2, { 0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b } }
 #define EFI_BLOCK_IO_GUID \
     { 0x964e5b21, 0x6459, 0x11d2, { 0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b } }
-#define EFI_SIMPLE_POINTER_GUID \
-    { 0x31878c87, 0x0b75, 0x11d5, { 0x9a, 0x4f, 0x00, 0x90, 0x27, 0x3f, 0xc1, 0x4d } }
-#define EFI_ABSOLUTE_POINTER_GUID \
-    { 0x8d59d32b, 0xc655, 0x4ae9, { 0x9b, 0x15, 0xf2, 0x59, 0x04, 0x99, 0x2a, 0x43 } }
 #define EFI_SIMPLE_TEXT_INPUT_GUID \
     { 0x387477c1, 0x69c7, 0x11d2, { 0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b } }
 #define EFI_DEVICE_PATH_GUID \
@@ -80,47 +76,6 @@ struct efi_text_output {
     void       *reset;
     efi_status (EFIAPI *output_string)(struct efi_text_output *, const uint16_t *);
     /* The rest is unused. */
-};
-
-/* ---- pointing devices ----------------------------------------------------
- *
- * Two protocols, because machines differ: a USB mouse reports how far it
- * moved, while a touchpad or a tablet reports where it is. Whichever the
- * firmware offers is the one used. */
-
-struct efi_pointer_state {
-    int32_t x, y, z;            /* movement since the last call */
-    uint8_t left, right;
-};
-
-struct efi_pointer_mode {
-    uint64_t res_x, res_y, res_z;   /* counts per millimetre */
-    uint8_t  left, right;
-};
-
-struct efi_simple_pointer {
-    efi_status (EFIAPI *reset)(struct efi_simple_pointer *, uint8_t extended);
-    efi_status (EFIAPI *get_state)(struct efi_simple_pointer *, struct efi_pointer_state *);
-    void                    *wait_for_input;
-    struct efi_pointer_mode *mode;
-};
-
-struct efi_absolute_state {
-    uint64_t x, y, z;
-    uint32_t buttons;
-};
-
-struct efi_absolute_mode {
-    uint64_t min_x, min_y, min_z;
-    uint64_t max_x, max_y, max_z;
-    uint32_t attributes;
-};
-
-struct efi_absolute_pointer {
-    efi_status (EFIAPI *reset)(struct efi_absolute_pointer *, uint8_t extended);
-    efi_status (EFIAPI *get_state)(struct efi_absolute_pointer *, struct efi_absolute_state *);
-    void                      *wait_for_input;
-    struct efi_absolute_mode  *mode;
 };
 
 /* ---- graphics ----------------------------------------------------------- */
@@ -321,8 +276,6 @@ _Static_assert(__builtin_offsetof(struct efi_boot_services, locate_handle_buffer
 _Static_assert(__builtin_offsetof(struct efi_boot_services, locate_protocol) == 320, "LocateProtocol");
 _Static_assert(__builtin_offsetof(struct efi_runtime_services, get_time) == 24, "GetTime");
 _Static_assert(__builtin_offsetof(struct efi_runtime_services, reset_system) == 104, "ResetSystem");
-_Static_assert(__builtin_offsetof(struct efi_simple_pointer, mode) == 24, "Pointer Mode");
-_Static_assert(__builtin_offsetof(struct efi_absolute_pointer, mode) == 24, "Absolute Mode");
 _Static_assert(__builtin_offsetof(struct efi_gop, mode) == 24, "GOP Mode");
 _Static_assert(__builtin_offsetof(struct efi_gop_mode, framebuffer) == 24, "FrameBufferBase");
 _Static_assert(__builtin_offsetof(struct efi_gop_info, pixels_per_scanline) == 32, "PixelsPerScanLine");

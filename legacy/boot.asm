@@ -1,4 +1,4 @@
-; BaxOS boot sector.
+; Tuxlet OS boot sector.
 ;
 ; The BIOS loads this sector to 0x7C00 in 16-bit real mode with DL = the boot
 ; drive. We read the file table, load kernel.bin from it to 0x10000, and jump

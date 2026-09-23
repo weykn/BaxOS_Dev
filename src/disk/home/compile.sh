@@ -1,5 +1,5 @@
 #!/bin/sh
-# Builds one BaxOS program on the host, next to its source. The disk folder is
+# Builds one Tuxlet OS program on the host, next to its source. The disk folder is
 # embedded as it is, so this is run by hand and its output kept:
 #
 #   ./compile.sh hello_elf.asm      -> hello_elf,   an ELF64 executable

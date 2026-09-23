@@ -28,9 +28,9 @@
 #define FS_SECTOR 512               /* bytes in a sector, here and on disk */
 
 #define FS_NAME_LEN  48     /* a whole path, including the NUL */
-#define FS_MAX_FILES 109    /* table entries: files and folders together */
-#define FS_REMAPS    8      /* folders standing in for other folders */
-#define FS_REMAP_LEN 24     /* either side of one, including the NUL */
+#define FS_MAX_FILES 128    /* table entries: files and folders together */
+#define FS_REMAPS    12     /* folders standing in for other folders */
+#define FS_REMAP_LEN 32     /* either side of one, including the NUL */
 
 enum {
     FS_EIO       = -1,      /* the disk reported an error */
