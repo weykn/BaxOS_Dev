@@ -8,7 +8,7 @@
 #include "syscall.h"
 #include "vga.h"
 
-#define LOG_DIR      "/log"
+#define LOG_DIR      "/var/log"
 #define LOG_MAX      32768      /* a program's file, before it starts over */
 #define LOG_CHUNK    512        /* text held back before one write to disk */
 #define LOG_PROGRAMS 6          /* names alive at once: a program, and any
@@ -20,7 +20,11 @@
    to disk already. */
 static struct log_entry entries[LOG_SIZE];
 static unsigned total, written, dropped;
-static int      enabled = 1;
+/* Off until something asks for it. Writing what a program did costs a disk
+   write, and a disk write is ten milliseconds the machine spends not
+   listening to the keyboard - felt as the shell stopping for a moment after
+   every command. `log on` is worth that; running is not. */
+static int      enabled;
 static bool     flushing;   /* the writes a flush makes are not logged */
 
 /* Who is running. A name is kept for as long as any entry names it, which is
@@ -175,7 +179,7 @@ const char *log_program(const char *name) {
         who_now = 0;
         return was;
     }
-    /* The last part of a path: /pkg/linux-coreutils/ls logs as ls, which is
+    /* The last part of a path: /usr/bin/ls logs as ls, which is
        also the name its file takes. */
     for (const char *p = name; *p != '\0'; p++) {
         if (*p == '/') {
@@ -370,10 +374,10 @@ size_t log_format(const struct log_entry *e, char *buf) {
 
 /* ---- to disk ----------------------------------------------------------- */
 
-/* Appends text to /log/<who>.log, making the file - and the folder - if
+/* Appends text to /var/log/<who>.log, making the file - and the folder - if
    there is none, and starting the file over once it has grown past LOG_MAX.
    A program's own file rather than one log for the machine: what `ls` did is
-   worth reading without `bash` interleaved through it. */
+   worth reading without `tsh` interleaved through it. */
 static void append(const char *who, const char *text, size_t size) {
     char path[FS_NAME_LEN];
     struct fs_file file;

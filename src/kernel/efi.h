@@ -21,6 +21,7 @@ typedef uint64_t efi_uintn;
 typedef void    *efi_handle;
 
 #define EFI_SUCCESS       0
+#define EFI_OUT_OF_RESOURCES (1ull << 63 | 9)
 #define EFI_ERROR(s)      (((int64_t)(s)) < 0)
 #define EFI_NOT_READY     0x8000000000000006ull
 #define EFI_BUFFER_SMALL  0x8000000000000005ull
@@ -179,6 +180,12 @@ struct efi_simple_fs {
 enum { EFI_ALLOCATE_ANY = 0, EFI_ALLOCATE_MAX = 1, EFI_ALLOCATE_ADDRESS = 2 };
 enum { EFI_LOADER_DATA = 2, EFI_CONVENTIONAL_MEMORY = 7 };
 
+/* Whether a memory map entry of this type is RAM - anybody's, firmware's
+   included - rather than reserved address space, a device, or broken. */
+static inline int efi_is_ram(uint32_t type) {
+    return (type >= 1 && type <= 7) || type == 9 || type == 10 || type == 14;
+}
+
 struct efi_memory_descriptor {
     uint32_t type;
     uint32_t pad;
@@ -204,7 +211,9 @@ struct efi_boot_services {
     efi_status (EFIAPI *handle_protocol)(efi_handle, const struct efi_guid *, void **);
     void *reserved, *register_notify, *locate_handle, *locate_device_path,
          *install_configuration_table, *load_image, *start_image, *exit,
-         *unload_image, *exit_boot_services, *get_next_monotonic_count;
+         *unload_image;
+    efi_status (EFIAPI *exit_boot_services)(efi_handle image, efi_uintn key);
+    void *get_next_monotonic_count;
     efi_status (EFIAPI *stall)(efi_uintn microseconds);
     efi_status (EFIAPI *set_watchdog_timer)(efi_uintn seconds, uint64_t code,
                                             efi_uintn size, uint16_t *data);

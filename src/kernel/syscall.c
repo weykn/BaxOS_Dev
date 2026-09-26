@@ -54,6 +54,7 @@ static bool loaded_flat;        /* the program is in the window, not a region */
 #define ENOTEMPTY 39
 #define ENFILE 23
 #define EPIPE  32
+#define ELOOP  40
 
 /* The arguments of the call being handled, all six of them. Handlers take
    the first three, which is all but a few of them want; the rest read the
@@ -70,10 +71,10 @@ static uint64_t sys_wait4(uint64_t pid, uint64_t status, uint64_t options);
 static uint64_t sys_pipe(uint64_t out, uint64_t b, uint64_t c);
 static uint64_t sys_pipe2(uint64_t out, uint64_t flags, uint64_t c);
 static uint64_t sys_getrandom(uint64_t buf, uint64_t length, uint64_t flags);
-static struct efi_boot_services *services(void);
 static bool fits(uint64_t addr, uint64_t size);
 static bool claim(uint64_t addr, uint64_t size);
 static int  read_at(const struct fs_file *file, uint64_t offset, void *dest, uint64_t size);
+static uint64_t fs_errno(int err);
 
 /* What the loaded program turned out to be, for the auxiliary vector its
    libc reads off the stack. */
@@ -286,7 +287,7 @@ static struct pipe *pipe_of(const struct handle *h) {
 
 static void pipe_drop(struct pipe *p) {
     if (p != NULL && p->refs > 0 && --p->refs == 0) {
-        services()->free_pool(p->data);
+        mem_free(p->data);
         *p = (struct pipe){ 0 };
     }
 }
@@ -311,7 +312,6 @@ static void pipes_hold(int by) {
 
 /* Adds to the buffer, growing it if there is room to. */
 static uint64_t pipe_write(struct pipe *p, const char *from, uint64_t count) {
-    struct efi_boot_services *bs = services();
 
     if (p->len + count > p->size) {
         uint32_t want = p->size;
@@ -326,11 +326,11 @@ static uint64_t pipe_write(struct pipe *p, const char *from, uint64_t count) {
         if (count == 0) {
             return ERR(EPIPE);
         }
-        if (EFI_ERROR(bs->allocate_pool(EFI_LOADER_DATA, want, &bigger))) {
+        if ((bigger = mem_alloc(want)) == NULL) {
             return ERR(ENOMEM);
         }
         memcpy(bigger, p->data, p->len);
-        bs->free_pool(p->data);
+        mem_free(p->data);
         p->data = bigger;
         p->size = want;
     }
@@ -602,6 +602,11 @@ static uint64_t open_name(const char *name, uint64_t flags) {
     if (name == NULL) {
         return ERR(EINVAL);
     }
+    /* Asked not to go through a link at the end, and there is one there. */
+    if ((flags & O_NOFOLLOW) != 0 && fs_lstat(name, &file) == 0 &&
+        (file.size & FS_LINK) != 0) {
+        return ERR(ELOOP);
+    }
     if ((which = dev_named(name)) != 0) {
         if (which == DEV_TTY) {
             return give_handle((struct handle){ .start = CONSOLE_MARK });
@@ -696,6 +701,10 @@ static uint64_t sys_open(uint64_t path, uint64_t flags, uint64_t mode) {
  * AT_FDCWD, and an absolute path whatever the descriptor says, are the
  * working directory's business and go through untouched. */
 #define AT_FDCWD (-100)
+
+/* In the flags of an *at call that can be about a link or what it names:
+   the link, please. */
+#define AT_SYMLINK_NOFOLLOW 0x100
 
 static const char *at_path(uint64_t dirfd, const char *name, char *out, size_t max) {
     struct handle *h;
@@ -875,7 +884,7 @@ static uint64_t sys_chdir(uint64_t path, uint64_t b, uint64_t c) {
     if (name == NULL) {
         return ERR(EFAULT);
     }
-    return fs_chdir(name) == 0 ? 0 : ERR(ENOENT);
+    return fs_errno(fs_chdir(name));
 }
 
 /* A folder that is already open, named by its entry in the table. A program
@@ -1217,6 +1226,7 @@ static uint64_t fs_errno(int err) {
     case FS_ENOTEMPTY: return ERR(ENOTEMPTY);
     case FS_EINVAL:    return ERR(EINVAL);
     case FS_EIO:       return ERR(EIO);
+    case FS_ELOOP:     return ERR(ELOOP);
     default:           return ERR(EACCES);
     }
 }
@@ -1579,6 +1589,7 @@ static uint64_t sys_umask(uint64_t mask, uint64_t b, uint64_t c) {
 #define S_IFCHR 0020000
 #define S_IFDIR 0040000
 #define S_IFREG 0100000
+#define S_IFLNK 0120000
 
 /* Descriptors have no flags worth keeping here: a program setting
    close-on-exec is told it worked, and one asking gets nothing back. The
@@ -1805,7 +1816,7 @@ static uint64_t sys_renameat(uint64_t olddir, uint64_t oldpath, uint64_t newdir)
     return fs_errno(fs_rename(kept, new_name));
 }
 
-/* Nothing on this disk is a link, and nothing can be made one: a program told
+/* A hard link, or a device node: there are neither here, and a program told
    so goes on to copy rather than stopping. */
 static uint64_t sys_no_links(uint64_t a, uint64_t b, uint64_t c) {
     (void)a;
@@ -1848,11 +1859,54 @@ static uint64_t sys_fstatfs(uint64_t fd, uint64_t out, uint64_t c) {
     return handle_of(fd) == NULL ? ERR(EBADF) : statfs_fill(out);
 }
 
+/* ---- symbolic links ------------------------------------------------------
+ *
+ * A link is a file holding a path, and the filesystem follows it wherever a
+ * path is resolved - /bin is one, to usr/bin. These are the calls that make
+ * one and read one back, and neither follows the link it is given. */
+
+static uint64_t sys_symlinkat(uint64_t target, uint64_t dirfd, uint64_t path) {
+    char kept[FS_LINK_LEN], joined[FS_NAME_LEN];
+    const char *to = user_string(target);
+    const char *name;
+
+    if (to == NULL || strlen(to) + 1 > sizeof kept) {
+        return ERR(to == NULL ? EFAULT : EINVAL);
+    }
+    strcpy(kept, to);
+    name = at_path(dirfd, user_string(path), joined, sizeof joined);
+    if (name == NULL) {
+        return ERR(EFAULT);
+    }
+    return fs_errno(fs_symlink(kept, name));
+}
+
+static uint64_t sys_symlink(uint64_t target, uint64_t path, uint64_t c) {
+    (void)c;
+    return sys_symlinkat(target, (uint64_t)AT_FDCWD, path);
+}
+
+/* Linux's readlink writes no NUL, and returns how many bytes it did write. */
 static uint64_t sys_readlinkat(uint64_t dirfd, uint64_t path, uint64_t buf) {
-    (void)dirfd;
-    (void)path;
-    (void)buf;
-    return ERR(EINVAL);
+    char joined[FS_NAME_LEN];
+    const char *name = at_path(dirfd, user_string(path), joined, sizeof joined);
+    uint64_t size = arg[3];
+    int got;
+
+    if (name == NULL || !user_range(buf, size)) {
+        return ERR(EFAULT);
+    }
+    got = fs_readlink(name, (char *)buf, size);
+    return got < 0 ? fs_errno(got) : (uint64_t)got;
+}
+
+static uint64_t sys_readlink(uint64_t path, uint64_t buf, uint64_t size) {
+    uint64_t kept = arg[3], result;
+
+    arg[3] = size;
+    result = sys_readlinkat((uint64_t)AT_FDCWD, path, buf);
+    arg[3] = kept;
+    return result;
 }
 
 /* ---- describing files ---------------------------------------------------- */
@@ -1978,7 +2032,6 @@ static uint64_t sys_statx(uint64_t dirfd, uint64_t path, uint64_t flags) {
     struct fs_file file;
     bool folder = false;
 
-    (void)flags;
     if (name == NULL || !user_range(arg[4], sizeof *out)) {
         return ERR(EINVAL);
     }
@@ -2018,9 +2071,27 @@ static uint64_t sys_statx(uint64_t dirfd, uint64_t path, uint64_t flags) {
         out->dev_minor = 1;
         return 0;
     }
-    if (fs_stat(name, &file) != 0 || is_folder_entry(&file)) {
+    if ((flags & AT_SYMLINK_NOFOLLOW) != 0 && fs_lstat(name, &file) == 0 &&
+        (file.size & FS_LINK) != 0) {
+        memset(out, 0, sizeof *out);
+        out->mask = STATX_BASIC;
+        out->blksize = SECTOR_SIZE;
+        out->nlink = 1;
+        out->mode = S_IFLNK | 0777;
+        out->ino = file.start;
+        out->size = file.size & ~FS_LINK;
+        out->blocks = 1;
+        out->dev_minor = 1;
+        return 0;
+    }
+    int err = fs_stat(name, &file);
+
+    if (err != 0 || is_folder_entry(&file)) {
         unsigned index = 0;
 
+        if (err == FS_ELOOP) {
+            return ERR(ELOOP);
+        }
         if (fs_folder_at(name, &index) != 0) {
             return ERR(ENOENT);
         }
@@ -2073,9 +2144,20 @@ static uint64_t sys_newfstatat(uint64_t dirfd, uint64_t path, uint64_t out) {
         fill_stat((struct stat *)out, 0, true, PROC_INO);
         return 0;
     }
-    if (fs_stat(name, &file) == 0 && !is_folder_entry(&file)) {
+    if ((arg[3] & AT_SYMLINK_NOFOLLOW) != 0 && fs_lstat(name, &file) == 0 &&
+        (file.size & FS_LINK) != 0) {
+        fill_stat((struct stat *)out, file.size & ~FS_LINK, false, file.start);
+        ((struct stat *)out)->mode = S_IFLNK | 0777;
+        return 0;
+    }
+    int err = fs_stat(name, &file);
+
+    if (err == 0 && !is_folder_entry(&file)) {
         fill_stat((struct stat *)out, file.size, false, file.start);
         return 0;
+    }
+    if (err == FS_ELOOP) {
+        return ERR(ELOOP);
     }
     /* Not a file: a folder, which the filesystem knows by its own spelling -
        and which is how the root, having no entry of its own, is one. */
@@ -2094,11 +2176,25 @@ static uint64_t sys_newfstatat(uint64_t dirfd, uint64_t path, uint64_t out) {
     return 0;
 }
 
-/* The older pair, which name a file rather than a descriptor and a name.
-   Nothing here is a symbolic link, so lstat is stat. */
+/* The older pair, which name a file rather than a descriptor and a name, and
+   differ only in whether a link at the end is followed. */
+static uint64_t stat_flags(uint64_t path, uint64_t out, uint64_t flags) {
+    uint64_t kept = arg[3], result;
+
+    arg[3] = flags;
+    result = sys_newfstatat((uint64_t)AT_FDCWD, path, out);
+    arg[3] = kept;
+    return result;
+}
+
 static uint64_t sys_stat(uint64_t path, uint64_t out, uint64_t c) {
     (void)c;
-    return sys_newfstatat(0, path, out);
+    return stat_flags(path, out, 0);
+}
+
+static uint64_t sys_lstat(uint64_t path, uint64_t out, uint64_t c) {
+    (void)c;
+    return stat_flags(path, out, AT_SYMLINK_NOFOLLOW);
 }
 
 /* ---- what is in a folder -------------------------------------------------
@@ -2110,6 +2206,7 @@ static uint64_t sys_stat(uint64_t path, uint64_t out, uint64_t c) {
 
 #define DT_DIR 4
 #define DT_REG 8
+#define DT_LNK 10
 
 struct dirent64 {
     uint64_t ino;
@@ -2181,7 +2278,7 @@ static uint64_t sys_getdents64(uint64_t fd, uint64_t buf, uint64_t count) {
         out->ino = is_folder ? folder_ino((unsigned)index + 1) : entry.start;
         out->off = (int64_t)(index + 1);
         out->reclen = (uint16_t)reclen;
-        out->type = is_folder ? DT_DIR : DT_REG;
+        out->type = is_folder ? DT_DIR : (entry.size & FS_LINK) != 0 ? DT_LNK : DT_REG;
         memcpy(out->name, leaf, length);
         out->name[is_folder ? length - 1 : length] = '\0';
 
@@ -2222,7 +2319,7 @@ static uint64_t sys_sysinfo(uint64_t out, uint64_t b, uint64_t c) {
     memset(info, 0, sizeof *info);
     info->uptime = (int64_t)(efi_uptime_ms() / 1000);
     info->totalram = (uint64_t)m.total_kib * 1024;
-    info->freeram = (uint64_t)(m.total_kib - m.used_kib) * 1024;
+    info->freeram = (uint64_t)m.free_kib * 1024;
     info->procs = 1;
     info->unit = 1;
     return 0;
@@ -2531,7 +2628,7 @@ void syscall_init(void) {
     syscall_register(SYS_OPENAT, sys_openat);
     syscall_register(SYS_NEWFSTATAT, sys_newfstatat);
     syscall_register(SYS_STAT, sys_stat);
-    syscall_register(SYS_LSTAT, sys_stat);
+    syscall_register(SYS_LSTAT, sys_lstat);
     syscall_register(SYS_CHDIR, sys_chdir);
     syscall_register(SYS_FCHDIR, sys_fchdir);
     syscall_register(SYS_DUP, sys_dup);
@@ -2546,7 +2643,7 @@ void syscall_init(void) {
     syscall_register(SYS_GETPGID, sys_getpgrp);
     syscall_register(SYS_SETPGID, sys_ok);
     syscall_register(SYS_SETSID, sys_getpgrp);
-    syscall_register(SYS_READLINK, sys_readlinkat);
+    syscall_register(SYS_READLINK, sys_readlink);
     syscall_register(SYS_SIGALTSTACK, sys_ok);
     syscall_register(SYS_GETRESUID, sys_getresuid);
     syscall_register(SYS_GETRESGID, sys_getresuid);
@@ -2566,9 +2663,9 @@ void syscall_init(void) {
     syscall_register(SYS_RENAMEAT, sys_renameat);
     syscall_register(SYS_RENAMEAT2, sys_renameat);
     syscall_register(SYS_LINKAT, sys_no_links);
-    syscall_register(SYS_SYMLINKAT, sys_no_links);
+    syscall_register(SYS_SYMLINKAT, sys_symlinkat);
     syscall_register(SYS_LINK, sys_no_links);
-    syscall_register(SYS_SYMLINK, sys_no_links);
+    syscall_register(SYS_SYMLINK, sys_symlink);
     syscall_register(SYS_MKNODAT, sys_no_links);
     syscall_register(SYS_TRUNCATE, sys_truncate);
     syscall_register(SYS_READV, sys_readv);
@@ -2708,9 +2805,6 @@ size_t program_memory(void) {
     return (size_t)window_pages * PAGE_SIZE + vm_memory() + vm_tables();
 }
 
-static struct efi_boot_services *services(void) {
-    return efi_boot()->system->boot;
-}
 
 static uint64_t *table_at(uint64_t entry) {
     return (uint64_t *)(entry & PAGE_ADDR);
@@ -2742,8 +2836,7 @@ static void window_map(void) {
         return;
     }
     window_tried = true;
-    if (EFI_ERROR(services()->allocate_pages(EFI_ALLOCATE_ANY, EFI_LOADER_DATA, 1,
-                                             &table))) {
+    if ((table = mem_pages(1)) == 0) {
         return;
     }
     memset((void *)table, 0, PAGE_SIZE);
@@ -2770,7 +2863,7 @@ static void window_map(void) {
         uint64_t flags = pdpt[0] & 0xFFF;
         uint64_t at = 0;
 
-        if (EFI_ERROR(services()->allocate_pages(EFI_ALLOCATE_ANY, EFI_LOADER_DATA, 1, &at))) {
+        if ((at = mem_pages(1)) == 0) {
             __asm__ volatile("mov %0, %%cr0" : : "r"(cr0) : "memory");
             return;
         }
@@ -2797,7 +2890,13 @@ static void window_reset(void) {
     }
     for (unsigned i = 0; i < WINDOW_PAGES; i++) {
         if (program_pt[i] != 0) {
-            services()->free_pages(program_pt[i] & PAGE_ADDR, 1);
+            uint64_t at = program_pt[i] & PAGE_ADDR;
+
+            if (at >= PROGRAM_BASE && at < PROGRAM_STACK) {
+                mem_window_give(at);
+            } else {
+                mem_pages_free(at, 1);
+            }
             program_pt[i] = 0;
         }
     }
@@ -2805,8 +2904,8 @@ static void window_reset(void) {
     flush_tlb();
 }
 
-/* Lets ring 3 have the window page holding addr, buying it from the firmware
-   if this is the first touch. The page is zeroed as it is handed over, so
+/* Lets ring 3 have the window page holding addr, buying it if this is the
+   first touch. The page is zeroed as it is handed over, so
    nothing of whatever used it last shows through. */
 static bool map_page(uint64_t addr) {
     uint64_t page = addr & ~(uint64_t)(PAGE_SIZE - 1);
@@ -2819,13 +2918,14 @@ static bool map_page(uint64_t addr) {
     }
     entry = &program_pt[(page - PROGRAM_BASE) / PAGE_SIZE];
     if (*entry == 0) {
-        /* At this exact address, so that the window maps one to one and the
-           memory is genuinely ours rather than something firmware is using. */
-        if (EFI_ERROR(services()->allocate_pages(EFI_ALLOCATE_ADDRESS, EFI_LOADER_DATA,
-                                                 1, &at))) {
+        /* At this exact address where it is free, so that the window maps
+           one to one; where something else has it - the firmware's leftovers,
+           on a small machine - any page will do, the window's own table
+           saying where it is. */
+        if (!mem_window_take(page) && (at = mem_pages(1)) == 0) {
             return false;
         }
-        *entry = page | PAGE_USER_RW;
+        *entry = at | PAGE_USER_RW;
         window_pages++;
         __asm__ volatile("invlpg (%0)" : : "r"(page) : "memory");
         memset((void *)page, 0, PAGE_SIZE);
@@ -3066,41 +3166,6 @@ static int load_elf_at(const struct fs_file *file, const struct elf_header *head
     return 0;
 }
 
-/* Where a shared library actually is.
- *
- * A program off a Linux system asks for its loader by the path it had there,
- * /lib64/ld-linux-x86-64.so.2, and that is not where anything is here. So the
- * path is tried as it stands and then by name in the places libraries are
- * kept, which is what the program was going to need anyway. */
-static const char *const library_paths[] = { "/pkg/linux-coreutils/lib/", "/lib/" };
-
-static int find_library(const char *path, struct fs_file *out) {
-    const char *name = path;
-    char tried[FS_NAME_LEN];
-
-    if (fs_stat(path, out) == 0) {
-        return 0;
-    }
-    for (const char *p = path; *p != '\0'; p++) {
-        if (*p == '/') {
-            name = p + 1;
-        }
-    }
-    for (unsigned i = 0; i < sizeof library_paths / sizeof library_paths[0]; i++) {
-        size_t n = strlen(library_paths[i]), m = strlen(name);
-
-        if (n + m + 1 > sizeof tried) {
-            continue;
-        }
-        memcpy(tried, library_paths[i], n);
-        memcpy(tried + n, name, m + 1);
-        if (fs_stat(tried, out) == 0) {
-            return 0;
-        }
-    }
-    return FS_ENOENT;
-}
-
 /* What program_load needs to hold while it works: three hundred bytes of
    headers and paths, borrowed rather than put on the kernel stack, since a
    program may start a program which starts a program. */
@@ -3114,7 +3179,7 @@ int program_load(const struct fs_file *file, uint64_t *entry) {
     struct load_work *w = NULL;
     int err;
 
-    if (EFI_ERROR(services()->allocate_pool(EFI_LOADER_DATA, sizeof *w, (void **)&w))) {
+    if ((w = mem_alloc(sizeof *w)) == NULL) {
         return FS_ENOSPC;
     }
 
@@ -3131,58 +3196,53 @@ int program_load(const struct fs_file *file, uint64_t *entry) {
     started_base = 0;
     started_phdr = started_phent = started_phnum = 0;
 
-    if (file->size >= sizeof header && read_at(file, 0, &header, sizeof header) == 0 &&
-        header.ident[0] == 0x7F && header.ident[1] == 'E' &&
-        header.ident[2] == 'L' && header.ident[3] == 'F') {
-        /* Something linked to run at a fixed address goes there; anything
-           position-independent goes where we put it. */
-        uint64_t bias = header.type == ET_DYN ? vm_base() + USER_EXEC : 0;
+    /* Everything on the disk is linked: an ELF, or not a program at all. */
+    if (file->size < sizeof header || read_at(file, 0, &header, sizeof header) != 0 ||
+        header.ident[0] != 0x7F || header.ident[1] != 'E' ||
+        header.ident[2] != 'L' || header.ident[3] != 'F') {
+        err = PROGRAM_EINVAL;
+        goto done;
+    }
+    uint64_t bias = header.type == ET_DYN ? vm_base() + USER_EXEC : 0;
 
-        /* Something linked to run at a fixed address goes there, in the
-           window; anything position-independent goes in a region. */
-        if (header.type == ET_DYN && vm_base() == 0) {
-            err = PROGRAM_EINVAL;
+    /* Something linked to run at a fixed address goes there, in the
+       window; anything position-independent goes in a region. */
+    if (header.type == ET_DYN && vm_base() == 0) {
+        err = PROGRAM_EINVAL;
+        goto done;
+    }
+    loaded_flat = header.type != ET_DYN;
+    err = load_elf_at(file, &header, bias, entry, &started_phdr,
+                      interp, FS_NAME_LEN);
+    if (err < 0) {
+        goto done;
+    }
+    started_phent = header.phentsize;
+    started_phnum = header.phnum;
+    started_entry = *entry;
+
+    if (interp[0] != '\0') {
+        /* It is dynamically linked: its loader runs first, and does the
+           rest of the work itself through these same syscalls. */
+        dbg("load: interpreter %s\n", interp);
+        if (fs_stat(interp, &w->loader) < 0 ||
+            read_at(&w->loader, 0, &w->loader_header,
+                    sizeof w->loader_header) < 0) {
+            err = PROGRAM_ENOINTERP;
             goto done;
         }
-        loaded_flat = header.type != ET_DYN;
-        err = load_elf_at(file, &header, bias, entry, &started_phdr,
-                          interp, FS_NAME_LEN);
+        started_base = vm_base() + USER_INTERP;
+        err = load_elf_at(&w->loader, &w->loader_header, started_base, entry,
+                          NULL, NULL, 0);
         if (err < 0) {
             goto done;
         }
-        started_phent = header.phentsize;
-        started_phnum = header.phnum;
-        started_entry = *entry;
-
-        if (interp[0] != '\0') {
-            /* It is dynamically linked: its loader runs first, and does the
-               rest of the work itself through these same syscalls. */
-            dbg("load: interpreter %s\n", interp);
-            if (find_library(interp, &w->loader) < 0 ||
-                read_at(&w->loader, 0, &w->loader_header,
-                        sizeof w->loader_header) < 0) {
-                err = PROGRAM_ENOINTERP;
-                goto done;
-            }
-            started_base = vm_base() + USER_INTERP;
-            err = load_elf_at(&w->loader, &w->loader_header, started_base, entry,
-                              NULL, NULL, 0);
-            if (err < 0) {
-                goto done;
-            }
-        }
-    } else {
-        /* A flat binary is its own image. */
-        *entry = PROGRAM_BASE;
-        started_entry = PROGRAM_BASE;
-        loaded_end = PROGRAM_BASE + file->size;
-        err = load_segment(file, 0, PROGRAM_BASE, file->size, file->size);
     }
     if (err == 0) {
         program_memory_start(loaded_end);
     }
 done:
-    services()->free_pool(w);
+    mem_free(w);
     return err;
 }
 #undef header
@@ -3208,18 +3268,14 @@ enum {
 /* The environment the first program starts with - the shell, since nothing
    runs before it. Everything after that inherits what the shell passes to
    execve, so this is only ever the shell's own.
-   LD_LIBRARY_PATH is the whole reason a loader off a Linux system can find
-   its libraries on this disk, and TERMINFO the reason readline believes the
-   screen can move a cursor. */
+   Nothing in it says where libraries or terminfo are: they are where a
+   program off a Linux system already looks, /usr/lib and /usr/share. */
 static const char *const environment[] = {
-    "LD_LIBRARY_PATH=/pkg/linux-coreutils/lib",
-    "PATH=/proc:/pkg/linux-coreutils",
+    "PATH=/proc:/usr/bin",
     "TERM=linux",
-    "TERMINFO=/pkg/linux-coreutils/terminfo",
-    "HOME=/home",
+    "HOME=/root",
     "TMPDIR=/tmp",
     "LANG=C",
-    "PS1=\\[\\e[36m\\]\\w\\[\\e[0m\\] $ ",
 };
 
 #define ENV_COUNT (sizeof environment / sizeof environment[0])
@@ -3244,11 +3300,14 @@ static uint64_t build_stack(unsigned argc, const char *const *argv,
     uint64_t *out;
     unsigned n = 0, count = 0;
 
-    if (big && !vm_reserve(top - USER_STACK_BYTES, USER_STACK_BYTES)) {
+    /* Only checked, not bought: a stack page arrives when it is first
+       touched, like every other page of a region - most programs use a few
+       of the sixty-four, and buying them all up front was a quarter of a
+       megabyte each program had whether it wanted it or not. */
+    if (big && !vm_holds(top - USER_STACK_BYTES, USER_STACK_BYTES)) {
         return 0;
     }
-    if (EFI_ERROR(services()->allocate_pool(EFI_LOADER_DATA, sizeof *work,
-                                            (void **)&work))) {
+    if ((work = mem_alloc(sizeof *work)) == NULL) {
         return 0;
     }
 
@@ -3320,7 +3379,7 @@ static uint64_t build_stack(unsigned argc, const char *const *argv,
         out[n++] = aux[i].type;
         out[n++] = aux[i].value;
     }
-    services()->free_pool(work);
+    mem_free(work);
     return rsp;
 }
 #undef aux
@@ -3427,7 +3486,6 @@ struct saved {
 static unsigned nest;               /* how deep we are in that */
 
 static uint64_t sys_pipe2(uint64_t out, uint64_t flags, uint64_t c) {
-    struct efi_boot_services *bs = services();
     uint32_t *fds = (uint32_t *)out;
     unsigned slot;
     uint64_t read_fd, write_fd;
@@ -3440,7 +3498,7 @@ static uint64_t sys_pipe2(uint64_t out, uint64_t flags, uint64_t c) {
     }
     for (slot = 0; slot < PIPES && pipes[slot].data != NULL; slot++) {
     }
-    if (slot == PIPES || EFI_ERROR(bs->allocate_pool(EFI_LOADER_DATA, PIPE_FIRST, &data))) {
+    if (slot == PIPES || (data = mem_alloc(PIPE_FIRST)) == NULL) {
         return ERR(ENFILE);
     }
     pipes[slot] = (struct pipe){ .data = data, .size = PIPE_FIRST, .refs = 2 };
@@ -3454,7 +3512,7 @@ static uint64_t sys_pipe2(uint64_t out, uint64_t flags, uint64_t c) {
         if ((int64_t)read_fd >= 0) {
             handles[read_fd].used = 0;
         }
-        bs->free_pool(data);
+        mem_free(data);
         pipes[slot] = (struct pipe){ 0 };
         return ERR(EMFILE);
     }
@@ -3516,11 +3574,10 @@ static uint64_t sys_wait4(uint64_t pid, uint64_t status, uint64_t options) {
 /* ---- putting a program aside -------------------------------------------- */
 
 static struct saved *context_save(void) {
-    struct efi_boot_services *bs = services();
     struct saved *s;
     void *block = NULL;
 
-    if (EFI_ERROR(bs->allocate_pool(EFI_LOADER_DATA, sizeof *s, &block))) {
+    if ((block = mem_alloc(sizeof *s)) == NULL) {
         return NULL;
     }
     s = block;
@@ -3552,7 +3609,7 @@ static void context_restore(struct saved *s) {
     wrmsr(MSR_FS_BASE, s->fs_base);
     loaded_flat = s->flat;
     memcpy(mappings, s->maps, sizeof mappings);
-    services()->free_pool(s);
+    mem_free(s);
 }
 
 /* ---- fork and execve ----------------------------------------------------- */
@@ -3597,27 +3654,26 @@ static uint64_t sys_fork(uint64_t a, uint64_t b, uint64_t c) {
     /* The child's registers are borrowed rather than kept on the kernel
        stack: the child runs inside this call, and everything it does is
        nested inside it. */
-    if (EFI_ERROR(services()->allocate_pool(EFI_LOADER_DATA, sizeof *child,
-                                            (void **)&child))) {
+    if ((child = mem_alloc(sizeof *child)) == NULL) {
         return ERR(ENOMEM);
     }
     *child = *user_frame;
     if ((state = context_save()) == NULL) {
-        services()->free_pool(child);
+        mem_free(child);
         return ERR(ENOMEM);
     }
     /* From here every page the child writes is copied aside first, so that
        what it does to its parent's memory can be undone. */
     if (!vm_undo_begin()) {
         context_restore(state);
-        services()->free_pool(child);
+        mem_free(child);
         return ERR(ENOMEM);
     }
     pid = ++last_pid;
     nest++;
     code = user_resume(child, 0);   /* the child, from this very syscall */
     nest--;
-    services()->free_pool(child);
+    mem_free(child);
 
     /* It may have been killed inside a program of its own, which leaves that
        program's region still on the stack of them. */
@@ -3678,9 +3734,13 @@ static char *join_args(char *line, unsigned argc) {
     if (argc < 2) {
         return line + first - 1;    /* the NUL after the only word */
     }
-    for (size_t i = first; line[i] != '\0' || line[i + 1] != '\0'; i++) {
+    /* Exactly argc - 1 words: the environment comes straight after the last
+       of them, and joining up to a double NUL ran on into it - a command
+       given no last argument was handed PATH=... as one. */
+    for (size_t i = first, words = 1; words < argc - 1; i++) {
         if (line[i] == '\0') {
             line[i] = ' ';
+            words++;
         }
     }
     return line + first;
@@ -3741,7 +3801,6 @@ static bool shebang(const struct fs_file *file, char *out, size_t max,
 
 static uint64_t sys_execve(uint64_t path, uint64_t argv, uint64_t envp) {
     const char *given = user_string(path);
-    struct efi_boot_services *bs = services();
     const struct proc_cmd *cmd;
     struct exec_args *held = NULL;
     struct fs_file file;
@@ -3753,7 +3812,7 @@ static uint64_t sys_execve(uint64_t path, uint64_t argv, uint64_t envp) {
     if (given == NULL || strlen(given) + 1 > FS_NAME_LEN) {
         return ERR(EINVAL);
     }
-    if (EFI_ERROR(bs->allocate_pool(EFI_LOADER_DATA, sizeof *held, (void **)&held))) {
+    if ((held = mem_alloc(sizeof *held)) == NULL) {
         return ERR(ENOMEM);
     }
     strcpy(held->name, given);
@@ -3774,20 +3833,20 @@ static uint64_t sys_execve(uint64_t path, uint64_t argv, uint64_t envp) {
         void *taken = NULL;
 
         if (!is_console(1) &&
-            !EFI_ERROR(bs->allocate_pool(EFI_LOADER_DATA, PROC_OUT, &taken))) {
+            (taken = mem_alloc(PROC_OUT)) != NULL) {
             vga_capture(taken, PROC_OUT);
         }
         proc_run(cmd, join_args(held->line, argc));
         if (taken != NULL) {
             vga_capture_end();
             write_to(handle_of(1), (uint64_t)taken, strlen(taken));
-            bs->free_pool(taken);
+            mem_free(taken);
         }
-        bs->free_pool(held);
+        mem_free(held);
         user_exit(0);
     }
     if (fs_stat(held->name, &file) != 0 || file.size == 0) {
-        bs->free_pool(held);
+        mem_free(held);
         return ERR(ENOENT);
     }
 
@@ -3810,18 +3869,18 @@ static uint64_t sys_execve(uint64_t path, uint64_t argv, uint64_t envp) {
         memcpy(held->words, rest, (n + 1) * sizeof rest[0]);
         argc = n;
         if (strlen(interp) + 1 > FS_NAME_LEN) {
-            bs->free_pool(held);
+            mem_free(held);
             return ERR(EINVAL);
         }
         strcpy(held->name, interp);
         if (fs_stat(held->name, &file) != 0 || file.size == 0) {
-            bs->free_pool(held);
+            mem_free(held);
             return ERR(ENOENT);
         }
     }
     /* A region of its own, so that whoever forked this child keeps theirs. */
     if (!vm_push()) {
-        bs->free_pool(held);
+        mem_free(held);
         return ERR(ENOMEM);
     }
     code = program_load(&file, &entry);
@@ -3834,6 +3893,6 @@ static uint64_t sys_execve(uint64_t path, uint64_t argv, uint64_t envp) {
         code = 127;
     }
     vm_pop();
-    bs->free_pool(held);
+    mem_free(held);
     user_exit(code);
 }

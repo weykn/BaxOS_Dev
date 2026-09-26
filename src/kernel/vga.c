@@ -7,6 +7,7 @@
 #include "boot.h"
 #include "debug.h"
 #include "efi_kernel.h"
+#include "mem.h"
 #include "font.h"
 #include "string.h"
 
@@ -232,17 +233,16 @@ static bool layout(void) {
     unsigned columns = fb_width / cell_w;
     unsigned rows = fb_height / cell_h;
     size_t bytes = (size_t)columns * rows * sizeof(uint16_t);
-    struct efi_boot_services *bs = efi_boot()->system->boot;
     void *memory;
 
     if (columns < 40 || rows < 8) {
         return false;
     }
-    if (EFI_ERROR(bs->allocate_pool(EFI_LOADER_DATA, bytes, &memory))) {
+    if ((memory = mem_alloc(bytes)) == NULL) {
         return false;
     }
     if (screen != NULL) {
-        bs->free_pool((void *)screen);
+        mem_free((void *)screen);
     }
     screen = memory;
     screen_bytes = bytes;
@@ -379,6 +379,10 @@ static void repaint(void) {
    it look - leaving us drawing a picture of one size into a scanout of
    another. There is no way to tell it not to, so instead this notices and
    follows; everything that waits for a key calls it. */
+void vga_firmware_gone(void) {
+    gop = NULL;
+}
+
 void vga_follow(void) {
     unsigned was_w, was_h;
 
@@ -682,7 +686,7 @@ static bool escaped(char c) {
     }
     if (c == '?' || c == '<' || c == '=' || c == '>') {
         /* A terminal's own settings rather than anything drawn - bracketed
-           paste, which readline turns on, is "escape [ ? 2 0 0 4 h". None of
+           paste, which a line editor turns on, is "escape [ ? 2 0 0 4 h". None of
            them mean anything to this screen, and the whole sequence is
            swallowed rather than half-read. */
         private = true;
@@ -775,7 +779,18 @@ void vga_putc(char c) {
     /* An escape sequence is not something printed: a colour, or a line of
        progress, leaves whatever is on screen where it is - which is what
        lets the loading screen stay up while the script behind it reports. */
+    size_t was = cursor;
+
     if (escaped(c)) {
+        if (cursor != was) {
+            /* A move: the cursor drawn where it was has to go with it. */
+            size_t now = cursor;
+
+            cursor = was;
+            cursor_draw(false);
+            cursor = now;
+            cursor_draw(true);
+        }
         return;
     }
     dbg_screen(c);
@@ -798,7 +813,7 @@ void vga_putc(char c) {
         } while (cursor % 8 != 0 && cursor % width != 0);
     } else if ((unsigned char)c < 0x20 || c == 0x7F) {
         /* A control character this screen has no answer for - the bell most
-           of all, which readline rings whenever an edit does nothing, a
+           of all, which a line editor rings whenever an edit does nothing, a
            backspace at the start of a line among them. The font has a glyph
            at every code, so printing one drew a stray dot on the line being
            typed. A terminal shows nothing for these, and nor does this. */
@@ -817,6 +832,10 @@ void vga_putc(char c) {
         cursor -= width;
     }
     cursor_draw(true);
+}
+
+size_t vga_at(void) {
+    return cursor;
 }
 
 void vga_puts(const char *s) {

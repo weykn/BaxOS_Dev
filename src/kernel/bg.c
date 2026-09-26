@@ -6,6 +6,7 @@
 #include "debug.h"
 #include "efi.h"
 #include "efi_kernel.h"
+#include "mem.h"
 #include "fs.h"
 #include "png.h"
 #include "string.h"
@@ -43,9 +44,6 @@ static unsigned *columns;
 static uint32_t  column_count;
 static uint8_t   dimmed[256];
 
-static struct efi_boot_services *services(void) {
-    return efi_boot()->system->boot;
-}
 
 /* ---- reading the file --------------------------------------------------- */
 
@@ -98,7 +96,7 @@ static void *source_alloc(void *ctx, size_t len) {
     void *memory;
 
     (void)ctx;
-    if (EFI_ERROR(services()->allocate_pool(EFI_LOADER_DATA, len, &memory))) {
+    if ((memory = mem_alloc(len)) == NULL) {
         return NULL;
     }
     return memory;
@@ -107,7 +105,7 @@ static void *source_alloc(void *ctx, size_t len) {
 static void source_free(void *ctx, void *memory) {
     (void)ctx;
     if (memory != NULL) {
-        services()->free_pool(memory);
+        mem_free(memory);
     }
 }
 
@@ -173,12 +171,12 @@ static void put_row(void *ctx, unsigned y, const uint8_t *row, unsigned width,
 void bg_clear(void) {
     vga_background(NULL);
     if (pixels != NULL) {
-        services()->free_pool(pixels);
+        mem_free(pixels);
         pixels = NULL;
         pixel_bytes = 0;
     }
     if (columns != NULL) {
-        services()->free_pool(columns);
+        mem_free(columns);
         columns = NULL;
         column_count = 0;
     }
@@ -206,12 +204,12 @@ int bg_set(const char *path, unsigned alpha) {
     if (pixels == NULL || pixel_bytes != bytes) {
         void *memory;
 
-        if (EFI_ERROR(services()->allocate_pool(EFI_LOADER_DATA, bytes, &memory))) {
+        if ((memory = mem_alloc(bytes)) == NULL) {
             return BG_EMEMORY;
         }
         vga_background(NULL);       /* the old pixels are about to go */
         if (pixels != NULL) {
-            services()->free_pool(pixels);
+            mem_free(pixels);
         }
         pixels = memory;
         pixel_bytes = bytes;
@@ -219,12 +217,11 @@ int bg_set(const char *path, unsigned alpha) {
     if (columns == NULL || column_count != w) {
         void *memory;
 
-        if (EFI_ERROR(services()->allocate_pool(EFI_LOADER_DATA,
-                                                (size_t)w * sizeof *columns, &memory))) {
+        if ((memory = mem_alloc((size_t)w * sizeof *columns)) == NULL) {
             return BG_EMEMORY;
         }
         if (columns != NULL) {
-            services()->free_pool(columns);
+            mem_free(columns);
         }
         columns = memory;
         column_count = w;

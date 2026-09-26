@@ -84,12 +84,19 @@ bool vga_has_background(void);
 uint16_t vga_get(unsigned column, unsigned row);
 void vga_put(unsigned column, unsigned row, uint16_t value);
 
+/* Where the cursor is, as row * vga_width() + column. */
+size_t vga_at(void);
+
 /* Draws the text cursor again. vga_put leaves it off, so nothing laid over
    its cell shows it through; whatever put the cell back calls this. */
 void vga_cursor(void);
 
 /* What the console's cells cost in memory, for the `mem` command. */
 size_t vga_memory(void);
+
+/* The firmware has been let go: its graphics protocol with it, so the mode
+   in use now is the mode for good. */
+void vga_firmware_gone(void);
 
 /* Puts the console back on screen if the firmware has taken the mode over.
    Everything that waits for a key calls this. */

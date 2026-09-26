@@ -17,10 +17,11 @@
 
 #define BOOT_MAGIC 0x536F7861426ULL     /* "BaxoS" */
 
-/* Where the loader puts things. Both are whole 2 MiB pages, which is what
-   the kernel's own page tables map them with. */
-#define KERNEL_BASE   0x200000          /* the kernel image, its bss and stack */
-#define KERNEL_BYTES  0x200000
+/* What the loader takes for the kernel: the image, its bss and its stack,
+   wherever the firmware has room. The kernel is position-independent and
+   applies its own relocations first thing, so no address is fixed - a
+   fixed one is exactly what a firmware short of memory has already used. */
+#define KERNEL_BYTES  0x20000
 
 struct boot_info {
     uint64_t magic;
@@ -37,7 +38,9 @@ struct boot_info {
     uint32_t             media_id;
     uint32_t             reserved;
 
-    uint64_t memory_kib;                /* RAM the firmware says is usable */
+    uint64_t memory_kib;                /* RAM free as the loader started */
+    uint64_t ram_kib;                   /* all the RAM there is, the firmware's
+                                           own included */
 
     /* The timestamp counter as the loader was entered, which is the earliest
        moment this machine can be asked about. Uptime counts from here, so it

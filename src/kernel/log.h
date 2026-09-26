@@ -6,7 +6,7 @@
 /* A record of the syscalls programs make, and who made them.
  *
  * Every call through syscall_dispatch is kept here, in a ring, and written
- * out to /log/<program>.log - one file per executable, which is what makes a
+ * out to /var/log/<program>.log - one file per executable, which is what makes a
  * program's own calls readable without the rest of the machine's in the way.
  *
  * When that happens is the whole of the difference between a machine that
@@ -72,9 +72,9 @@ const struct log_entry *log_get(unsigned i);
    returns its length. */
 size_t log_format(const struct log_entry *entry, char *buf);
 
-/* Appends what is held to /log/<program>.log, a file per program, and empties
+/* Appends what is held to /var/log/<program>.log, a file per program, and empties
    the ring. Called when the ring fills and when a program ends; a folder
-   named /log is made if there is none. */
+   named /var/log is made if there is none. */
 void log_flush(void);
 
 void log_clear(void);

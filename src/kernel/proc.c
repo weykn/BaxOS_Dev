@@ -4,6 +4,7 @@
 
 #include "bg.h"
 #include "efi_kernel.h"
+#include "ata.h"
 #include "fs.h"
 #include "log.h"
 #include "mem.h"
@@ -73,7 +74,7 @@ static void detail(const char *label, unsigned bytes) {
     kprintf("  %s", label);
     pad(strlen(label), 16);
     color(COL_TEXT);
-    put_right(bytes, 6);
+    put_right(bytes, 8);        /* the firmware's is tens of megabytes */
     color(COL_DIM);
     vga_puts(" B");
 }
@@ -96,6 +97,11 @@ static void list(const char *(*name)(unsigned), const char *now) {
 static void cmd_mode(char *args) {
     const char *name = str_word(&args);
 
+    if (*name != '\0' && vga_mode_name(0) == NULL) {
+        /* The modes are the firmware's to switch, and it has been let go. */
+        error("mode: cannot change after boot\n");
+        return;
+    }
     if (*name != '\0') {
         if (vga_set_mode(name) < 0) {
             error("mode: %s: no such mode\n", name);
@@ -104,11 +110,11 @@ static void cmd_mode(char *args) {
         }
         return;
     }
+    if (vga_mode_name(0) == NULL) {
+        kprintf("  %s  current\n", vga_mode());   /* nothing else to list */
+        return;
+    }
     list(vga_mode_name, vga_mode());
-    /* These are the screen's own, not a guess, so nothing else will work. */
-    color(COL_DIM);
-    kprintf("  %s now\n", vga_mode());
-    color(COL_TEXT);
 }
 
 static void cmd_font(char *args) {
@@ -116,14 +122,11 @@ static void cmd_font(char *args) {
 
     if (*name != '\0') {
         if (vga_set_font(name) < 0) {
-            error("font: %s: no such size, or too big for this screen\n", name);
+            error("font: %s: no such size\n", name);
         }
         return;
     }
     list(vga_font_name, vga_font());
-    color(COL_DIM);
-    vga_puts("  a size is how tall a character is, in pixels\n");
-    color(COL_TEXT);
 }
 
 /* Reads "0.5", "1", "100" or "50%" as a percentage. Anything unreadable is
@@ -158,7 +161,7 @@ static void cmd_set_bg(char *args) {
         bg_clear();
         return;
     }
-    err = bg_set(path, *alpha == '\0' ? 100 : percent(alpha));
+    err = bg_set(path, *alpha == '\0' ? 25 : percent(alpha));
     if (err < 0) {
         error("set-bg: %s: %s\n", path,
               err == BG_EFORMAT ? "not a PNG this can read" :
@@ -174,7 +177,13 @@ static void cmd_mem(char *args) {
 
     (void)args;
     mem_get_stats(&m);
+    uint32_t ours = m.kernel_kib * 1024 + m.window;
+
     usage_bar("memory", m.used_kib, m.total_kib, "KiB");
+    /* The firmware's is what is in use that is not ours: its drivers, and
+       everything it keeps for itself for as long as the kernel uses it. */
+    detail("firmware", m.used_kib * 1024 > ours ? m.used_kib * 1024 - ours : 0);
+    vga_putc('\n');
     detail("kernel image", m.image);
     vga_putc('\n');
     detail("kernel data", m.data);
@@ -220,6 +229,91 @@ static void cmd_clear(char *args) {
    did - so it covers loading the kernel, not only running it. Shown at the
    scale that reads best: a fresh boot in seconds and hundredths, an old one
    in the units that matter. */
+/* ---- the disk cache ------------------------------------------------------
+ *
+ * Every program is the same loader and the same C library read off the disk
+ * again, and a read costs about the same whatever its size: three hundred
+ * microseconds of round trip through the firmware. Keeping them is what makes
+ * one command as quick as the last.
+ *
+ * It costs megabytes, so it is off until it is asked for - and asking also
+ * reads the loader and the library in, so that the first program after is as
+ * quick as the second. */
+
+#define LOADER  "/usr/lib/ld-linux-x86-64.so.2"
+#define LIBRARY "/usr/lib/libc.so.6"
+
+static size_t cache_preload(const char *path) {
+    struct fs_file file;
+
+    if (fs_stat(path, &file) != 0 || file.size == 0) {
+        return 0;
+    }
+    return ata_cache_read(file.start, (file.size + FS_SECTOR - 1) / FS_SECTOR);
+}
+
+/* A size as "512K", "3M" or "1G", or a bare number of bytes. */
+static bool parse_bytes(const char *text, size_t *out) {
+    size_t n = 0;
+
+    if (*text < '0' || *text > '9') {
+        return false;
+    }
+    while (*text >= '0' && *text <= '9') {
+        n = n * 10 + (size_t)(*text++ - '0');
+    }
+    switch (*text) {
+    case 'k': case 'K': n <<= 10; text++; break;
+    case 'm': case 'M': n <<= 20; text++; break;
+    case 'g': case 'G': n <<= 30; text++; break;
+    }
+    *out = n;
+    return *text == '\0';
+}
+
+#define CACHE_DEFAULT (3 << 20)
+
+static size_t cache_bytes = CACHE_DEFAULT;  /* what `cache on` gives it */
+
+/* Gives the cache cache_bytes, and the loader and C library to start with. */
+static void cache_start(void) {
+    if (cache_bytes / 1024 > mem_free_kib()) {
+        error("cache: not enough memory\n");
+        return;
+    }
+    if (ata_cache_size(cache_bytes) > 0) {
+        cache_preload(LOADER);
+        cache_preload(LIBRARY);
+    }
+}
+
+static void cmd_cache(char *args) {
+    const char *what = str_word(&args);
+    bool on = ata_cache_room() > 0;
+
+    if (strcmp(what, "on") == 0) {
+        cache_start();
+    } else if (strcmp(what, "off") == 0) {
+        ata_cache_size(0);
+    } else if (*what != '\0') {
+        size_t bytes;
+
+        if (!parse_bytes(what, &bytes)) {
+            error("usage: cache [on|off|size]\n");
+            return;
+        }
+        cache_bytes = bytes;
+        if (on) {
+            cache_start();          /* a new size for one already running */
+        }
+    } else if (!on) {
+        kprintf("  off, %u KiB\n", (unsigned)(cache_bytes / 1024));
+    } else {
+        usage_bar("cache", (unsigned)(ata_cache_held() / 1024),
+                  (unsigned)(ata_cache_room() / 1024), "KiB");
+    }
+}
+
 static void cmd_uptime(char *args) {
     uint64_t ms = efi_uptime_ms();
     unsigned seconds = (unsigned)(ms / 1000);
@@ -234,57 +328,10 @@ static void cmd_uptime(char *args) {
     }
 }
 
-/* ---- remaps --------------------------------------------------------------
- *
- * One folder standing in for another, which is how a program that knows only
- * where Linux keeps things finds where this disk keeps them: /conf/sys/remap
- * sends /.config to /conf/pkg, so a program writing its settings to
- * /.config/<name> writes them to /conf/pkg/<name> without knowing it. The
- * swap happens in the filesystem, so it holds for every command and every
- * program alike. */
-
-static void cmd_remap(char *args) {
-    const char *from = str_word(&args);
-    const char *to = str_word(&args);
-
-    if (*from == '\0') {
-        const char *there, *here;
-
-        color(COL_ACCENT);
-        for (unsigned i = 0; i < FS_REMAPS; i++) {
-            if (fs_remap_at(i, &there, &here) == 0) {
-                kprintf("  /%s", there);
-                color(COL_DIM);
-                kprintf(" -> ");
-                color(COL_ACCENT);
-                kprintf("/%s\n", here);
-            }
-        }
-        color(COL_TEXT);
-        return;
-    }
-    if (strcmp(from, "remove") == 0) {
-        from = to;
-        to = "";
-        if (*from == '\0') {
-            error("usage: remap remove <folder>\n");
-            return;
-        }
-    } else if (*to == '\0') {
-        error("usage: remap <folder> <folder>\n");
-        return;
-    }
-    int err = fs_remap(from, *to == '\0' ? NULL : to);
-
-    if (err < 0) {
-        error("remap: %s: %s\n", from, fs_error(err));
-    }
-}
-
 /* ---- the log -------------------------------------------------------------
  *
  * What is on screen is the ring: the last few dozen calls, whoever made
- * them. What has been written out is on the disk, under /log, a file per
+ * them. What has been written out is on the disk, under /var/log, a file per
  * program, put there whenever the machine is idle. */
 
 static void cmd_log(char *args) {
@@ -321,8 +368,6 @@ static void cmd_log(char *args) {
         vga_puts(", logging off");
     } else if (log_dropped() > 0) {
         kprintf(", %u dropped", log_dropped());
-    } else {
-        vga_puts(", the rest under /log");
     }
     vga_putc('\n');
     color(COL_TEXT);
@@ -336,8 +381,8 @@ static const struct proc_cmd commands[] = {
     { "set-bg", "<file> [alpha]",    cmd_set_bg },
     { "mem",    "",                  cmd_mem    },
     { "uptime", "",                  cmd_uptime },
-    { "remap",  "[folder folder]",   cmd_remap  },
     { "log",    "[on|off|clear]",    cmd_log },
+    { "cache",  "[on|off|size]",     cmd_cache },
     { "clear",  "",                  cmd_clear },
     { "reboot", "",                  cmd_reboot },
     { "poweroff", "",                cmd_poweroff },

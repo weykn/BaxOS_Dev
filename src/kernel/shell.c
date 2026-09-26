@@ -4,6 +4,7 @@
 
 #include "debug.h"
 #include "efi_kernel.h"
+#include "mem.h"
 #include "fs.h"
 #include "io.h"
 #include "string.h"
@@ -14,20 +15,20 @@
 
 /* Bringing the machine up: the system's configuration, and then the shell.
  *
- * /conf/sys/boot is the machine itself - the size of the screen, the size of
- * the text, the folders standing in for other folders - and the kernel reads
- * and runs it, because all of it is the kernel's own state and none of it
- * needs a shell. Its lines print as they run, the way a Unix says what it is
- * doing on the way up. Only once it is through does /conf/sys/shell say what
- * to start.
+ * /etc/boot is the machine itself - the size of the screen, the size of the
+ * text, the wallpaper - and the kernel reads and runs it, because all of it
+ * is the kernel's own state and none of it needs a shell. Its lines print as they run, the way a Unix says what it is
+ * doing on the way up. Only once it is through does /etc/shell say what to
+ * start.
  *
  * The shell itself is a program on the disk and nothing of it is in here:
  * reading a line, splitting it into words, looking a name up on the path,
  * running what it finds, are all its own. */
 
-#define BOOT_CONF     "/conf/sys/boot"
-#define SHELL_CONF    "/conf/sys/shell"
-#define SHELL_DEFAULT "/pkg/linux-coreutils/bash"
+#define BOOT_CONF     "/etc/boot"
+#define SHELL_CONF    "/etc/shell"
+#define SHELL_DEFAULT "/usr/bin/tsh"
+#define HOME          "/root"   /* root's, as on Linux; /home is for users */
 
 #define CONF_LINE     128       /* the longest line one of them may hold */
 #define CONF_DEPTH    4         /* files calling files, at most */
@@ -80,7 +81,7 @@ static const char *shell_wanted(char *out, size_t max) {
  *
  * One command a line, '#' a comment, blanks ignored, and `sh <file>` another
  * file read the same way - which is how the boot script calls the rest of
- * /conf/sys. The commands it can run are the kernel's own, the ones under
+ * /etc. The commands it can run are the kernel's own, the ones under
  * /proc: the shell's words are not here, and are not wanted, because what
  * this file sets up is the machine rather than the shell. */
 
@@ -113,7 +114,7 @@ static void conf_line(char *text, unsigned depth) {
 
     if (cmd == NULL) {
         vga_set_color(VGA_LIGHTRED, VGA_BLACK);
-        kprintf("%s: %s: not one of the machine's own commands\n", path_now, name);
+        kprintf("%s: %s: not found\n", path_now, name);
         vga_set_color(VGA_LIGHTGRAY, VGA_BLACK);
         return;
     }
@@ -121,7 +122,6 @@ static void conf_line(char *text, unsigned depth) {
 }
 
 static void conf_run(const char *path, unsigned depth) {
-    struct efi_boot_services *bs = efi_boot()->system->boot;
     char was[FS_NAME_LEN + 1] = "/";
     char here[FS_NAME_LEN + 1] = "/";
     char text[CONF_LINE];
@@ -136,10 +136,10 @@ static void conf_run(const char *path, unsigned depth) {
     }
     sectors = (file.size + FS_SECTOR - 1) / FS_SECTOR;
     if (sectors > 0) {
-        if (EFI_ERROR(bs->allocate_pool(EFI_LOADER_DATA, sectors * FS_SECTOR, &script)) ||
+        if ((script = mem_alloc(sectors * FS_SECTOR)) == NULL ||
             fs_read_many(file.start, 0, sectors, script) < 0) {
             if (script != NULL) {
-                bs->free_pool(script);
+                mem_free(script);
             }
             return;
         }
@@ -170,7 +170,7 @@ static void conf_run(const char *path, unsigned depth) {
     path_now = outer;
     fs_chdir(was);
     if (script != NULL) {
-        bs->free_pool(script);
+        mem_free(script);
     }
 }
 
@@ -193,8 +193,12 @@ __attribute__((noreturn)) void shell_run(void) {
     if (fs_stat(BOOT_CONF, &file) == 0) {
         conf_run(BOOT_CONF, 0);
     }
+    /* The screen mode is set, which only the firmware can do: now it can go,
+       and everything it held with it. */
+    efi_leave();
     boot_time();
     shell = shell_wanted(wanted, sizeof wanted);
+    fs_chdir(HOME);                 /* a shell starts at home, as a login does */
 
     for (;;) {
         int err = fs_stat(shell, &file);

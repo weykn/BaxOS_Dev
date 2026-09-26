@@ -29,14 +29,15 @@ BUILD := build
 
 CFLAGS := -Isrc/kernel $(if $(filter 1,$(DEBUG)),-DDEBUG) -std=gnu11 -Oz -flto -Wall -Wextra \
           -ffreestanding -fno-builtin -nostdlib \
-          -fno-pic -fno-pie -mno-red-zone -mgeneral-regs-only \
+          -fpie -mno-red-zone -mgeneral-regs-only \
           -fno-stack-protector -fno-asynchronous-unwind-tables \
           -fno-tree-loop-distribute-patterns \
           -ffunction-sections -fdata-sections
 
-# The kernel is linked through gcc so LTO can run. --no-warn-rwx-segments: a
-# flat binary has no segment permissions to enforce.
-LDFLAGS := -static -no-pie \
+# The kernel is linked through gcc so LTO can run, as a static PIE at 0 that
+# relocates itself (start.asm). --no-warn-rwx-segments: a flat binary has no
+# segment permissions to enforce.
+LDFLAGS := -static-pie \
            -Wl,-n,--no-warn-rwx-segments,--gc-sections,--build-id=none,-T,src/kernel/kernel.ld
 
 # The loader is built by a compiler that emits PE and speaks the calling
@@ -57,10 +58,10 @@ START_OBJ := $(BUILD)/kernel/start.o
 
 # Everything under src/disk goes onto the disk exactly as it is, keeping the
 # folders it sits in - the folders themselves included, so that one with
-# nothing in it yet still arrives. src/disk/ROBOT.md says what each is for.
+# nothing in it yet still arrives, and the symbolic links - /bin is one.
 # Nothing here is built: programs are compiled on the host by hand.
 DISK_ROOT  := src/disk
-DISK_FILES := $(shell find $(DISK_ROOT) -mindepth 1 \( -type f -o -type d \) 2>/dev/null)
+DISK_FILES := $(shell find $(DISK_ROOT) -mindepth 1 \( -type f -o -type d -o -type l \) 2>/dev/null)
 
 KERNEL_ELF := $(BUILD)/kernel.elf
 KERNEL_BIN := $(BUILD)/kernel.bin
@@ -74,7 +75,7 @@ IMAGE      := $(BUILD)/TuxletOS.img
 # a trailing comment leaves its spaces inside the value, and these get stuck
 # straight onto sector numbers and onto sgdisk's "+48M".
 FS_SECTORS := 131072
-ESP_MIB    := 48
+ESP_MIB    := 1
 FS_MIB     := 64
 DISK_MIB   := 128
 ESP_LBA    := 2048
@@ -87,11 +88,19 @@ ESP_AT      := $(IMAGE)@@$(ESP_LBA)s
 
 all: $(IMAGE)
 
-$(BUILD)/%.o: src/%.c
+# What the last build was built with. Objects depend on it, so changing a
+# flag - DEBUG above all - rebuilds everything that flag reaches rather than
+# leaving a half-and-half kernel that fails to link.
+FLAGS_FILE := $(BUILD)/flags
+$(shell mkdir -p $(BUILD); \
+        [ "$$(cat $(FLAGS_FILE) 2>/dev/null)" = "$(CFLAGS)" ] || \
+        printf '%s' "$(CFLAGS)" > $(FLAGS_FILE))
+
+$(BUILD)/%.o: src/%.c $(FLAGS_FILE)
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
 
-$(BUILD)/%.o: src/%.asm
+$(BUILD)/%.o: src/%.asm $(FLAGS_FILE)
 	@mkdir -p $(@D)
 	$(NASM) -f elf64 $< -o $@
 
@@ -128,7 +137,7 @@ $(IMAGE): $(LOADER) $(FS_IMG)
 	@dd if=/dev/zero of=$@ bs=1M count=$(DISK_MIB) status=none
 	@sgdisk -o -n 1:$(ESP_LBA):+$(ESP_MIB)M -t 1:ef00 -c 1:"EFI System" \
 	        -n 2:$(FS_LBA):+$(FS_MIB)M -t 2:8300 -c 2:"Tuxlet OS" $@ > /dev/null
-	@mformat -i $(ESP_AT) -T $(ESP_SECTORS) -F -v TUXLET ::
+	@mformat -i $(ESP_AT) -T $(ESP_SECTORS) -v TUXLET ::
 	@mmd -i $(ESP_AT) ::/EFI ::/EFI/BOOT
 	@mcopy -i $(ESP_AT) $(LOADER) ::/EFI/BOOT/BOOTX64.EFI
 	@dd if=$(FS_IMG) of=$@ bs=512 seek=$(FS_LBA) conv=notrunc status=none
@@ -151,7 +160,7 @@ run: $(IMAGE)
 	qemu-system-x86_64 $(ACCEL) \
 	    -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 	    -drive if=pflash,format=raw,file=$(BUILD)/ovmf_vars.fd \
-	    -drive format=raw,file=$(IMAGE) -net none -m 256M
+	    -drive format=raw,file=$(IMAGE) -net none -m 39M
 
 clean:
 	rm -rf $(BUILD)

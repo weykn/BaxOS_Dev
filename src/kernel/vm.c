@@ -3,6 +3,7 @@
 #include "debug.h"
 #include "efi.h"
 #include "efi_kernel.h"
+#include "mem.h"
 #include "string.h"
 
 /* x86-64 paging, four levels of it: a virtual address is four nine-bit
@@ -75,16 +76,15 @@ static struct level {
 
 static unsigned depth;          /* levels[depth] is the one in use */
 
-static struct efi_boot_services *services(void) {
-    return efi_boot()->system->boot;
-}
-
+/* Pages from mem.c: the firmware's while it is running, the kernel's own
+   after. EFI_SUCCESS or not, as the callers were written for. */
 static efi_status pages_from_firmware(uint64_t pages, uint64_t *at) {
-    return services()->allocate_pages(EFI_ALLOCATE_ANY, EFI_LOADER_DATA, pages, at);
+    *at = mem_pages(pages);
+    return *at != 0 ? EFI_SUCCESS : EFI_OUT_OF_RESOURCES;
 }
 
 static void pages_back_to_firmware(uint64_t at, uint64_t pages) {
-    services()->free_pages(at, pages);
+    mem_pages_free(at, pages);
 }
 
 static uint64_t *table_at(uint64_t entry) {
@@ -428,8 +428,7 @@ bool vm_undo_begin(void) {
     if (level->base == 0 || level->undo != NULL) {
         return false;               /* one fork out at a time in a region */
     }
-    if (EFI_ERROR(services()->allocate_pool(EFI_LOADER_DATA,
-                                            UNDO_MAX * sizeof(struct undo), &block))) {
+    if ((block = mem_alloc(UNDO_MAX * sizeof(struct undo))) == NULL) {
         return false;
     }
     level->undo = block;
@@ -471,7 +470,7 @@ void vm_undo_end(bool restore) {
     }
     walk(level, unprotect);
     flush_tlb();
-    services()->free_pool(log);
+    mem_free(log);
 }
 
 /* Empties the region: every page it lent the program goes back onto its own

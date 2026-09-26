@@ -49,6 +49,20 @@ void *memcpy(void *dest, const void *src, size_t count) {
     return dest;
 }
 
+/* The same where the two may overlap: backwards when dest is the later. */
+void *memmove(void *dest, const void *src, size_t count) {
+    uint8_t *d = dest;
+    const uint8_t *s = src;
+
+    if (d <= s || d >= s + count) {
+        return memcpy(dest, src, count);
+    }
+    while (count-- > 0) {
+        d[count] = s[count];
+    }
+    return dest;
+}
+
 size_t strlen(const char *s) {
     size_t n = 0;
     while (s[n] != '\0') {

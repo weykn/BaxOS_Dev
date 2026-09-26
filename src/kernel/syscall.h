@@ -10,8 +10,7 @@
 /* User programs, and the syscalls they make.
  *
  * A program is an ELF64 executable, loaded where its program headers say and
- * entered at the address in its header, or a flat binary loaded at
- * PROGRAM_BASE and entered at its first byte. A dynamically linked one
+ * entered at the address in its header. A dynamically linked one
  * arrives with the path of its loader, and that is loaded too and entered
  * instead.
  *
@@ -181,7 +180,7 @@ enum {
     SYS_OPENAT     = 257,   /* (dirfd, path, flags, mode) */
     SYS_NEWFSTATAT = 262,   /* (dirfd, path, struct stat *, flags) */
     SYS_STAT       = 4,     /* (path, struct stat *) */
-    SYS_LSTAT      = 6,     /* (path, struct stat *): nothing is a link */
+    SYS_LSTAT      = 6,     /* (path, struct stat *): the link, not its target */
     SYS_CHDIR      = 80,    /* (path): a program moving the working folder */
     SYS_FCHDIR     = 81,    /* (fd): the same, by a folder already open */
     SYS_DUP3       = 292,
@@ -193,7 +192,7 @@ enum {
     SYS_GETPGRP    = 111,
     SYS_SETSID     = 112,
     SYS_GETPGID    = 121,
-    SYS_READLINK   = 89,    /* (path, buf, size): nothing here is a link */
+    SYS_READLINK   = 89,    /* (path, buf, size): a link's target, no NUL */
     SYS_SIGALTSTACK = 131,
     SYS_GETRESUID  = 118,   /* (uid_t *, uid_t *, uid_t *) */
     SYS_GETRESGID  = 120,
@@ -220,6 +219,7 @@ enum {
 #define O_CREAT   0x40
 #define O_TRUNC   0x200
 #define O_APPEND  0x400
+#define O_NOFOLLOW 0x20000  /* a link at the end of the path is ELOOP */
 /* A file with no name, made in the folder the path names: what a program
    that wants a scratch buffer of its own asks for. */
 #define O_TMPFILE 0x410000

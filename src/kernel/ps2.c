@@ -209,7 +209,7 @@ static void key_push(char c) {
 
 /* What a key with no character of its own sends: the escape sequence every
    terminal has sent for it since the VT100, which is what a program doing
-   its own line editing - a shell's readline - is watching for. */
+   its own line editing is watching for. */
 static const char *grey_key(uint8_t code) {
     switch (code) {
     case 0x48: return "\033[A";     /* up */

@@ -7,12 +7,12 @@
  * ROOT, folders and all - so src/disk/home/ed becomes home/ed, and the
  * folders it needs are made on the way. A PATH that is itself a folder is
  * made and left empty, which is the only way one with nothing in it yet can
- * reach the disk. Files already there are left alone, so what was saved from
+ * reach the disk. A PATH that is a symbolic link becomes one on the disk,
+ * pointing where it points - which is how /bin comes to be usr/bin. Files already there are left alone, so what was saved from
  * inside Tuxlet OS survives a rebuild.
  *
- * The kernel goes to kernel/kernel.bin rather than into the root: the disk's
- * own policy, in ROBOT.md, keeps the root for folders and gives the kernel
- * one of its own.
+ * The kernel goes to boot/kernel.bin rather than into the root, which is
+ * kept for the folders a Linux system has there.
  *
  * What comes out is the contents of one partition, which the Makefile writes
  * into the disk image beside the EFI system partition. The kernel that
@@ -103,8 +103,8 @@ static const char *stored_name(const char *root, const char *path) {
     return base_name(path);
 }
 
-/* Where the kernel is kept, as ROBOT.md lays the disk out. */
-#define KERNEL_NAME "kernel/kernel.bin"
+/* Where the kernel is kept. */
+#define KERNEL_NAME "boot/kernel.bin"
 
 static int is_folder(const char *path) {
     struct stat st;
@@ -190,6 +190,18 @@ int main(int argc, char **argv) {
         }
         make_folders(name);
 
+        char target[FS_LINK_LEN];
+        ssize_t length = readlink(path, target, sizeof target - 1);
+
+        if (length > 0) {
+            target[length] = '\0';
+            err = fs_symlink(target, name);
+            if (err < 0 && err != FS_EEXIST) {
+                fprintf(stderr, "%s: %s\n", path, fs_error(err));
+                return 1;
+            }
+            continue;               /* a link, however it resolves on the host */
+        }
         if (is_folder(path)) {
             make_folder(name);      /* it may have nothing in it yet */
             continue;

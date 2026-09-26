@@ -154,7 +154,7 @@ static bool find_disk(void) {
 static void measure_memory(void) {
     struct efi_memory_descriptor *map = 0;
     efi_uintn size = 0, key, stride;
-    uint64_t pages = 0;
+    uint64_t pages = 0, ram = 0;
     uint32_t version;
 
     bs->get_memory_map(&size, map, &key, &stride, &version);
@@ -168,19 +168,25 @@ static void measure_memory(void) {
             if (d->type == EFI_CONVENTIONAL_MEMORY) {
                 pages += d->pages;
             }
+            if (efi_is_ram(d->type)) {
+                ram += d->pages;
+            }
         }
     }
     bs->free_pool(map);
     info.memory_kib = pages * 4;
+    info.ram_kib = ram * 4;
 }
 
-/* ---- taking the memory the kernel expects to be at ---------------------- */
+/* ---- taking memory for the kernel ---------------------------------------- */
 
-static int take(uint64_t address, uint64_t bytes) {
-    uint64_t at = address;
+/* Anywhere below 4 GiB: the kernel runs wherever it is put. Returns where,
+   or 0 if there is no room at all. */
+static uint64_t take(uint64_t bytes) {
+    uint64_t at = 0xFFFFFFFF;
 
-    return !EFI_ERROR(bs->allocate_pages(EFI_ALLOCATE_ADDRESS, EFI_LOADER_DATA,
-                                         bytes / 4096, &at));
+    return EFI_ERROR(bs->allocate_pages(EFI_ALLOCATE_MAX, EFI_LOADER_DATA,
+                                        bytes / 4096, &at)) ? 0 : at;
 }
 
 efi_status EFIAPI efi_main(efi_handle image, struct efi_system_table *table) {
@@ -210,14 +216,16 @@ efi_status EFIAPI efi_main(efi_handle image, struct efi_system_table *table) {
     }
     measure_memory();
 
-    if (!take(KERNEL_BASE, KERNEL_BYTES)) {
-        fail(u"cannot have the memory the kernel is built for");
+    uint64_t base = take(KERNEL_BYTES);
+
+    if (base == 0) {
+        fail(u"no memory for the kernel");
     }
 
     /* The image, then zeroes for its .bss - which the flat binary does not
        carry - and the stack that lives in it. */
-    zero((void *)KERNEL_BASE, KERNEL_BYTES);
-    copy((void *)KERNEL_BASE, kernel_start, (uint64_t)(kernel_end - kernel_start));
+    zero((void *)base, KERNEL_BYTES);
+    copy((void *)base, kernel_start, (uint64_t)(kernel_end - kernel_start));
 
-    ((kernel_entry)KERNEL_BASE)(&info);
+    ((kernel_entry)base)(&info);
 }

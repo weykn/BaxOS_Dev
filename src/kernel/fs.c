@@ -137,176 +137,141 @@ static bool starts_with(const char *name, const char *prefix) {
     return true;
 }
 
-/* ---- remaps --------------------------------------------------------------
+/* The loaded table's entry for name, or NULL. Free entries have an empty
+   name, so find("") returns the first free one. */
+static struct fs_file *find(const char *name) {
+    for (size_t i = 0; i < FS_MAX_FILES; i++) {
+        if (name_cmp(buf.table.files[i].name, name) == 0) {
+            return &buf.table.files[i];
+        }
+    }
+    return NULL;
+}
+
+static bool is_link(const struct fs_file *file) {
+    return (file->size & FS_LINK) != 0;
+}
+
+/* Bytes of data an entry owns, which for a link is its target. */
+static unsigned bytes_of(const struct fs_file *file) {
+    return file->size & ~FS_LINK;
+}
+
+/* ---- following links -----------------------------------------------------
  *
- * Both sides are kept the way the table spells a folder and no other way: no
- * leading slash, no trailing one. A path matches a remap when it is that
- * folder or lies inside it, and the swap happens once - the result is never
- * looked at again, so a pair that points at each other cannot loop. */
+ * A link is a file holding a path, and resolving a name walks it a part at
+ * a time: each part that turns out to be a link is swapped for what it
+ * holds, and the walk carries on from there - from the root if that starts
+ * with '/', and otherwise from the folder the link is in. The last part is
+ * only followed when the caller asks, since lstat, readlink and unlink are
+ * about the link itself. */
 
-static struct {
-    char from[FS_REMAP_LEN], to[FS_REMAP_LEN];
-} remaps[FS_REMAPS];
+#define WALK_MAX (FS_NAME_LEN + FS_LINK_LEN)   /* a path, links swapped in */
 
-/* Copies path into out the way a remap is stored, or returns false if it is
-   empty or will not fit. */
-static bool as_remap(const char *path, char *out) {
-    size_t n = 0;
+static char walk[WALK_MAX];         /* what is left of the path being resolved */
+static int  resolve_err;            /* why resolve_any last gave NULL */
 
-    while (*path == '/') {
-        path++;                     /* from the root is the only way to mean it */
-    }
-    while (path[n] != '\0') {
-        if (n + 1 >= FS_REMAP_LEN) {
-            return false;
-        }
-        out[n] = path[n];
-        n++;
-    }
-    while (n > 0 && out[n - 1] == '/') {
-        n--;
-    }
-    out[n] = '\0';
-    return n > 0;
-}
-
-/* Rewrites the n characters in full through the first remap that covers
-   them, leaving it as it was if none does. */
-static void remapped(size_t n) {
-    for (unsigned i = 0; i < FS_REMAPS; i++) {
-        size_t from = strlen(remaps[i].from);
-        size_t to = strlen(remaps[i].to);
-        char rest[FS_NAME_LEN];
-
-        /* The folder itself, or something inside it - not merely a name
-           that starts with the same letters. */
-        if (from == 0 || !starts_with(full, remaps[i].from) ||
-            (full[from] != '\0' && full[from] != '/')) {
-            continue;
-        }
-        if (n - from + to + 1 > FS_NAME_LEN) {
-            return;                 /* the swap would not fit: leave it be */
-        }
-        memcpy(rest, full + from, n - from + 1);
-        memcpy(full, remaps[i].to, to);
-        memcpy(full + to, rest, n - from + 1);
-        return;
-    }
-}
-
-int fs_remap(const char *from, const char *to) {
-    char name[FS_REMAP_LEN], where[FS_REMAP_LEN];
-    unsigned free_slot = FS_REMAPS;
-
-    if (!as_remap(from, name)) {
-        return FS_EINVAL;
-    }
-    bool off = to == NULL || !as_remap(to, where);
-
-    for (unsigned i = 0; i < FS_REMAPS; i++) {
-        if (remaps[i].from[0] == '\0') {
-            if (free_slot == FS_REMAPS) {
-                free_slot = i;
-            }
-        } else if (name_cmp(remaps[i].from, name) == 0) {
-            if (off) {
-                remaps[i].from[0] = '\0';
-            } else {
-                memcpy(remaps[i].to, where, strlen(where) + 1);
-            }
-            return 0;               /* changed where it went, or taken off */
-        }
-    }
-    if (off) {
-        return to == NULL || *to == '\0' ? FS_ENOENT : FS_EINVAL;
-    }
-    if (free_slot == FS_REMAPS) {
-        return FS_ENOSPC;
-    }
-    memcpy(remaps[free_slot].from, name, strlen(name) + 1);
-    memcpy(remaps[free_slot].to, where, strlen(where) + 1);
-    return 0;
-}
-
-int fs_remap_at(unsigned index, const char **from, const char **to) {
-    if (index >= FS_REMAPS || remaps[index].from[0] == '\0') {
-        return FS_ENOENT;
-    }
-    *from = remaps[index].from;
-    *to = remaps[index].to;
-    return 0;
-}
-
-/* The table name for path. Returns NULL - and leaves full unusable - if the
-   result would not fit, or the path is empty or has an empty component. */
 /* The whole path a name stands for, "" being the root - which is a folder
    with no entry of its own, so only the callers that can mean the root use
-   this; the rest go through resolve, which turns "" into no name at all. */
-static const char *resolve_any(const char *path) {
+   this; the rest go through resolve, which turns "" into no name at all.
+   Returns NULL, with resolve_err saying why, if the result would not fit, the
+   path is empty, or it goes round more than FS_LINKS links. */
+static const char *resolve_any(const char *path, bool follow) {
+    unsigned links = 0;
     size_t n = 0;
+    char *p = walk;
 
-    if (*path == '\0') {
+    resolve_err = FS_EINVAL;
+    if (*path == '\0' || strlen(path) >= sizeof walk) {
         return NULL;
     }
-    if (*path == '/') {
-        path++;                     /* from the root, not from where we are */
-    } else {
-        while (cwd[n] != '\0') {
-            full[n] = cwd[n];
-            n++;
-        }
+    if (load_table() < 0) {
+        resolve_err = FS_EIO;
+        return NULL;
     }
-    /* Segment by segment, so that "." and ".." mean what they do everywhere
-       else: a script saying ./wallpaper/one.png names a file beside it. */
-    while (*path != '\0') {
+    if (*path != '/') {
+        n = strlen(cwd);            /* from where we are, not from the root */
+        memcpy(full, cwd, n);
+    }
+    strcpy(walk, path);
+
+    /* Part by part, so that "." and ".." mean what they do everywhere else:
+       a script saying ./wallpaper/one.png names a file beside it. */
+    while (*p != '\0') {
         size_t len = 0;
 
-        while (path[len] != '\0' && path[len] != '/') {
+        while (p[len] != '\0' && p[len] != '/') {
             len++;
         }
-        bool folder = path[len] == '/';
+        bool folder = p[len] == '/';
 
         if (len == 0) {
-            return NULL;            /* "//", or a path that is only slashes */
+            p++;                    /* a leading slash, or "//" */
+            continue;
         }
-        if (len == 1 && path[0] == '.') {
+        if (len == 1 && p[0] == '.') {
             ;                       /* here: nothing to add */
-        } else if (len == 2 && path[0] == '.' && path[1] == '.') {
+        } else if (len == 2 && p[0] == '.' && p[1] == '.') {
             if (n > 0) {            /* up one, and past the root is the root */
                 for (n--; n > 0 && full[n - 1] != '/'; n--) {
                 }
             }
         } else {
-            if (n + len + 1 + (folder ? 1 : 0) > FS_NAME_LEN) {
+            if (n + len + 2 > FS_NAME_LEN) {
                 return NULL;
             }
-            memcpy(full + n, path, len);
+            memcpy(full + n, p, len);
+            full[n + len] = '\0';
+
+            struct fs_file *link = folder || follow ? find(full) : NULL;
+
+            if (link != NULL && is_link(link)) {
+                size_t size = bytes_of(link);
+                char *rest = p + len;
+                size_t left = strlen(rest);
+
+                if (++links > FS_LINKS) {
+                    resolve_err = FS_ELOOP;
+                    return NULL;
+                }
+                if (size + left + 1 > sizeof walk || load_sector(link->start) < 0) {
+                    resolve_err = size + left + 1 > sizeof walk ? FS_EINVAL : FS_EIO;
+                    return NULL;
+                }
+                /* What the link holds, then whatever came after it. */
+                memmove(walk + size, rest, left + 1);
+                memcpy(walk, sector, size);
+                p = walk;
+                if (*p == '/') {
+                    n = 0;          /* from the root */
+                }
+                continue;           /* and from the link's own folder if not */
+            }
             n += len;
             if (folder) {
                 full[n++] = '/';
             }
         }
-        path += folder ? len + 1 : len;
+        p += folder ? len + 1 : len;
     }
     full[n] = '\0';
-    remapped(n);                    /* a folder standing in for another */
     return full;                    /* "" is the root, which has no entry */
 }
 
 /* The same, for everything that needs an actual entry. An empty result means
    the root, and the root has no entry to find - and find("") would hand back
    the first free one, which is not the same thing at all. */
-static const char *resolve(const char *path) {
-    const char *full = resolve_any(path);
+static const char *resolve(const char *path, bool follow) {
+    const char *full = resolve_any(path, follow);
 
     return full != NULL && *full != '\0' ? full : NULL;
 }
 
 /* The same, ending in the slash that makes it a folder's name. */
-static const char *dir_name(const char *path) {
+static const char *dir_name(const char *path, bool follow) {
     size_t n;
 
-    if (resolve(path) == NULL) {
+    if (resolve(path, follow) == NULL) {
         return NULL;
     }
     n = strlen(full);
@@ -318,17 +283,6 @@ static const char *dir_name(const char *path) {
         full[n + 1] = '\0';
     }
     return full;
-}
-
-/* The loaded table's entry for name, or NULL. Free entries have an empty
-   name, so find("") returns the first free entry. */
-static struct fs_file *find(const char *name) {
-    for (size_t i = 0; i < FS_MAX_FILES; i++) {
-        if (name_cmp(buf.table.files[i].name, name) == 0) {
-            return &buf.table.files[i];
-        }
-    }
-    return NULL;
 }
 
 /* True if the folder holding name exists; the root always does. Needs the
@@ -365,7 +319,7 @@ static unsigned allocate(unsigned count, const struct fs_file *replacing) {
         moved = false;
         for (size_t i = 0; i < FS_MAX_FILES; i++) {
             const struct fs_file *file = &buf.table.files[i];
-            unsigned end = file->start + sectors_for(file->size);
+            unsigned end = file->start + sectors_for(bytes_of(file));
 
             if (file != replacing && file->name[0] != '\0' &&
                 file->start < start + count && start < end) {
@@ -403,12 +357,9 @@ int fs_file(size_t index, struct fs_file *file) {
     return file->name[0] != '\0' ? 0 : FS_ENOENT;
 }
 
-int fs_stat(const char *path, struct fs_file *file) {
-    if (resolve(path) == NULL) {
-        return FS_EINVAL;
-    }
-    if (load_table() < 0) {
-        return FS_EIO;
+static int stat_at(const char *path, bool follow, struct fs_file *file) {
+    if (resolve(path, follow) == NULL) {
+        return resolve_err;
     }
     struct fs_file *found = find(full);
     if (found == NULL) {
@@ -416,6 +367,14 @@ int fs_stat(const char *path, struct fs_file *file) {
     }
     *file = *found;
     return 0;
+}
+
+int fs_stat(const char *path, struct fs_file *file) {
+    return stat_at(path, true, file);
+}
+
+int fs_lstat(const char *path, struct fs_file *file) {
+    return stat_at(path, false, file);
 }
 
 const char *fs_sector(uint32_t start, unsigned index) {
@@ -426,15 +385,12 @@ int fs_read_many(uint32_t start, unsigned index, unsigned count, void *dest) {
     return ata_read_many(start + index, count, dest) == 0 ? 0 : FS_EIO;
 }
 
-int fs_write(const char *path, const void *data, size_t size) {
-    const char *name = resolve(path);
-
+/* Writes a file, or a link when flag is FS_LINK, under name - a whole path,
+   already resolved into full. */
+static int store(const char *name, const void *data, size_t size, uint32_t flag) {
     /* A trailing slash is how a folder is spelled, so it is not a file. */
-    if (name == NULL || name[strlen(name) - 1] == '/') {
+    if (name[strlen(name) - 1] == '/') {
         return FS_EINVAL;
-    }
-    if (load_table() < 0) {
-        return FS_EIO;
     }
     if (!parent_exists(full)) {
         return FS_ENOENT;
@@ -478,24 +434,71 @@ int fs_write(const char *path, const void *data, size_t size) {
     file = &buf.table.files[index];
     memcpy(file->name, name, strlen(name) + 1);
     file->start = start;
-    file->size = (uint32_t)size;
+    file->size = (uint32_t)size | flag;
     return save_entry(file);
 }
 
-int fs_remove(const char *path) {
-    if (load_table() < 0) {
+int fs_write(const char *path, const void *data, size_t size) {
+    const char *name = resolve(path, true);
+
+    return name == NULL ? resolve_err : store(name, data, size, 0);
+}
+
+int fs_symlink(const char *target, const char *path) {
+    size_t size = strlen(target);
+    const char *name = resolve(path, false);
+    size_t n;
+
+    if (name == NULL) {
+        return resolve_err;
+    }
+    if (size == 0 || size >= FS_LINK_LEN) {
+        return FS_EINVAL;
+    }
+    /* Taken already, whether by a file, a link, or a folder. */
+    n = strlen(full);
+    if (find(full) != NULL || n + 2 > FS_NAME_LEN) {
+        return FS_EEXIST;
+    }
+    full[n] = '/';
+    full[n + 1] = '\0';
+    if (find(full) != NULL) {
+        return FS_EEXIST;
+    }
+    full[n] = '\0';
+    return store(full, target, size, FS_LINK);
+}
+
+int fs_readlink(const char *path, char *out, size_t max) {
+    struct fs_file link = { .size = 0 };
+    int err = fs_lstat(path, &link);
+    size_t size;
+
+    if (err < 0) {
+        return err;
+    }
+    if (!is_link(&link)) {
+        return FS_EINVAL;
+    }
+    if (load_sector(link.start) < 0) {
         return FS_EIO;
     }
-    if (resolve(path) == NULL) {
-        return FS_EINVAL;
+    size = bytes_of(&link) < max ? bytes_of(&link) : max;
+    memcpy(out, sector, size);
+    return (int)size;
+}
+
+int fs_remove(const char *path) {
+    if (resolve(path, false) == NULL) {
+        return resolve_err;         /* a link goes itself, not what it names */
     }
     struct fs_file *file = find(full);
 
     if (file == NULL) {
         /* Not a file of that name, so try it as a folder - which goes only
            once there is nothing left under it. */
-        if (dir_name(path) == NULL) {
-            return FS_EINVAL;
+        if (dir_name(path, false) == NULL) {
+            return resolve_err;
         }
         file = find(full);
         if (file == NULL) {
@@ -514,13 +517,18 @@ int fs_remove(const char *path) {
 }
 
 int fs_mkdir(const char *path) {
-    if (load_table() < 0) {
-        return FS_EIO;
+    size_t n;
+    bool taken;
+
+    if (dir_name(path, false) == NULL) {
+        return resolve_err;
     }
-    if (dir_name(path) == NULL) {
-        return FS_EINVAL;
-    }
-    if (find(full) != NULL) {
+    /* Taken as a folder, or as a file or a link spelled without the slash. */
+    n = strlen(full);
+    full[n - 1] = '\0';
+    taken = find(full) != NULL;
+    full[n - 1] = '/';
+    if (taken || find(full) != NULL) {
         return FS_EEXIST;
     }
     if (!parent_exists(full)) {
@@ -553,11 +561,8 @@ int fs_chdir(const char *path) {
         }
         return 0;
     }
-    if (dir_name(path) == NULL) {
-        return FS_EINVAL;
-    }
-    if (load_table() < 0) {
-        return FS_EIO;
+    if (dir_name(path, true) == NULL) {
+        return resolve_err;
     }
     if (find(full) == NULL) {
         return FS_ENOENT;
@@ -594,11 +599,8 @@ int fs_folder(const char *path, char *out, size_t max) {
     size_t n;
 
     if (*path != '\0' && strcmp(path, "/") != 0) {
-        if (dir_name(path) == NULL) {
-            return FS_EINVAL;
-        }
-        if (load_table() < 0) {
-            return FS_EIO;
+        if (dir_name(path, true) == NULL) {
+            return resolve_err;
         }
         if (find(full) == NULL) {
             return FS_ENOENT;
@@ -624,7 +626,7 @@ int fs_get_stats(struct fs_stats *stats) {
     stats->files = 0;
     for (size_t i = 0; i < FS_MAX_FILES; i++) {
         if (buf.table.files[i].name[0] != '\0') {
-            stats->used += sectors_for(buf.table.files[i].size);
+            stats->used += sectors_for(bytes_of(&buf.table.files[i]));
             stats->files++;
         }
     }
@@ -634,7 +636,7 @@ int fs_get_stats(struct fs_stats *stats) {
 const char *fs_error(int err) {
     static const char *const messages[] = {
         "disk error", "no such file or folder", "no space", "bad name",
-        "already there", "not empty",
+        "already there", "not empty", "too many links",
     };
     return messages[-err - 1];
 }
@@ -643,12 +645,12 @@ const char *fs_error(int err) {
    program opening "." to read it is asking for the working directory, and
    resolve has already turned that into a whole path. */
 int fs_folder_at(const char *path, unsigned *index) {
-    const char *full = resolve_any(path);
+    const char *full = resolve_any(path, true);
     char name[FS_NAME_LEN];
     size_t n;
 
     if (full == NULL) {
-        return FS_EINVAL;
+        return resolve_err;
     }
     if (*full == '\0') {
         *index = 0;                 /* the root */
@@ -680,22 +682,19 @@ int fs_folder_at(const char *path, unsigned *index) {
    moved, since every path inside it would have to change with it. */
 int fs_rename(const char *from, const char *to) {
     char was[FS_NAME_LEN];
-    const char *name = resolve(from);
+    const char *name = resolve(from, false);
 
     if (name == NULL || name[strlen(name) - 1] == '/') {
-        return FS_EINVAL;
+        return name == NULL ? resolve_err : FS_EINVAL;
     }
     memcpy(was, name, strlen(name) + 1);
-    if (load_table() < 0) {
-        return FS_EIO;
-    }
     if (find(was) == NULL) {
         return FS_ENOENT;
     }
 
-    name = resolve(to);
+    name = resolve(to, false);
     if (name == NULL || name[strlen(name) - 1] == '/') {
-        return FS_EINVAL;
+        return name == NULL ? resolve_err : FS_EINVAL;
     }
     if (name_cmp(was, name) == 0) {
         return 0;                   /* already where it is being put */
@@ -723,12 +722,12 @@ int fs_rename(const char *from, const char *to) {
    carried across a sector at a time, through the same one-sector buffer
    everything else here uses. */
 int fs_write_at(const char *path, uint32_t offset, const void *data, size_t size) {
-    const char *name = resolve(path);
+    const char *name = resolve(path, true);
     struct fs_file *file;
     unsigned have, need, start, end;
 
-    if (name == NULL || load_table() < 0) {
-        return FS_EINVAL;
+    if (name == NULL) {
+        return resolve_err;
     }
     file = find(name);
     if (file == NULL) {

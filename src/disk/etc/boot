@@ -1,5 +1,5 @@
 # The machine itself, run by the kernel before there is a shell.
-sh remap
 sh font-size
 sh display-res
 sh wallpaper
+sh cache

@@ -6,10 +6,9 @@
 /* The kernel's own commands, as files under /proc.
  *
  * Everything the shell cannot do for itself - the screen's size, the text's
- * size, the wallpaper, what memory and the clock say, the folders standing
- * in for other folders, the syscall log - is kernel state, and a command
- * that changes it has to run in the kernel. So each one is a file: `remap`
- * at the prompt and /proc/remap are the same thing, because the shell looks
+ * size, the wallpaper, what memory and the clock say, the syscall log - is
+ * kernel state, and a command that changes it has to run in the kernel. So
+ * each one is a file: `mem` at the prompt and /proc/mem are the same thing, because the shell looks
  * the name up in /proc like it looks any other command up on the path, and
  * running the file runs the command.
  *
@@ -25,7 +24,7 @@ struct proc_cmd {
 /* Command i, or NULL past the last, for listing them. */
 const struct proc_cmd *proc_at(unsigned i);
 
-/* The command a path names - "/proc/remap", or "remap" relative to /proc -
+/* The command a path names - "/proc/mem", or "mem" relative to /proc -
    or NULL if the path is not one of them. */
 const struct proc_cmd *proc_command(const char *path);
 

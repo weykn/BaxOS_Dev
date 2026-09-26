@@ -7,14 +7,15 @@ DEFAULT REL
 
 SECTION .text
 GLOBAL user_enter, user_resume, user_exit, syscall_entry, trap_stubs, page_fault_entry
-GLOBAL user_frame, user_cs, user_ss
+GLOBAL user_frame, user_cs, user_ss, user_flags
 EXTERN syscall_dispatch, page_fault, trap_report, tss
 
-; The always-one bit, and IF. Interrupts have to stay on in ring 3: the
+; A program's RFLAGS, in user_flags below: the always-one bit, and IF while
+; the firmware is running. Interrupts have to stay on in ring 3 then: the
 ; firmware's timers are what drive its keyboard and its USB polling, so a
 ; program running with them off freezes the whole machine rather than just
-; itself - and a program that never returns could then only be powered off.
-USER_RFLAGS equ 0x202
+; itself. Once the firmware is gone (efi_leave) they go off for good: the
+; kernel polls everything, and none of the firmware's handlers are left.
 
 ; Ring 3 is entered and returned to with IRETQ rather than SYSRET.
 ;
@@ -55,7 +56,7 @@ user_enter:
 
     push qword [user_ss]                ; the frame IRETQ returns through
     push rsi                            ; the program's stack
-    push qword USER_RFLAGS
+    push qword [user_flags]
     push qword [user_cs]
     push rdi                            ; where it starts
 
@@ -268,6 +269,9 @@ page_fault_entry:
     pop rax
     add rsp, 8                          ; the error code
     iretq
+
+SECTION .data
+user_flags: dq 0x202
 
 SECTION .bss
 user_rsp:   resq 1

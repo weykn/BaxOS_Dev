@@ -11,7 +11,8 @@
    name is the whole path - "docs/notes.txt" - and a folder is an entry whose
    name ends in a slash and that owns no sectors, which is what lets an empty
    one exist. So a name ending in '/' only ever names a folder and one that
-   does not only ever names a file.
+   does not only ever names a file - or a symbolic link, which is a file
+   whose size carries FS_LINK and whose contents are the path it points at.
 
    There is a working directory. Every path below is taken relative to it
    unless it starts with '/', which means from the root.
@@ -24,13 +25,14 @@
    itself. The loader looks for this to tell which partition to hand over, so
    it lives here rather than inside fs.c. */
 #define FS_LBA    1
-#define FS_MAGIC  0x34465842u       /* "BXF4" */
+#define FS_MAGIC  0x35465842u       /* "BXF5": the Linux layout, with links */
 #define FS_SECTOR 512               /* bytes in a sector, here and on disk */
 
 #define FS_NAME_LEN  48     /* a whole path, including the NUL */
 #define FS_MAX_FILES 128    /* table entries: files and folders together */
-#define FS_REMAPS    12     /* folders standing in for other folders */
-#define FS_REMAP_LEN 32     /* either side of one, including the NUL */
+#define FS_LINKS     40     /* links followed in one path, as Linux allows */
+#define FS_LINK_LEN  128    /* a link's target, including the NUL */
+#define FS_LINK      0x80000000u    /* in an entry's size: it is a link */
 
 enum {
     FS_EIO       = -1,      /* the disk reported an error */
@@ -39,6 +41,7 @@ enum {
     FS_EINVAL    = -4,      /* empty or over-long path */
     FS_EEXIST    = -5,      /* a folder of that name is already there */
     FS_ENOTEMPTY = -6,      /* a folder with anything still in it */
+    FS_ELOOP     = -7,      /* more than FS_LINKS links in one path */
 };
 
 struct fs_file {
@@ -63,8 +66,21 @@ int fs_format(uint32_t disk_sectors);
    FS_ENOENT if it is free, or FS_EIO. */
 int fs_file(size_t index, struct fs_file *file);
 
-/* Copies out the file at path. Returns 0 or an FS_E* code. */
+/* Copies out the file at path, following links all the way. Returns 0 or an
+   FS_E* code. */
 int fs_stat(const char *path, struct fs_file *file);
+
+/* The same without following the last part of path if it is a link, which is
+   then what is copied out - FS_LINK in its size and all. */
+int fs_lstat(const char *path, struct fs_file *file);
+
+/* Makes path a link to target, which is taken relative to the folder the
+   link is in unless it starts with '/'. Returns 0 or an FS_E* code. */
+int fs_symlink(const char *target, const char *path);
+
+/* Copies the target of the link at path into out, unterminated, and returns
+   its length - or FS_EINVAL if path is not a link. */
+int fs_readlink(const char *path, char *out, size_t max);
 
 /* Reads sector index of the run starting at start. Returns its 512 bytes,
    which stay valid until the next fs call, or NULL on a disk error. */
@@ -118,21 +134,3 @@ int fs_rename(const char *from, const char *to);
 /* Writes size bytes into a file at offset, which may be anywhere up to and
    including its end - past the end is refused. Returns 0 or an FS_E* code. */
 int fs_write_at(const char *path, uint32_t offset, const void *data, size_t size);
-
-/* ---- remaps -------------------------------------------------------------
- *
- * A folder standing in for another one. A program off a Linux system puts
- * its settings in /.config/<name>, a folder this disk has no use for; a
- * remap of /.config to /conf/pkg lands them beside the rest of the
- * configuration instead. Every path goes through the same resolution, so one
- * remap holds for reading, writing, listing and deleting alike. */
-
-/* Makes from stand for to - both folders, spelled either way round the
-   slashes. An empty or NULL to takes the remap off again. Returns 0,
-   FS_EINVAL if a name is empty or too long, FS_ENOSPC if there is no free
-   slot, or FS_ENOENT when taking off one that is not there. */
-int fs_remap(const char *from, const char *to);
-
-/* Remap index, one of FS_REMAPS, for listing them. Returns 0 and points
-   *from and *to at it, or FS_ENOENT if the slot is free. */
-int fs_remap_at(unsigned index, const char **from, const char **to);

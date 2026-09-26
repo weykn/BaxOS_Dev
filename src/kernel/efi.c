@@ -6,27 +6,129 @@
 
 #include "ata.h"
 #include "boot.h"
+#include "efi_kernel.h"
+#include "fs.h"
+#include "ide.h"
+#include "io.h"
+#include "mem.h"
 #include "keyboard.h"
 #include "ps2.h"
+#include "vga.h"
 
 /* The kernel's side of the firmware.
  *
- * Boot services are still running, so the keyboard, the disk and the clock
- * are the firmware's drivers rather than ours. That is the whole reason this
- * boots on a machine whose keyboard is on USB and whose disk is NVMe: those
- * drivers are already written, already loaded, and already know the machine.
+ * Until efi_leave, boot services are still running, and the keyboard and
+ * the disk are the firmware's drivers rather than ours. After it, the disk
+ * is ide.c's and the keyboard ps2.c's, and all that is left of the firmware
+ * is its runtime services: the clock, and switching the machine off. A
+ * machine the kernel has no drivers for - a USB keyboard, an NVMe disk -
+ * never leaves, and goes on as before.
  *
  * Everything here is a call back into firmware, so it costs a switch to
  * Microsoft's calling convention and nothing else. */
 
+/* A copy: the loader's own lies in memory that is handed back with it. */
+static struct boot_info kept;
 static struct boot_info *boot;
+static uint64_t         ide_base;   /* where the partition starts, once ide.c
+                                       has the disk; 0 while the firmware does */
 
 void efi_init(struct boot_info *info) {
-    boot = info;
+    kept = *info;
+    boot = &kept;
 }
 
 const struct boot_info *efi_boot(void) {
     return boot;
+}
+
+/* ---- memory -------------------------------------------------------------- */
+
+uint64_t efi_free_kib(void) {
+    struct efi_boot_services *bs = boot->system->boot;
+    struct efi_memory_descriptor *map = NULL;
+    efi_uintn size = 0, key, stride;
+    uint64_t pages = 0;
+    uint32_t version;
+
+    /* Asked once for the size, then for the map: the pool it goes in may add
+       an entry or two of its own. */
+    bs->get_memory_map(&size, map, &key, &stride, &version);
+    size += 4 * stride;
+    if (EFI_ERROR(bs->allocate_pool(EFI_LOADER_DATA, size, (void **)&map))) {
+        return 0;
+    }
+    if (!EFI_ERROR(bs->get_memory_map(&size, map, &key, &stride, &version))) {
+        for (efi_uintn at = 0; at < size; at += stride) {
+            const struct efi_memory_descriptor *d = (const void *)((char *)map + at);
+
+            if (d->type == EFI_CONVENTIONAL_MEMORY) {
+                pages += d->pages;
+            }
+        }
+    }
+    bs->free_pool(map);
+    return pages * 4;
+}
+
+/* In syscall_entry.asm: the RFLAGS a program starts with. */
+extern uint64_t user_flags;
+
+/* ---- letting the firmware go --------------------------------------------- */
+
+bool efi_leave(void) {
+    struct efi_boot_services *bs = boot->system->boot;
+    efi_uintn size = 0, key, stride, room;
+    uint32_t version;
+    uint64_t map, first;
+
+    /* Only if what it does can be done without it: the filesystem on a disk
+       ide.c can drive, and a keyboard ps2.c can. */
+    first = ide_find(FS_LBA, FS_MAGIC);
+    if (first == 0 || !ps2_init()) {
+        dbg("efi: staying - %s\n", first == 0 ? "no IDE disk" : "no PS/2 keyboard");
+        return false;
+    }
+    efi_uptime_ms();                /* the clock is timed against the firmware */
+
+    /* The map, asked for until ExitBootServices takes it: anything the
+       firmware does in between - even allocating this - changes it. */
+    bs->get_memory_map(&size, NULL, &key, &stride, &version);
+    room = size + 16 * stride;
+    map = mem_pages((room + 4095) / 4096);
+    if (map == 0) {
+        return false;
+    }
+    for (unsigned tries = 0; ; tries++) {
+        size = room;
+        if (EFI_ERROR(bs->get_memory_map(&size, (void *)map, &key, &stride, &version))) {
+            if (tries == 0) {
+                mem_pages_free(map, (room + 4095) / 4096);
+            }
+            return false;
+        }
+        if (!EFI_ERROR(bs->exit_boot_services(boot->image, key))) {
+            break;
+        }
+        if (tries == 3) {
+            return false;           /* gone half way: nothing to call to undo */
+        }
+    }
+
+    /* Nothing of the firmware's may run now, interrupts least of all: its
+       handlers are in memory that is about to be reused. Programs run with
+       them off too; nothing here uses one. */
+    __asm__ volatile("cli");
+    outb(0x21, 0xFF);               /* both PICs, every line masked */
+    outb(0xA1, 0xFF);
+    user_flags = 0x002;             /* and programs start without them */
+    ide_base = first;
+    boot->disk = NULL;
+    vga_firmware_gone();
+    mem_take_over((const void *)map, size, stride);
+    mem_pages_free(map, (room + 4095) / 4096);
+    dbg("efi: left the firmware; %u KiB free\n", mem_free_kib());
+    return true;
 }
 
 /* ---- the keyboard ------------------------------------------------------- */
@@ -71,9 +173,10 @@ char keyboard_poll_char(char (*idle)(void)) {
         }
         return c;
     }
-    /* A PS/2 keyboard is read here; one on USB still by the firmware. */
+    /* A PS/2 keyboard is read here; one on USB still by the firmware, while
+       there is one. */
     c = ps2_key();
-    if (c != 0) {
+    if (c != 0 || mem_ours()) {
         return c;
     }
     if (EFI_ERROR(in->read_key(in, &key))) {
@@ -143,6 +246,9 @@ static unsigned block_run = BLOCK_RUN_MAX;
 static int read_now(uint32_t lba, unsigned count, void *buffer) {
     struct efi_block_io *disk = boot->disk;
 
+    if (ide_base != 0) {
+        return count == 0 ? -1 : ide_read(ide_base + lba, count, buffer);
+    }
     if (disk == NULL || count == 0) {
         return -1;
     }
@@ -177,33 +283,36 @@ static int read_now(uint32_t lba, unsigned count, void *buffer) {
  *
  * The cache is a handful of large lines rather than many small ones, because
  * a miss costs a whole line and a line costs one call however big it is. Each
- * is bought from the firmware the first time it is needed, so a machine that
- * never reads twice never pays for it, and how many there are is scaled to
- * the memory the machine has. */
+ * is bought the first time it is needed, so a machine that never reads twice
+ * never pays for it. How many there may be is set by the `cache` command,
+ * which /etc/cache runs at boot. */
 
 #define LINE_SECTORS 256                /* 128 KiB a line */
-#define LINES_MAX    16                 /* ... so two megabytes at most */
+#define LINE_BYTES   (LINE_SECTORS * 512)
 
 static struct line {
     uint32_t first;                     /* its first sector; 0 when unused */
     uint32_t used;                      /* when it was last read, for the LRU */
     char    *data;
-} lines[LINES_MAX];
+} *lines;                               /* line_count of them, or NULL */
 
-static unsigned line_count;             /* how many this machine may have */
+static unsigned line_count;
 static uint32_t line_clock;
-static bool     line_sized;
 
-static void cache_start(void) {
-    line_sized = true;
-    uint64_t kib = boot->memory_kib;
-
-    /* A sixty-fourth of the machine, up to four megabytes, and nothing at all
-       on a machine small enough to want the memory for itself. */
-    line_count = kib < 32 * 1024 ? 0 : (unsigned)(kib / 64 / (LINE_SECTORS / 2));
-    if (line_count > LINES_MAX) {
-        line_count = LINES_MAX;
+size_t ata_cache_size(size_t bytes) {
+    for (unsigned i = 0; i < line_count; i++) {
+        if (lines[i].data != NULL) {
+            mem_pages_free((uint64_t)lines[i].data, LINE_SECTORS / 8);
+        }
     }
+    mem_free(lines);
+    lines = NULL;
+    line_count = 0;
+    if (bytes / LINE_BYTES > 0 && (lines = mem_alloc(bytes / LINE_BYTES * sizeof *lines)) != NULL) {
+        line_count = (unsigned)(bytes / LINE_BYTES);
+        memset(lines, 0, line_count * sizeof *lines);
+    }
+    return (size_t)line_count * LINE_BYTES;
 }
 
 /* The line holding lba, read in if it is not there yet. NULL if the machine
@@ -228,12 +337,10 @@ static struct line *cache_line(uint32_t lba) {
         }
     }
     if (spare->data == NULL) {
-        uint64_t at = 0;
+        uint64_t at = mem_pages(LINE_SECTORS / 8);
 
-        if (EFI_ERROR(boot->system->boot->allocate_pages(
-                EFI_ALLOCATE_ANY, EFI_LOADER_DATA, LINE_SECTORS / 8, &at))) {
-            line_count = 0;             /* no memory for one: do without */
-            return NULL;
+        if (at == 0) {
+            return NULL;                /* no memory for one: read around it */
         }
         spare->data = (char *)at;
     }
@@ -265,9 +372,6 @@ int ata_read_many(uint32_t lba, unsigned count, void *buffer) {
     if (count == 0) {
         return -1;
     }
-    if (!line_sized) {
-        cache_start();
-    }
     /* More than the cache could hold anyway: straight to the disk, which is
        one call rather than a line at a time. */
     if (line_count == 0 || count > LINE_SECTORS * 2) {
@@ -293,7 +397,8 @@ int ata_read_many(uint32_t lba, unsigned count, void *buffer) {
     return 0;
 }
 
-/* What the cache costs, for the `mem` command. */
+/* What the cache costs, for the `mem` command, and how much of it is holding
+   something, for the `cache` command. */
 size_t ata_cache_memory(void) {
     size_t held = 0;
 
@@ -303,6 +408,44 @@ size_t ata_cache_memory(void) {
     return held;
 }
 
+size_t ata_cache_room(void) {
+    return (size_t)line_count * LINE_SECTORS * 512;
+}
+
+size_t ata_cache_held(void) {
+    size_t held = 0;
+
+    for (unsigned i = 0; i < line_count; i++) {
+        held += lines[i].data != NULL && lines[i].first != 0 ? LINE_SECTORS * 512 : 0;
+    }
+    return held;
+}
+
+/* Reads a run of sectors into the cache without copying it anywhere: what
+   `cache on` does with the library every program is about to want. Returns
+   how many bytes it managed to take. */
+size_t ata_cache_read(uint32_t lba, unsigned count) {
+    size_t taken = 0;
+
+    while (count > 0 && line_count > 0) {
+        struct line *line = cache_line(lba);
+        unsigned within, take;
+
+        if (line == NULL) {
+            break;
+        }
+        within = lba - line->first;
+        take = LINE_SECTORS - within;
+        if (take > count) {
+            take = count;
+        }
+        taken += (size_t)take * 512;
+        lba += take;
+        count -= take;
+    }
+    return taken;
+}
+
 int ata_write(uint32_t lba, const void *buffer) {
     return ata_write_many(lba, 1, buffer);
 }
@@ -310,10 +453,13 @@ int ata_write(uint32_t lba, const void *buffer) {
 int ata_write_many(uint32_t lba, unsigned count, const void *buffer) {
     struct efi_block_io *disk = boot->disk;
 
-    if (disk == NULL || count == 0) {
+    if (count == 0 || (disk == NULL && ide_base == 0)) {
         return -1;
     }
     cache_forget(lba, count);
+    if (ide_base != 0) {
+        return ide_write(ide_base + lba, count, buffer);
+    }
     while (count > 0) {
         unsigned n = count < block_run ? count : block_run;
 
@@ -341,7 +487,9 @@ int ata_write_many(uint32_t lba, unsigned count, const void *buffer) {
 void ata_sync(void) {
     struct efi_block_io *disk = boot->disk;
 
-    if (disk != NULL) {
+    if (ide_base != 0) {
+        ide_flush();
+    } else if (disk != NULL) {
         disk->flush_blocks(disk);
     }
 }
