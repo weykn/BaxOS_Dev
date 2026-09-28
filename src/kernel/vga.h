@@ -40,6 +40,14 @@ int vga_start(struct boot_info *info);
    Returns 0, or -1 leaving the mode in use alone. */
 int vga_set_mode(const char *name);
 
+/* Draws everything at "<width>x<height>", no larger than the mode, scaled up
+   to fill the screen; "off" draws at the mode's own size. Returns 0, or -1
+   leaving it alone. */
+int vga_set_scale(const char *name);
+
+/* The size being scaled up, or "off". */
+const char *vga_scale(void);
+
 /* Mode i the screen offers, counting from 0, or NULL past the last. The
    string is rebuilt on each call. */
 const char *vga_mode_name(unsigned i);
@@ -110,6 +118,10 @@ void vga_capture(char *buf, size_t max);
 void vga_capture_end(void);
 
 void vga_set_color(enum vga_color fg, enum vga_color bg);
+
+/* Whether "\n" also goes back to the start of the line - off when a program
+   turns off ONLCR, and sends its own "\r". */
+void vga_set_crlf(bool on);
 void vga_putc(char c);
 void vga_puts(const char *s);
 

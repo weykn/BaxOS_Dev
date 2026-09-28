@@ -41,6 +41,8 @@ struct boot_info {
     uint64_t memory_kib;                /* RAM free as the loader started */
     uint64_t ram_kib;                   /* all the RAM there is, the firmware's
                                            own included */
+    uint64_t firmware_kib;              /* of that, what the firmware keeps
+                                           for good */
 
     /* The timestamp counter as the loader was entered, which is the earliest
        moment this machine can be asked about. Uptime counts from here, so it

@@ -377,7 +377,7 @@ size_t log_format(const struct log_entry *e, char *buf) {
 /* Appends text to /var/log/<who>.log, making the file - and the folder - if
    there is none, and starting the file over once it has grown past LOG_MAX.
    A program's own file rather than one log for the machine: what `ls` did is
-   worth reading without `tsh` interleaved through it. */
+   worth reading without the shell interleaved through it. */
 static void append(const char *who, const char *text, size_t size) {
     char path[FS_NAME_LEN];
     struct fs_file file;

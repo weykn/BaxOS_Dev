@@ -113,6 +113,7 @@ void console_reset(void) {
     settings.cc[VERASE] = '\b';     /* what the keyboard sends for it */
     settings.cc[VEOF] = 4;
     settings.cc[VMIN] = 1;
+    vga_set_crlf(true);
 }
 
 void console_get(void *out, size_t size) {
@@ -121,6 +122,7 @@ void console_get(void *out, size_t size) {
 
 void console_set(const void *in, size_t size) {
     memcpy(&settings, in, size > sizeof settings ? sizeof settings : size);
+    vga_set_crlf((settings.oflag & (OPOST | ONLCR)) == (OPOST | ONLCR));
 }
 
 /* ---- the line editor -----------------------------------------------------
@@ -292,15 +294,12 @@ static void candidate(const char *name, size_t n, const char *typed, size_t type
 static void candidates(const char *folder, bool command, const char *typed,
                        size_t typed_n, bool list) {
     struct fs_file entry;
+    size_t cursor = 0, index;
 
-    for (size_t i = 0; i < FS_MAX_FILES; i++) {
-        const char *leaf;
+    while (fs_list(folder, &cursor, &entry, &index) == 0) {
+        const char *leaf = fs_inside(folder, entry.name);
 
-        if (fs_file(i, &entry) == 0 && (leaf = fs_inside(folder, entry.name)) != NULL) {
-            size_t n = strlen(leaf);
-
-            candidate(leaf, n, typed, typed_n, list);
-        }
+        candidate(leaf, strlen(leaf), typed, typed_n, list);
     }
     for (unsigned i = 0; command && proc_at(i) != NULL; i++) {
         candidate(proc_at(i)->name, strlen(proc_at(i)->name), typed, typed_n, list);
@@ -491,13 +490,26 @@ static bool edit_line(void) {
    is echoed unless ECHO says so. */
 uint64_t console_read(char *buf, uint64_t count) {
     if ((settings.lflag & ICANON) == 0) {
-        char c = take_key();
+        /* Whatever has been typed, up to count - so a key that sends a
+           sequence arrives whole - waiting for the first only if VMIN asks
+           for one. Return is "\r" unless ICRNL turns it into "\n". */
+        uint64_t n = 0;
 
-        buf[0] = c;
-        if ((settings.lflag & ECHO) != 0) {
-            vga_putc(c);
+        if (settings.cc[VMIN] == 0 && !console_ready()) {
+            return 0;
         }
-        return 1;                   /* one character is a read of its own */
+        do {
+            char c = take_key();
+
+            if (c == '\n' && (settings.iflag & ICRNL) == 0) {
+                c = '\r';
+            }
+            buf[n++] = c;
+            if ((settings.lflag & ECHO) != 0) {
+                vga_putc(c);
+            }
+        } while (n < count && console_ready());
+        return n;
     }
     if (handed == ready) {
         drawing = (settings.lflag & ECHO) != 0;

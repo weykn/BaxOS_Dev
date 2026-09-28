@@ -46,7 +46,10 @@ struct undo {
    A chunk's own first page holds where the chunk before it was, so that the
    whole lot can be handed back at the end without a list of them anywhere
    else. */
-#define CHUNK_FIRST 8               /* what the first one costs a small program */
+#define CHUNK_FIRST 8               /* what the first one costs a small program:
+                                       the shell's code, data, stack and the
+                                       two tables under them, and the chunk's
+                                       own page */
 #define CHUNK_MAX   64              /* and a quarter of a megabyte once it is
                                        clearly big: past that the tail of the
                                        last chunk wastes more than the extra
@@ -72,7 +75,38 @@ static struct level {
     struct undo *undo;          /* what it has changed since a fork, if any */
     unsigned  undo_count;
     bool      undo_full;        /* more than the log could hold */
+
+    /* Low memory, for a program linked to run at a fixed address: the range
+       it may use, and a page listing the page table for each two megabytes
+       of it, which stand in for the firmware's own mapping while it runs. */
+    uint64_t  low_start, low_end;
+    uint64_t *low_tables;
+    uint64_t  low_owned;        /* pages it has at their own address */
 } levels[LEVELS];
+
+/* ---- low memory ------------------------------------------------------------
+ *
+ * A program linked to run at a fixed address - 0x400000, where a plain `ld`
+ * puts things - has to be there, and there is where the firmware maps the
+ * first gigabyte of the machine one to one. So while it runs, the firmware's
+ * page directory for that gigabyte has the program's own tables in place of
+ * the two-megabyte stretches it uses, and they are put back when it stops.
+ *
+ * That hides whatever is at those physical addresses, so nothing else may be
+ * there: each page the program is given is the one at its own address, taken
+ * so that nothing else can have it - or, where a program underneath already
+ * has that page or the firmware keeps it for its runtime services and ACPI,
+ * any page at all: those are not touched but through calls that put the
+ * firmware's view back first (vm_firmware_view). A page held by anything
+ * else means the program cannot run. The kernel takes its own memory from the top down, so
+ * on any real machine the bottom is free for this. */
+
+#define LOW_LIMIT (1ull << 30)      /* the gigabyte one page directory covers */
+#define OWNED     0x200             /* an entry whose page is at its own address */
+
+static uint64_t *low_pd;            /* the firmware's directory for it */
+static uint64_t *low_orig;          /* what that said before anything changed it */
+static uint64_t  low_fixed;         /* pages bought for those two, for good */
 
 static unsigned depth;          /* levels[depth] is the one in use */
 
@@ -223,6 +257,105 @@ static bool slot_take(struct level *level) {
     return false;
 }
 
+/* Finds the firmware's page directory for the first gigabyte, splitting a
+   one-gigabyte page into two-megabyte ones if that is how it was mapped, and
+   keeps a copy of it to put back from. Once; false if it cannot be had. */
+static bool low_setup(void) {
+    uint64_t *top = pml4(), *pdpt;
+    uint64_t cr0;
+
+    if (low_pd != NULL) {
+        return true;
+    }
+    if (!(top[0] & PRESENT) || !((pdpt = table_at(top[0]))[0] & PRESENT) ||
+        (low_orig = (uint64_t *)table_page()) == NULL) {
+        return false;
+    }
+    low_fixed = VM_PAGE;
+    cr0 = write_protect_off();
+    top[0] |= USER;                 /* ring 3 is let through at every level */
+    if (pdpt[0] & BIG) {
+        uint64_t base = pdpt[0] & ADDR, flags = pdpt[0] & 0xFFF;
+        uint64_t *pd = (uint64_t *)table_page();
+
+        if (pd == NULL) {
+            write_protect_back(cr0);
+            return false;
+        }
+        for (unsigned i = 0; i < ENTRIES; i++) {
+            pd[i] = (base + ((uint64_t)i << 21)) | flags | BIG;
+        }
+        pdpt[0] = (uint64_t)pd | PRESENT | WRITE;
+        low_fixed += VM_PAGE;
+    }
+    pdpt[0] |= USER;
+    low_pd = table_at(pdpt[0]);
+    memcpy(low_orig, low_pd, VM_PAGE);
+    write_protect_back(cr0);
+    flush_tlb();
+    return true;
+}
+
+/* Puts level's tables for its low range in the directory, or takes them out
+   again for what the firmware had there. */
+static void low_apply(struct level *level, bool on) {
+    uint64_t cr0;
+
+    if (level->low_tables == NULL) {
+        return;
+    }
+    cr0 = write_protect_off();
+    for (uint64_t i = level->low_start >> 21; i <= (level->low_end - 1) >> 21; i++) {
+        uint64_t table = level->low_tables[i];
+
+        low_pd[i] = on && table != 0 ? table | PRESENT | WRITE | USER : low_orig[i];
+    }
+    write_protect_back(cr0);
+    flush_tlb();
+}
+
+/* Whether a program underneath has the page at addr at its own address, and
+   so whether this one may have a page there without hiding anyone's. */
+static bool low_below(uint64_t addr) {
+    for (unsigned i = 0; i < depth; i++) {
+        struct level *l = &levels[i];
+
+        if (l->low_tables != NULL && addr >= l->low_start && addr < l->low_end) {
+            uint64_t table = l->low_tables[addr >> 21];
+
+            if (table != 0 && (((uint64_t *)table)[(addr >> 12) & (ENTRIES - 1)] & OWNED)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool vm_low(uint64_t start, uint64_t end) {
+    struct level *level = &levels[depth];
+
+    start &= ~(uint64_t)(VM_PAGE - 1);
+    end = (end + VM_PAGE - 1) & ~(uint64_t)(VM_PAGE - 1);
+    if (level->base == 0 || level->low_tables != NULL || start < (2ull << 20) ||
+        end > LOW_LIMIT || start >= end || !low_setup() ||
+        (level->low_tables = page_from(level)) == NULL) {
+        return false;
+    }
+    level->low_start = start;
+    level->low_end = end;
+    return true;
+}
+
+void vm_firmware_view(bool on) {
+    if (low_pd != NULL) {
+        low_apply(&levels[depth], !on);
+    }
+}
+
+size_t vm_fixed_tables(void) {
+    return (size_t)low_fixed + (levels[0].base != 0 ? VM_PAGE : 0);
+}
+
 bool vm_start(void) {
     if (levels[0].base != 0) {
         return true;
@@ -241,8 +374,13 @@ uint64_t vm_end(void) {
 }
 
 bool vm_holds(uint64_t addr, uint64_t size) {
-    uint64_t base = levels[depth].base;
+    struct level *level = &levels[depth];
+    uint64_t base = level->base;
 
+    if (level->low_tables != NULL && addr >= level->low_start && addr <= level->low_end &&
+        size <= level->low_end - addr) {
+        return true;
+    }
     return base != 0 && addr >= base && addr <= vm_end() && size <= vm_end() - addr;
 }
 
@@ -250,6 +388,30 @@ bool vm_holds(uint64_t addr, uint64_t size) {
    set. Returns NULL if there is none, or if one could not be made. */
 static uint64_t *entry_for(uint64_t addr, bool make) {
     struct level *level = &levels[depth];
+
+    if (addr < LOW_LIMIT) {
+        uint64_t *pt;
+
+        if (level->low_tables == NULL) {
+            return NULL;
+        }
+        if (level->low_tables[addr >> 21] == 0) {
+            uint64_t cr0;
+
+            if (!make || (pt = page_from(level)) == NULL) {
+                return NULL;
+            }
+            level->low_tables[addr >> 21] = (uint64_t)pt;
+            level->tables += VM_PAGE;
+            cr0 = write_protect_off();
+            low_pd[addr >> 21] = (uint64_t)pt | PRESENT | WRITE | USER;
+            write_protect_back(cr0);
+            flush_tlb();
+        }
+        pt = (uint64_t *)level->low_tables[addr >> 21];
+        return &pt[(addr >> 12) & (ENTRIES - 1)];
+    }
+
     uint64_t *table = table_at(pml4()[level->slot]);
     unsigned index[3] = {
         (unsigned)(addr >> 30) & (ENTRIES - 1),
@@ -326,6 +488,27 @@ bool vm_fault(uint64_t addr) {
         __asm__ volatile("invlpg (%0)" : : "r"(page) : "memory");
         return true;
     }
+    if (page < LOW_LIMIT) {
+        /* The page at its own address, so that nothing else is hidden -
+           or, over one a program underneath has, any page at all. */
+        uint64_t owned = 0;
+
+        if (mem_take_page(page)) {
+            owned = OWNED;
+            level->low_owned++;
+            fresh = (uint64_t *)page;
+        } else if (!(low_below(page) || mem_firmware_kept(page)) ||
+                   (fresh = page_from(level)) == NULL) {
+            return false;           /* someone's, and in use: not to be hidden */
+        }
+        if (level->undo != NULL) {
+            undo_note(level, page, false);
+        }
+        *at = (uint64_t)fresh | PRESENT | WRITE | USER | owned;
+        __asm__ volatile("invlpg (%0)" : : "r"(page) : "memory");
+        memset((void *)page, 0, VM_PAGE);
+        return true;
+    }
     fresh = page_from(level);
     if (fresh == NULL) {
         return false;
@@ -363,6 +546,17 @@ bool vm_reserve(uint64_t addr, uint64_t size) {
     return true;
 }
 
+/* Hands back the page an entry maps: to the machine if it was one at its own
+   address, to the region's spares otherwise. */
+static void low_page_back(struct level *level, uint64_t entry) {
+    if (entry & OWNED) {
+        mem_give_page(entry & ADDR);
+        level->low_owned--;
+    } else {
+        page_back(level, entry & ADDR);
+    }
+}
+
 void vm_release(uint64_t addr, uint64_t size) {
     struct level *level = &levels[depth];
     uint64_t first = (addr + VM_PAGE - 1) & ~(uint64_t)(VM_PAGE - 1);
@@ -375,7 +569,7 @@ void vm_release(uint64_t addr, uint64_t size) {
         uint64_t *at = entry_for(page, false);
 
         if (at != NULL && (*at & PRESENT)) {
-            page_back(level, *at & ADDR);
+            low_page_back(level, *at);
             *at = 0;
         }
     }
@@ -386,6 +580,18 @@ void vm_release(uint64_t addr, uint64_t size) {
    the address it covers. */
 static void walk(struct level *level, void (*visit)(uint64_t *at, uint64_t addr)) {
     uint64_t *pdpt = table_at(pml4()[level->slot]);
+
+    if (level->low_tables != NULL) {
+        for (uint64_t i = level->low_start >> 21; i <= (level->low_end - 1) >> 21; i++) {
+            uint64_t *pt = (uint64_t *)level->low_tables[i];
+
+            for (unsigned k = 0; pt != NULL && k < ENTRIES; k++) {
+                if (pt[k] & PRESENT) {
+                    visit(&pt[k], (i << 21) + ((uint64_t)k << 12));
+                }
+            }
+        }
+    }
 
     for (unsigned i = 0; i < ENTRIES; i++) {
         uint64_t *pd;
@@ -457,7 +663,7 @@ void vm_undo_end(bool restore) {
             memcpy((void *)log[i].at, (const void *)log[i].copy, VM_PAGE);
         }
         if (restore && log[i].copy == 0 && at != NULL && (*at & PRESENT)) {
-            page_back(level, *at & ADDR);           /* the parent had none */
+            low_page_back(level, *at);              /* the parent had none */
             *at = 0;
             continue;
         }
@@ -482,6 +688,25 @@ static void level_empty(struct level *level, bool whole) {
 
     if (level->base == 0) {
         return;
+    }
+    if (level->low_tables != NULL) {
+        low_apply(level, false);
+        for (uint64_t i = level->low_start >> 21; i <= (level->low_end - 1) >> 21; i++) {
+            uint64_t *pt = (uint64_t *)level->low_tables[i];
+
+            for (unsigned k = 0; pt != NULL && k < ENTRIES; k++) {
+                if (pt[k] & PRESENT) {
+                    low_page_back(level, pt[k]);
+                }
+            }
+            if (pt != NULL) {
+                page_back(level, (uint64_t)pt);
+                level->tables -= VM_PAGE;
+            }
+        }
+        page_back(level, (uint64_t)level->low_tables);
+        level->low_tables = NULL;
+        level->low_start = level->low_end = 0;
     }
     pdpt = table_at(pml4()[level->slot]);
     for (unsigned i = 0; i < ENTRIES; i++) {
@@ -538,10 +763,12 @@ bool vm_push(void) {
     if (depth + 1 >= LEVELS) {
         return false;
     }
+    low_apply(&levels[depth], false);   /* the one underneath is put away */
     depth++;
     levels[depth] = (struct level){ 0 };
     if (!slot_take(&levels[depth])) {
         depth--;
+        low_apply(&levels[depth], true);
         return false;
     }
     return true;
@@ -556,6 +783,7 @@ void vm_pop(void) {
     }
     level_empty(&levels[depth], true);
     depth--;
+    low_apply(&levels[depth], true);
 }
 
 unsigned vm_level(void) {
@@ -572,16 +800,19 @@ size_t vm_memory(void) {
     size_t total = 0;
 
     for (unsigned i = 0; i <= depth; i++) {
-        total += (size_t)levels[i].bought;
+        total += (size_t)levels[i].bought + (size_t)levels[i].low_owned * VM_PAGE;
     }
     return total;
 }
 
+/* Only each region's top table: the rest are out of its chunks, and so are
+   already in vm_memory. The first region's is the machine's, kept from boot
+   whether anything runs or not, so it is counted with vm_fixed_tables. */
 size_t vm_tables(void) {
     size_t total = 0;
 
-    for (unsigned i = 0; i <= depth; i++) {
-        total += (size_t)levels[i].tables;
+    for (unsigned i = 1; i <= depth; i++) {
+        total += levels[i].base != 0 ? VM_PAGE : 0;
     }
     return total;
 }

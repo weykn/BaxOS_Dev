@@ -1,0 +1,8 @@
+sh font-size
+sh display-res
+sh wallpaper
+sh cache
+
+echo Welcome to Tuxlet OS
+uptime Booted in
+echo Type 'help' to see what you can run!

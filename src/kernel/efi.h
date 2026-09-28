@@ -186,6 +186,13 @@ static inline int efi_is_ram(uint32_t type) {
     return (type >= 1 && type <= 7) || type == 9 || type == 10 || type == 14;
 }
 
+/* The RAM the firmware keeps for good, even once it is left: its runtime
+   services' code and data, the ACPI tables and ACPI's own storage. No OS
+   counts this as memory it has - Linux leaves it out of MemTotal. */
+static inline int efi_is_firmware_kept(uint32_t type) {
+    return type == 5 || type == 6 || type == 9 || type == 10;
+}
+
 struct efi_memory_descriptor {
     uint32_t type;
     uint32_t pad;

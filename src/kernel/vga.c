@@ -33,7 +33,18 @@ static const struct font {
 
 /* The screen, as the firmware set it up and the loader passed it on. */
 static volatile uint8_t *fb;
-static unsigned fb_width, fb_height, fb_pitch;
+static unsigned fb_pitch;
+static unsigned real_w, real_h;         /* the firmware's mode */
+
+/* The screen everything is drawn in, which is the firmware's mode unless
+   `scale` asked for a smaller one. Then each of its pixels is drawn as a
+   block of the real ones - xmap[x] up to xmap[x + 1] across, ymap likewise
+   down - nearest-neighbour, the same shape kept, black at the edges. NULL
+   maps mean one pixel for one. It needs nothing of the hardware, so it
+   works wherever the framebuffer does. */
+static unsigned fb_width, fb_height;
+static unsigned want_w, want_h;         /* `scale`, or 0 for none */
+static uint16_t *xmap, *ymap;
 
 /* The firmware's screen protocol, for changing mode later; NULL if it could
    not be found again, which only costs us the `mode` command. */
@@ -67,6 +78,18 @@ static unsigned width;          /* columns */
 static size_t   cells;          /* on screen */
 static size_t   cursor;         /* row * width + column */
 static uint8_t  color = VGA_LIGHTGRAY;
+static uint8_t  pen = VGA_LIGHTGRAY;    /* color before reverse video swaps it */
+static bool     reversed;
+
+/* What a full-screen program leans on: the rows that scroll (top up to, not
+   including, bottom), a character written in the last column holding the
+   cursor there until the next one (so the bottom-right cell can be written
+   without scrolling), and a cursor it can hide while it redraws. */
+static unsigned region_top, region_bottom;
+static bool     wrap_pending;
+static bool     cursor_shown = true;
+static bool     inserting;      /* each character opens a gap for itself */
+static bool     cr_on_lf = true;        /* "\n" goes back to column 0 too */
 
 /* The sixteen colours as the framebuffer wants them: one pixel per uint32.
    Written for blue in the low byte, and swapped at startup if the screen
@@ -99,10 +122,26 @@ static volatile uint32_t *row(unsigned y) {
     return (volatile uint32_t *)(fb + (size_t)y * fb_pitch);
 }
 
-/* The top-left pixel of cell i. */
-static volatile uint8_t *cell_pixels(size_t i) {
-    return fb + (i / width) * cell_h * (size_t)fb_pitch
-              + (i % width) * cell_w * sizeof(uint32_t);
+/* Draws n pixels of the screen's scan line y, from x on. Everything that
+   draws comes through here. */
+static void emit(unsigned x, unsigned y, const uint32_t *px, unsigned n) {
+    if (xmap == NULL) {
+        volatile uint32_t *line = row(y) + x;
+
+        for (unsigned i = 0; i < n; i++) {
+            line[i] = px[i];
+        }
+        return;
+    }
+    for (unsigned ry = ymap[y]; ry < ymap[y + 1]; ry++) {
+        volatile uint32_t *line = row(ry);
+
+        for (unsigned i = 0; i < n; i++) {
+            for (unsigned rx = xmap[x + i]; rx < xmap[x + i + 1]; rx++) {
+                line[rx] = px[i];
+            }
+        }
+    }
 }
 
 /* Draws one cell's glyph, foreground and background both. A cell whose
@@ -116,7 +155,7 @@ static void draw_cell(size_t i, uint16_t value) {
                            ? picture : NULL;
     unsigned left = (unsigned)(i % width) * cell_w;
     unsigned top_y = (unsigned)(i / width) * cell_h;
-    volatile uint8_t *top = cell_pixels(i);
+    uint32_t line[GLYPH_W * 4];         /* one scan line, at the largest scale */
 
     for (unsigned y = 0; y < glyphs->height; y++) {
         uint8_t bits = glyph[y];
@@ -125,10 +164,9 @@ static void draw_cell(size_t i, uint16_t value) {
            pixels scale times across, which is what makes the cell bigger. */
         for (unsigned again = 0; again < glyphs->scale; again++) {
             unsigned screen_y = top_y + y * glyphs->scale + again;
-            volatile uint32_t *line =
-                (volatile uint32_t *)(top + (y * glyphs->scale + again) * (size_t)fb_pitch);
             const uint32_t *from = behind != NULL
                                  ? behind + (size_t)screen_y * fb_width + left : NULL;
+            uint32_t *to = line;
 
             for (unsigned x = 0; x < GLYPH_W; x++) {
                 bool ink = (bits & 0x80 >> x) != 0;
@@ -136,9 +174,10 @@ static void draw_cell(size_t i, uint16_t value) {
                 for (unsigned wide = 0; wide < glyphs->scale; wide++) {
                     uint32_t under = from != NULL ? *from++ : bg;
 
-                    *line++ = ink ? fg : under;
+                    *to++ = ink ? fg : under;
                 }
             }
+            emit(left, screen_y, line, cell_w);
         }
     }
 }
@@ -153,23 +192,21 @@ static void fill_background(unsigned y0, unsigned y1) {
         return;
     }
     for (unsigned y = y0; y < y1; y++) {
-        volatile uint32_t *line = row(y);
-        const uint32_t *from = picture + (size_t)y * fb_width;
-
-        for (unsigned x = 0; x < fb_width; x++) {
-            line[x] = from[x];
-        }
+        emit(0, y, picture + (size_t)y * fb_width, fb_width);
     }
 }
 
 /* Paints scan lines y0 up to y1 in one colour. Clearing a whole screen this
    way is far cheaper than drawing a blank glyph in every cell. */
 static void fill_rows(unsigned y0, unsigned y1, uint32_t rgb) {
-    for (unsigned y = y0; y < y1; y++) {
-        volatile uint32_t *line = row(y);
+    uint32_t run[64];
 
-        for (unsigned x = 0; x < fb_width; x++) {
-            line[x] = rgb;
+    for (unsigned i = 0; i < 64; i++) {
+        run[i] = rgb;
+    }
+    for (unsigned y = y0; y < y1; y++) {
+        for (unsigned x = 0; x < fb_width; x += 64) {
+            emit(x, y, run, fb_width - x < 64 ? fb_width - x : 64);
         }
     }
 }
@@ -178,22 +215,22 @@ static void fill_rows(unsigned y0, unsigned y1, uint32_t rgb) {
    two scan lines of the cell, scaled with the font, in the foreground
    colour. Putting the cell back the way it was erases it. */
 static void cursor_draw(bool on) {
-    if (cursor >= cells) {
+    if (cursor >= cells || (on && !cursor_shown)) {
         return;
     }
     if (!on) {
         draw_cell(cursor, screen[cursor]);
         return;
     }
-    volatile uint8_t *top = cell_pixels(cursor);
-    uint32_t fg = palette[screen[cursor] >> 8 & 0x0F];
+    unsigned left = (unsigned)(cursor % width) * cell_w;
+    unsigned top_y = (unsigned)(cursor / width) * cell_h;
+    uint32_t line[GLYPH_W * 4];
 
+    for (unsigned x = 0; x < cell_w; x++) {
+        line[x] = palette[screen[cursor] >> 8 & 0x0F];
+    }
     for (unsigned y = cell_h - 2 * glyphs->scale; y < cell_h; y++) {
-        volatile uint32_t *line = (volatile uint32_t *)(top + y * (size_t)fb_pitch);
-
-        for (unsigned x = 0; x < cell_w; x++) {
-            line[x] = fg;
-        }
+        emit(left, top_y + y, line, cell_w);
     }
 }
 
@@ -248,6 +285,9 @@ static bool layout(void) {
     screen_bytes = bytes;
     width = columns;
     cells = (size_t)columns * rows;
+    region_top = 0;
+    region_bottom = rows;
+    wrap_pending = false;
 
     /* The screen holds whatever it held before, so agree with it: every cell
        blank and black, and the whole of it painted to match. Otherwise put()
@@ -288,15 +328,9 @@ static bool parse_size(const char *s, unsigned *w, unsigned *h) {
 /* Takes the framebuffer the firmware is using now. */
 static void take_screen(uint64_t base, unsigned w, unsigned h, unsigned pitch,
                         unsigned format) {
-    /* A wallpaper is exactly the size of the screen it was made for. If the
-       screen has changed - which the firmware does on its own, and vga_follow
-       then notices - it is dropped rather than read past the end of. */
-    if (w != fb_width || h != fb_height) {
-        picture = NULL;
-    }
     fb = (volatile uint8_t *)base;
-    fb_width = w;
-    fb_height = h;
+    real_w = w;
+    real_h = h;
     fb_pitch = pitch;
     ksprintf(mode_name, "%ux%u", w, h);
 
@@ -310,6 +344,54 @@ static void take_screen(uint64_t base, unsigned w, unsigned h, unsigned pitch,
             palette[i] = (c & 0x00FF00) | (c >> 16 & 0xFF) | (c & 0xFF) << 16;
         }
     }
+}
+
+/* Sizes the screen drawn in against the real one, after either changes:
+   the `scale` size if it fits, the real one otherwise - which is also what
+   a map that cannot be had comes to. */
+static void fit(void) {
+    unsigned w = real_w, h = real_h;
+
+    if (xmap != NULL) {
+        mem_free(xmap);
+        xmap = ymap = NULL;
+    }
+    if (want_w != 0 && want_w <= real_w && want_h <= real_h &&
+        (want_w != real_w || want_h != real_h) &&
+        (xmap = mem_alloc((want_w + want_h + 2) * sizeof(uint16_t))) != NULL) {
+        /* As large as it goes without changing shape, in the middle. */
+        unsigned out_w = real_w, out_h = real_h;
+
+        w = want_w;
+        h = want_h;
+        if (real_w * h > real_h * w) {
+            out_w = w * real_h / h;
+        } else {
+            out_h = h * real_w / w;
+        }
+        ymap = xmap + w + 1;
+        for (unsigned i = 0; i <= w; i++) {
+            xmap[i] = (uint16_t)((real_w - out_w) / 2 + i * out_w / w);
+        }
+        for (unsigned i = 0; i <= h; i++) {
+            ymap[i] = (uint16_t)((real_h - out_h) / 2 + i * out_h / h);
+        }
+        for (unsigned y = 0; y < real_h; y++) {       /* the edges */
+            volatile uint32_t *line = row(y);
+
+            for (unsigned x = 0; x < real_w; x++) {
+                line[x] = palette[VGA_BLACK];
+            }
+        }
+    }
+    /* A wallpaper is exactly the size of the screen it was made for. If the
+       screen has changed - which the firmware does on its own, and vga_follow
+       then notices - it is dropped rather than read past the end of. */
+    if (w != fb_width || h != fb_height) {
+        picture = NULL;
+    }
+    fb_width = w;
+    fb_height = h;
 }
 
 /* The firmware's mode i, if it is one we could draw in. */
@@ -396,6 +478,7 @@ void vga_follow(void) {
     take_screen(gop->mode->framebuffer, gop->mode->info->width,
                 gop->mode->info->height, gop->mode->info->pixels_per_scanline * 4,
                 gop->mode->info->pixel_format);
+    fit();
 
     /* The same grid, so the cells still say what is on screen and only the
        pixels need putting back; a different one has to start over. */
@@ -426,6 +509,7 @@ int vga_start(struct boot_info *info) {
         take_screen(info->framebuffer, info->width, info->height, info->pitch,
                     info->pixel_format);
     }
+    fit();
     use_font(&fonts[FONT_DEFAULT]);
     return layout() ? 0 : -1;
 }
@@ -451,10 +535,42 @@ int vga_set_mode(const char *name) {
         take_screen(gop->mode->framebuffer, gop->mode->info->width,
                     gop->mode->info->height, gop->mode->info->pixels_per_scanline * 4,
                     gop->mode->info->pixel_format);
+        fit();
         layout();
         return 0;
     }
     return -1;
+}
+
+int vga_set_scale(const char *name) {
+    unsigned w = 0, h = 0;
+
+    if (strcmp(name, "off") != 0 &&
+        (!parse_size(name, &w, &h) || w > real_w || h > real_h)) {
+        return -1;
+    }
+    unsigned was_w = want_w, was_h = want_h;
+
+    want_w = w;
+    want_h = h;
+    fit();
+    if (layout()) {
+        return 0;
+    }
+    /* Too small for a console: back to what it was. */
+    want_w = was_w;
+    want_h = was_h;
+    fit();
+    layout();
+    return -1;
+}
+
+const char *vga_scale(void) {
+    if (xmap == NULL) {
+        return "off";
+    }
+    ksprintf(list_name, "%ux%u", fb_width, fb_height);
+    return list_name;
 }
 
 int vga_set_font(const char *name) {
@@ -508,7 +624,12 @@ size_t vga_memory(void) {
 /* ---- the console -------------------------------------------------------- */
 
 void vga_set_color(enum vga_color fg, enum vga_color bg) {
-    color = VGA_ATTR(fg, bg);
+    pen = color = VGA_ATTR(fg, bg);
+    reversed = false;
+}
+
+void vga_set_crlf(bool on) {
+    cr_on_lf = on;
 }
 
 void vga_clear(void) {
@@ -540,7 +661,10 @@ void vga_clear(void) {
 
 #define PARAMS 4
 
-static enum { PLAIN, AFTER_ESC, IN_CSI } escape;
+static enum { PLAIN, AFTER_ESC, IN_CSI, CHARSET, IN_OSC } escape;
+static unsigned osc_left;       /* of a palette entry: "P" and seven digits */
+static size_t   saved_cursor;
+static uint8_t  saved_pen;
 static unsigned params[PARAMS], param_count;
 static bool     private;        /* a sequence about the terminal, not the screen */
 
@@ -552,11 +676,21 @@ static const uint8_t ansi_colors[8] = {
 };
 
 static void set_graphics(void) {
+    color = pen;
+    if (param_count == 0) {
+        param_count = 1;            /* "escape [ m" is "escape [ 0 m" */
+        params[0] = 0;
+    }
     for (unsigned i = 0; i < param_count; i++) {
         unsigned n = params[i];
 
         if (n == 0) {
             color = VGA_ATTR(VGA_LIGHTGRAY, VGA_BLACK);
+            reversed = false;
+        } else if (n == 39) {
+            color = (uint8_t)((color & 0xF0) | VGA_LIGHTGRAY);
+        } else if (n == 49) {
+            color = (uint8_t)(color & 0x0F);
         } else if (n == 1) {
             color = (uint8_t)(color | 0x08);            /* bright */
         } else if (n == 22) {
@@ -570,10 +704,15 @@ static void set_graphics(void) {
         } else if (n >= 100 && n <= 107) {
             color = (uint8_t)((color & 0x0F) | (ansi_colors[n - 100] | 0x08) << 4);
         } else if (n == 7 || n == 27) {
-            /* Reverse video, which is one attribute byte with its two halves
-               the other way round. Turning it off is turning it on again. */
-            color = (uint8_t)((color >> 4 & 0x0F) | (color & 0x0F) << 4);
+            /* Reverse video: the attribute byte with its two halves the other
+               way round, kept apart so that colours set under it still land
+               where they are meant to. */
+            reversed = n == 7;
         }
+    }
+    pen = color;
+    if (reversed) {
+        color = (uint8_t)((pen >> 4 & 0x0F) | (pen & 0x0F) << 4);
     }
 }
 
@@ -602,6 +741,44 @@ static void erase(char what) {
    takes a count means by leaving it out. */
 static size_t count_param(void) {
     return param_count > 0 && params[0] > 0 ? params[0] : 1;
+}
+
+/* Moves rows top up to bottom by one: up, the top one going and a blank one
+   coming in at the bottom, or down, the other way round. */
+static void scroll(unsigned top, unsigned bottom, bool up) {
+    size_t first = (size_t)top * width, last = (size_t)bottom * width;
+
+    if (up) {
+        for (size_t i = first; i < last; i++) {
+            put(i, i + width < last ? screen[i + width] : cell(' '));
+        }
+    } else {
+        for (size_t i = last; i-- > first;) {
+            put(i, i >= first + width ? screen[i - width] : cell(' '));
+        }
+    }
+}
+
+/* Down a row, scrolling the region when the cursor is on its last one. */
+static void line_feed(void) {
+    unsigned row = (unsigned)(cursor / width);
+
+    if (row + 1 == region_bottom) {
+        scroll(region_top, region_bottom, true);
+    } else if (row + 1 < vga_height()) {
+        cursor += width;
+    }
+}
+
+/* Up a row, scrolling the region the other way on its first. */
+static void reverse_feed(void) {
+    unsigned row = (unsigned)(cursor / width);
+
+    if (row == region_top) {
+        scroll(region_top, region_bottom, false);
+    } else if (row > 0) {
+        cursor -= width;
+    }
 }
 
 /* Moves the cursor about the screen without printing anything. Row 0 is the
@@ -635,9 +812,8 @@ static void move_by(char what) {
 /* Opens a gap in the line at the cursor, or closes one: what a terminal does
    for a program editing a line in the middle of it. The rest of the line
    moves, and nothing beyond the line is touched. */
-static void shift_line(bool open) {
+static void shift_line(bool open, size_t n) {
     size_t start = cursor, end = cursor - cursor % width + width;
-    size_t n = count_param();
 
     if (n > end - start) {
         n = end - start;
@@ -666,6 +842,55 @@ static void move_cursor(void) {
     }
 }
 
+/* Opens n blank rows at the cursor's, pushing the rest of the region down,
+   or closes them, pulling it up. Outside the region it does nothing. */
+static void shift_rows(bool open) {
+    unsigned row = (unsigned)(cursor / width);
+    size_t n = count_param();
+
+    if (row < region_top || row >= region_bottom) {
+        return;
+    }
+    if (n > region_bottom - row) {
+        n = region_bottom - row;
+    }
+    while (n-- > 0) {
+        scroll(row, region_bottom, !open);
+    }
+    cursor -= cursor % width;
+}
+
+/* Blanks n characters from the cursor on, without moving it or the rest of
+   the line. */
+static void erase_chars(void) {
+    size_t end = cursor - cursor % width + width;
+    size_t n = count_param();
+
+    for (size_t i = cursor; i < end && n > 0; i++, n--) {
+        put(i, cell(' '));
+    }
+}
+
+static void set_region(void) {
+    unsigned rows = vga_height();
+    unsigned top = param_count > 0 && params[0] > 0 ? params[0] - 1 : 0;
+    unsigned bottom = param_count > 1 && params[1] > 0 && params[1] <= rows ? params[1] : rows;
+
+    if (top + 1 < bottom) {
+        region_top = top;
+        region_bottom = bottom;
+        cursor = 0;
+    }
+}
+
+static void to_row(void) {
+    size_t row = count_param() - 1;
+
+    if (row < vga_height()) {
+        cursor = row * width + cursor % width;
+    }
+}
+
 /* One character of a sequence. True if it was taken. */
 
 static bool escaped(char c) {
@@ -677,11 +902,58 @@ static bool escaped(char c) {
         return true;
     }
     if (escape == AFTER_ESC) {
-        /* Only CSI - "escape bracket" - is understood; anything else was a
-           sequence this does not know, and is dropped with it. */
-        escape = c == '[' ? IN_CSI : PLAIN;
+        /* CSI - "escape bracket" - is most of them; the rest are a letter
+           straight after the escape. One this does not know is dropped. */
+        escape = c == '[' ? IN_CSI : c == '(' || c == ')' ? CHARSET
+               : c == ']' ? IN_OSC : PLAIN;
         params[0] = param_count = 0;
         private = false;
+        osc_left = 0;
+        if (c == '7') {
+            saved_cursor = cursor;
+            saved_pen = pen;
+        } else if (c == '8') {
+            cursor = saved_cursor < cells ? saved_cursor : 0;
+            pen = saved_pen;
+            reversed = false;
+            color = pen;
+            wrap_pending = false;
+        } else if (c == 'M') {
+            reverse_feed();
+            wrap_pending = false;
+        } else if (c == 'D') {
+            line_feed();
+            wrap_pending = false;
+        } else if (c == 'E') {
+            cursor -= cursor % width;
+            line_feed();
+            wrap_pending = false;
+        } else if (c == 'c') {
+            pen = color = VGA_ATTR(VGA_LIGHTGRAY, VGA_BLACK);
+            reversed = inserting = false;
+            cursor_shown = true;
+            region_top = 0;
+            region_bottom = vga_height();
+            vga_clear();
+        }
+        return true;
+    }
+    if (escape == CHARSET) {
+        escape = PLAIN;             /* the set it names: there is only the one */
+        return true;
+    }
+    if (escape == IN_OSC) {
+        /* The Linux console's palette ("P" and seven digits, or "R" to put it
+           back), or anything else up to a bell. None of it is kept. */
+        if (osc_left > 0) {
+            if (--osc_left == 0) {
+                escape = PLAIN;
+            }
+        } else if (c == 'P') {
+            osc_left = 7;
+        } else if (c == 'R' || c == 0x07 || c == 0x1B) {
+            escape = c == 0x1B ? AFTER_ESC : PLAIN;
+        }
         return true;
     }
     if (c == '?' || c == '<' || c == '=' || c == '>') {
@@ -709,8 +981,15 @@ static bool escaped(char c) {
         return true;
     }
     escape = PLAIN;                 /* the final letter ends it either way */
+    wrap_pending = false;
     if (private) {
+        /* Of the terminal's own settings, only showing the cursor matters. */
         private = false;
+        if ((c == 'h' || c == 'l') && param_count > 0 && params[0] == 25) {
+            cursor_draw(false);
+            cursor_shown = c == 'h';
+            cursor_draw(true);
+        }
         return true;
     }
     switch (c) {
@@ -733,10 +1012,29 @@ static bool escaped(char c) {
         move_by(c);
         break;
     case '@':
-        shift_line(true);
+        shift_line(true, count_param());
         break;
     case 'P':
-        shift_line(false);
+        shift_line(false, count_param());
+        break;
+    case 'L':
+    case 'M':
+        shift_rows(c == 'L');
+        break;
+    case 'X':
+        erase_chars();
+        break;
+    case 'd':
+        to_row();
+        break;
+    case 'r':
+        set_region();
+        break;
+    case 'h':
+    case 'l':
+        if (param_count > 0 && params[0] == 4) {
+            inserting = c == 'h';
+        }
         break;
     default:
         break;                      /* something else: dropped */
@@ -797,20 +1095,31 @@ void vga_putc(char c) {
     cursor_draw(false);
 
     if (c == '\n') {
-        cursor += width - cursor % width;
+        /* Down a line, and back to the start of it unless a program has
+           said it will send the "\r" itself. */
+        if (cr_on_lf) {
+            cursor -= cursor % width;
+        }
+        wrap_pending = false;
+        line_feed();
     } else if (c == '\r') {
         cursor -= cursor % width;
+        wrap_pending = false;
     } else if (c == '\b') {
         /* A move, not an erase: that is what a terminal does with it, and
            what a program editing a line in place counts on. Rubbing a
            character out is "\b \b", which is what the console echoes. */
-        if (cursor % width > 0) {
+        if (cursor % width > 0 && !wrap_pending) {
             cursor--;
         }
+        wrap_pending = false;
     } else if (c == '\t') {
-        do {
-            put(cursor++, cell(' '));
-        } while (cursor % 8 != 0 && cursor % width != 0);
+        /* To the next stop, moving rather than writing, and no further
+           than the last column. */
+        size_t end = cursor - cursor % width + width - 1;
+
+        cursor = (cursor / 8 + 1) * 8 < end ? (cursor / 8 + 1) * 8 : end;
+        wrap_pending = false;
     } else if ((unsigned char)c < 0x20 || c == 0x7F) {
         /* A control character this screen has no answer for - the bell most
            of all, which a line editor rings whenever an edit does nothing, a
@@ -820,21 +1129,37 @@ void vga_putc(char c) {
         cursor_draw(true);
         return;
     } else {
-        put(cursor++, cell(c));
-    }
-
-    /* Off the bottom: scroll everything up a row. Reading a row ahead of the
-       one being written keeps this a single pass. */
-    if (cursor >= cells) {
-        for (size_t i = 0; i < cells; i++) {
-            put(i, i < cells - width ? screen[i + width] : cell(' '));
+        /* A character in the last column leaves the cursor on it, and the
+           next one goes to the start of the line below. */
+        if (wrap_pending) {
+            cursor -= cursor % width;
+            line_feed();
+            wrap_pending = false;
         }
-        cursor -= width;
+        if (inserting) {
+            shift_line(true, 1);
+        }
+        put(cursor, cell(c));
+        if (cursor % width == width - 1) {
+            wrap_pending = true;
+        } else {
+            cursor++;
+        }
     }
     cursor_draw(true);
 }
 
+/* Where the next character goes, which is the line below if one has just
+   filled the last column: the wrap is made now, so the answer is a place on
+   screen. */
 size_t vga_at(void) {
+    if (wrap_pending) {
+        cursor_draw(false);
+        cursor -= cursor % width;
+        line_feed();
+        wrap_pending = false;
+        cursor_draw(true);
+    }
     return cursor;
 }
 

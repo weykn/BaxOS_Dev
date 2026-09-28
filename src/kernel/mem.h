@@ -30,12 +30,15 @@ void mem_take_over(const void *map, size_t size, size_t stride);
 /* Whether mem_take_over has happened: the firmware is gone. */
 bool mem_ours(void);
 
-/* A page of the fixed window (syscall.c), which is mapped one to one and so
-   has to be that exact page: taken if it is free, given back when the
-   program is done with it. The window's pages are kept for it alone, since
-   its mapping hides whatever else was there. */
-bool mem_window_take(uint64_t page);
-void mem_window_give(uint64_t page);
+/* The page at page, taken if it is free - for low memory (vm.c), which has
+   to be that exact page since its mapping hides whatever else was there -
+   and given back when the program is done with it. */
+bool mem_take_page(uint64_t page);
+
+/* Whether the page is low memory the firmware keeps for good - its runtime
+   services', ACPI's, or reserved - rather than anyone's in use. */
+bool mem_firmware_kept(uint64_t page);
+void mem_give_page(uint64_t page);
 
 /* RAM free right now, in KiB. */
 uint64_t mem_free_kib(void);
@@ -43,7 +46,10 @@ uint64_t mem_free_kib(void);
 
 /* Sizes in bytes unless named otherwise. */
 struct mem_stats {
-    uint32_t total_kib;     /* all the RAM there is */
+    uint32_t ram_kib;       /* all the RAM there is */
+    uint32_t firmware_kib;  /* of it, the firmware's for good */
+    uint32_t total_kib;     /* the rest: the RAM the OS has, as Linux's
+                               MemTotal counts it */
     uint32_t free_kib;      /* what nobody has right now */
     uint32_t image;         /* kernel code and data, as loaded from kernel.bin */
     uint32_t data;          /* zero-filled kernel data (.bss), minus the stack */
@@ -58,8 +64,8 @@ struct mem_stats {
     uint32_t kernel_kib;    /* all of the above but the window, in KiB
                                rounded up: what the machine costs, whoever is
                                asking and whatever is running */
-    uint32_t used_kib;      /* everything that is not free: the firmware's,
-                               the kernel's and the program's */
+    uint32_t used_kib;      /* all of ram_kib that is not free: the
+                               firmware's, the kernel's and the program's */
 };
 
 void mem_get_stats(struct mem_stats *stats);

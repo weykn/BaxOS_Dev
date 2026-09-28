@@ -10,24 +10,27 @@
 #include "string.h"
 #include "log.h"
 #include "proc.h"
+#include "console.h"
 #include "syscall.h"
 #include "vga.h"
 
 /* Bringing the machine up: the system's configuration, and then the shell.
  *
- * /etc/boot is the machine itself - the size of the screen, the size of the
+ * /etc/tuxlet/boot is the machine itself - the size of the screen, the size of the
  * text, the wallpaper - and the kernel reads and runs it, because all of it
  * is the kernel's own state and none of it needs a shell. Its lines print as they run, the way a Unix says what it is
- * doing on the way up. Only once it is through does /etc/shell say what to
+ * doing on the way up. Only once it is through does /etc/tuxlet/shell say what to
  * start.
  *
- * The shell itself is a program on the disk and nothing of it is in here:
- * reading a line, splitting it into words, looking a name up on the path,
- * running what it finds, are all its own. */
+ * The shell is in here too, as /proc/tsh: reading a line is the console's
+ * own line editor, and running a program is what the kernel does anyway, so
+ * a shell that is a program of its own costs a region, its page tables and
+ * its code for nothing but a loop. Another shell - bash, say - is a program
+ * on the disk like any other, which /etc/tuxlet/shell may name instead. */
 
-#define BOOT_CONF     "/etc/boot"
-#define SHELL_CONF    "/etc/shell"
-#define SHELL_DEFAULT "/usr/bin/tsh"
+#define BOOT_CONF     "/etc/tuxlet/boot"
+#define SHELL_CONF    "/etc/tuxlet/shell"
+#define SHELL_DEFAULT "/proc/tsh"
 #define HOME          "/root"   /* root's, as on Linux; /home is for users */
 
 #define CONF_LINE     128       /* the longest line one of them may hold */
@@ -174,14 +177,127 @@ static void conf_run(const char *path, unsigned depth) {
     }
 }
 
-/* Says how long the machine took to come up, the way a Unix does before it
-   hands the screen to a shell. */
-static void boot_time(void) {
-    uint64_t ms = efi_uptime_ms();
+/* ---- tsh -------------------------------------------------------------------
+ *
+ * As small as a shell can be and still be one: it reads a line, splits it
+ * into words on blanks, and runs the first with the rest as its arguments -
+ * a command of the kernel's from /proc, or a program from /usr/bin, or
+ * whatever path it names. `cd`, `exit` and `help` are its own. There are no
+ * pipes, redirections, variables or quoting: bash is on the disk for those. */
 
-    vga_set_color(VGA_DARKGRAY, VGA_BLACK);
-    kprintf("Booted in %u.%02us\n", (unsigned)(ms / 1000), (unsigned)(ms % 1000) / 10);
-    vga_set_color(VGA_LIGHTGRAY, VGA_BLACK);
+#define TSH_LINE  256
+#define TSH_WORDS 32
+
+static void tsh_help(void) {
+    kprintf("Built-in commands:\n"
+            "\n"
+            "  cd [dir]      change directory\n"
+            "  exit          exit the shell\n"
+            "  help          show this message\n"
+            "\n"
+            "Kernel commands, in /proc:\n"
+            "\n ");
+    for (unsigned i = 0; proc_at(i) != NULL; i++) {
+        kprintf(" %s", proc_at(i)->name);
+    }
+    kprintf("\n\nOther commands are in /usr/bin\n");
+}
+
+/* Runs one line's words: a kernel command with the rest of the line as its
+   arguments, or a program. */
+static void tsh_run(unsigned argc, char **argv) {
+    char path[FS_NAME_LEN] = "/proc/";
+    const struct proc_cmd *cmd = NULL;
+    int code;
+
+    if (strchr(argv[0], '/') == NULL && strlen(argv[0]) + sizeof "/usr/bin/" <= sizeof path) {
+        strcpy(path + sizeof "/proc/" - 1, argv[0]);
+        cmd = proc_command(path);
+        strcpy(path, "/usr/bin/");
+        strcpy(path + sizeof "/usr/bin/" - 1, argv[0]);
+    } else if (strlen(argv[0]) < sizeof path) {
+        strcpy(path, argv[0]);
+    } else {
+        path[0] = '\0';
+    }
+    if (cmd != NULL) {
+        /* The words back into one line, which is how a command takes them. */
+        char *args = argc > 1 ? argv[1] : argv[0] + strlen(argv[0]);
+
+        for (unsigned i = 2; i < argc; i++) {
+            for (char *gap = argv[i - 1] + strlen(argv[i - 1]); gap < argv[i]; gap++) {
+                *gap = ' ';
+            }
+        }
+        proc_run(cmd, args);
+        return;
+    }
+    code = path[0] != '\0' ? program_start(path, argc, (const char *const *)argv) : FS_ENOENT;
+    log_flush();
+    if (code < 0) {
+        vga_set_color(VGA_LIGHTRED, VGA_BLACK);
+        kprintf("tsh: %s: %s\n", argv[0],
+                code == FS_ENOENT ? "not found" :
+                code == PROGRAM_EINVAL ? "not a program" : fs_error(code));
+        vga_set_color(VGA_LIGHTGRAY, VGA_BLACK);
+    }
+}
+
+/* Reads and runs lines until `exit`. */
+static void tsh(void) {
+    static char line[TSH_LINE];
+    char *argv[TSH_WORDS + 1];
+
+    for (;;) {
+        const char *cwd = fs_cwd();
+        size_t cwd_n = strlen(cwd);
+        unsigned argc = 0;
+        uint64_t got;
+
+        console_reset();            /* whatever the last program left it as */
+        vga_putc('/');
+        for (size_t i = 0; i + 1 < cwd_n; i++) {
+            vga_putc(cwd[i]);       /* "root/" is shown as /root */
+        }
+        kprintf(" $ ");
+        got = console_read(line, sizeof line - 1);
+        line[got] = '\0';
+
+        for (char *p = line; *p != '\0' && argc < TSH_WORDS;) {
+            while (*p == ' ' || *p == '\t' || *p == '\n') {
+                *p++ = '\0';
+            }
+            if (*p == '\0') {
+                break;
+            }
+            argv[argc++] = p;
+            while (*p != '\0' && *p != ' ' && *p != '\t' && *p != '\n') {
+                p++;
+            }
+        }
+        argv[argc] = NULL;
+        if (argc == 0 || argv[0][0] == '#') {
+            continue;
+        }
+        if (strcmp(argv[0], "exit") == 0) {
+            return;
+        } else if (strcmp(argv[0], "help") == 0) {
+            tsh_help();
+        } else if (strcmp(argv[0], "cd") == 0) {
+            if (fs_chdir(argc > 1 ? argv[1] : HOME) < 0) {
+                kprintf("tsh: cd: no such folder\n");
+            }
+        } else {
+            tsh_run(argc, argv);
+        }
+    }
+}
+
+/* What /proc/tsh does when a program runs it: there is one of it, and it is
+   already underneath. */
+void shell_tsh(char *args) {
+    (void)args;
+    kprintf("tsh: already the machine's shell - exit to get back to it\n");
 }
 
 __attribute__((noreturn)) void shell_run(void) {
@@ -196,11 +312,14 @@ __attribute__((noreturn)) void shell_run(void) {
     /* The screen mode is set, which only the firmware can do: now it can go,
        and everything it held with it. */
     efi_leave();
-    boot_time();
     shell = shell_wanted(wanted, sizeof wanted);
     fs_chdir(HOME);                 /* a shell starts at home, as a login does */
 
     for (;;) {
+        if (strcmp(shell, SHELL_DEFAULT) == 0) {
+            tsh();                  /* ends only with `exit`: started again */
+            continue;
+        }
         int err = fs_stat(shell, &file);
 
         if (err == 0) {
@@ -211,11 +330,8 @@ __attribute__((noreturn)) void shell_run(void) {
             kprintf("%s: %s\n", shell,
                     err == PROGRAM_EINVAL ? "not a program" : fs_error(err));
             vga_set_color(VGA_LIGHTGRAY, VGA_BLACK);
-            /* Whatever was asked for is not there; the one that came with
-               the machine is, and is worth trying before giving up. */
-            if (strcmp(shell, SHELL_DEFAULT) == 0) {
-                halt_forever();
-            }
+            /* Whatever was asked for is not there; the one in the kernel
+               always is. */
             shell = SHELL_DEFAULT;
             continue;
         }

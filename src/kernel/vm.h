@@ -35,7 +35,22 @@ bool vm_start(void);
 uint64_t vm_base(void);
 uint64_t vm_end(void);
 
-/* Whether addr .. addr + size lies inside the region in use. */
+/* Gives the program in the current region start .. end of low memory too,
+   for one linked to run at a fixed address: mapped over the firmware's one
+   to one mapping while it runs, from pages at those very addresses. False if
+   that cannot be had. Its pages come as it touches them, like the region's. */
+bool vm_low(uint64_t start, uint64_t end);
+
+/* Puts the firmware's own view of low memory back while it is on, for a call
+   into its runtime services, and the running program's when it is off. */
+void vm_firmware_view(bool on);
+
+/* The page tables the machine has for good: the first region's top table,
+   and what low memory has cost. */
+size_t vm_fixed_tables(void);
+
+/* Whether addr .. addr + size lies inside the region in use, or its low
+   memory. */
 bool vm_holds(uint64_t addr, uint64_t size);
 
 /* Maps the page holding addr, if it is in the region and not mapped yet -
@@ -77,7 +92,7 @@ void vm_unwind(unsigned to);
 bool vm_undo_begin(void);
 void vm_undo_end(bool restore);
 
-/* What the regions cost: the pages lent to programs, and the page tables
-   describing them. */
+/* What the regions cost: every page bought for them, the tables under the
+   top one included, and the top tables, which are bought on their own. */
 size_t vm_memory(void);
 size_t vm_tables(void);

@@ -30,6 +30,7 @@
 
 #include "ata.h"
 #include "fs.h"
+#include "mem.h"
 
 #define SECTOR_SIZE 512
 
@@ -54,6 +55,15 @@ int ata_write_many(uint32_t lba, unsigned count, const void *buffer) {
     size_t bytes = (size_t)count * SECTOR_SIZE;
 
     return pwrite(image, buffer, bytes, (off_t)lba * SECTOR_SIZE) == (ssize_t)bytes ? 0 : -1;
+}
+
+/* And gets memory for the file table through these. */
+void *mem_alloc(size_t bytes) {
+    return malloc(bytes);
+}
+
+void mem_free(void *memory) {
+    free(memory);
 }
 
 void ata_sync(void) {

@@ -74,10 +74,10 @@ IMAGE      := $(BUILD)/TuxletOS.img
 # Sizes, in the units their names give. FS_SECTORS is FS_MIB as sectors. Nothing may follow these on the line:
 # a trailing comment leaves its spaces inside the value, and these get stuck
 # straight onto sector numbers and onto sgdisk's "+48M".
-FS_SECTORS := 131072
+FS_SECTORS := 524288
 ESP_MIB    := 1
-FS_MIB     := 64
-DISK_MIB   := 128
+FS_MIB     := 256
+DISK_MIB   := 320
 ESP_LBA    := 2048
 
 FS_LBA      := $(shell expr $(ESP_LBA) + $(ESP_MIB) \* 2048)
@@ -160,7 +160,7 @@ run: $(IMAGE)
 	qemu-system-x86_64 $(ACCEL) \
 	    -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 	    -drive if=pflash,format=raw,file=$(BUILD)/ovmf_vars.fd \
-	    -drive format=raw,file=$(IMAGE) -net none -m 39M
+	    -drive format=raw,file=$(IMAGE) -net none -m 1G
 
 clean:
 	rm -rf $(BUILD)

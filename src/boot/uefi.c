@@ -154,7 +154,7 @@ static bool find_disk(void) {
 static void measure_memory(void) {
     struct efi_memory_descriptor *map = 0;
     efi_uintn size = 0, key, stride;
-    uint64_t pages = 0, ram = 0;
+    uint64_t pages = 0, ram = 0, kept = 0;
     uint32_t version;
 
     bs->get_memory_map(&size, map, &key, &stride, &version);
@@ -171,11 +171,15 @@ static void measure_memory(void) {
             if (efi_is_ram(d->type)) {
                 ram += d->pages;
             }
+            if (efi_is_firmware_kept(d->type)) {
+                kept += d->pages;
+            }
         }
     }
     bs->free_pool(map);
     info.memory_kib = pages * 4;
     info.ram_kib = ram * 4;
+    info.firmware_kib = kept * 4;
 }
 
 /* ---- taking memory for the kernel ---------------------------------------- */

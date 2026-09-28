@@ -24,9 +24,6 @@
 #define PAGE_SIZE   4096
 
 static uint64_t write_protect(bool on);
-static void window_reset(void);
-static bool map_page(uint64_t addr);
-static bool loaded_flat;        /* the program is in the window, not a region */
 
 /* Linux answers a failed call with the negated error number, and a libc
    tells the two apart by the result being a small negative. -1 on its own
@@ -67,6 +64,10 @@ static uint64_t arg[6];
 static uint64_t sys_execve(uint64_t path, uint64_t argv, uint64_t envp);
 static uint64_t sys_fork(uint64_t a, uint64_t b, uint64_t c);
 static uint64_t sys_clone(uint64_t flags, uint64_t stack, uint64_t parent_tid);
+static uint64_t sys_rt_sigtimedwait(uint64_t set, uint64_t info, uint64_t timeout);
+static uint64_t sys_timer_create(uint64_t clock, uint64_t event, uint64_t id);
+static uint64_t sys_timer_settime(uint64_t id, uint64_t flags, uint64_t spec);
+static uint64_t sys_timer_gettime(uint64_t id, uint64_t spec, uint64_t c);
 static uint64_t sys_wait4(uint64_t pid, uint64_t status, uint64_t options);
 static uint64_t sys_pipe(uint64_t out, uint64_t b, uint64_t c);
 static uint64_t sys_pipe2(uint64_t out, uint64_t flags, uint64_t c);
@@ -79,11 +80,6 @@ static uint64_t fs_errno(int err);
 /* What the loaded program turned out to be, for the auxiliary vector its
    libc reads off the stack. */
 static uint64_t started_base;   /* where the loader went, 0 without one */
-/* Whether what was loaded is a raw image rather than an ELF. One of those is
-   this machine's own, and everything it has - its code, its heap, its stack -
-   fits the fixed window; the big region is for what a Linux program needs,
-   and a program that stays in the window is a program the kernel can put
-   aside and give back, which is what lets the shell start another. */
 static uint64_t started_phdr, started_entry;
 static uint64_t started_phent, started_phnum;
 
@@ -170,7 +166,7 @@ static struct handle {
     uint32_t writer;        /* which of the names above, one-based */
     uint32_t start;         /* first sector, or one of the marks below */
     uint32_t size;
-    uint32_t offset;        /* where we are in it; the table index, in a folder */
+    uint32_t offset;        /* where we are in it; in a folder, how far through the index */
     uint32_t folder;        /* the folder's own table entry, one-based */
 } handles[PROGRAM_FILES];
 
@@ -407,6 +403,115 @@ static uint64_t sys_write(uint64_t fd, uint64_t text, uint64_t length) {
     return write_to(handle_of(fd), text, length);
 }
 
+/* ---- time spent -----------------------------------------------------------
+ *
+ * One program runs at a time, and one that forks waits for the child to
+ * finish, so a program's time is the time since it started less the time
+ * its children ran and the time it spent waiting - for a key, or asleep. Of
+ * what is left, the time inside its syscalls and page faults is system time
+ * and the rest user time. All of it is in microseconds. */
+
+struct times {
+    uint64_t started;           /* when the program began */
+    uint64_t idle;              /* how long it waited */
+    uint64_t sys;               /* how long the kernel worked for it */
+    uint64_t children_wall;     /* how long its finished children ran */
+    uint64_t children_user, children_sys;   /* and what of it was which */
+};
+
+static struct times now_running;    /* the program running now */
+
+static uint64_t self_us(void) {
+    uint64_t took = efi_uptime_us() - now_running.started;
+    uint64_t not = now_running.children_wall + now_running.idle;
+
+    return took > not ? took - not : 0;
+}
+
+static uint64_t user_us(void) {
+    uint64_t self = self_us();
+
+    return self > now_running.sys ? self - now_running.sys : 0;
+}
+
+/* Marks the start of a wait, and then its end, which counts it idle. */
+static uint64_t wait_began(void) {
+    return efi_uptime_us();
+}
+
+static void wait_ended(uint64_t began) {
+    now_running.idle += efi_uptime_us() - began;
+}
+
+/* The same around the kernel working for a program: what it took is system
+   time, less what went on waiting or on children inside it - a fork runs a
+   whole child inside the call. */
+struct kernel_mark {
+    uint64_t at, idle, children_wall;
+};
+
+static struct kernel_mark kernel_began(void) {
+    return (struct kernel_mark){ efi_uptime_us(), now_running.idle,
+                                 now_running.children_wall };
+}
+
+static void kernel_ended(struct kernel_mark m) {
+    uint64_t took = efi_uptime_us() - m.at;
+    uint64_t not = (now_running.idle - m.idle) +
+                   (now_running.children_wall - m.children_wall);
+
+    now_running.sys += took > not ? took - not : 0;
+}
+
+/* The time of day in milliseconds. The firmware's clock counts whole
+   seconds, so it is read once and the uptime counted on from there. */
+static uint64_t realtime_ms(void) {
+    static uint64_t offset;
+
+    if (offset == 0) {
+        offset = efi_epoch() * 1000 - efi_uptime_ms();
+    }
+    return offset + efi_uptime_ms();
+}
+
+#define RUSAGE_CHILDREN (-1)
+
+static uint64_t sys_getrusage(uint64_t who, uint64_t out, uint64_t c) {
+    bool children = (int32_t)who == RUSAGE_CHILDREN;
+    uint64_t user = children ? now_running.children_user : user_us();
+    uint64_t sys = children ? now_running.children_sys : now_running.sys;
+    int64_t *usage = (int64_t *)out;
+
+    (void)c;
+    if (!user_range(out, 144)) {
+        return ERR(EFAULT);
+    }
+    memset(usage, 0, 144);
+    usage[0] = (int64_t)(user / 1000000);       /* ru_utime */
+    usage[1] = (int64_t)(user % 1000000);
+    usage[2] = (int64_t)(sys / 1000000);        /* ru_stime */
+    usage[3] = (int64_t)(sys % 1000000);
+    return 0;
+}
+
+/* In clock ticks, a hundred to the second; the answer is ticks since boot. */
+static uint64_t sys_times(uint64_t out, uint64_t b, uint64_t c) {
+    int64_t *tms = (int64_t *)out;
+
+    (void)b;
+    (void)c;
+    if (out != 0) {
+        if (!user_range(out, 32)) {
+            return ERR(EFAULT);
+        }
+        tms[0] = (int64_t)(user_us() / 10000);
+        tms[1] = (int64_t)(now_running.sys / 10000);
+        tms[2] = (int64_t)(now_running.children_user / 10000);
+        tms[3] = (int64_t)(now_running.children_sys / 10000);
+    }
+    return efi_uptime_ms() / 10;
+}
+
 /* Which of a few descriptors can be read or written without waiting.
  *
  * Every file here is ready the moment it is asked about; the console is
@@ -417,10 +522,11 @@ static uint64_t sys_write(uint64_t fd, uint64_t text, uint64_t length) {
  *
  * An fd_set is a bitmap, and every descriptor this kernel hands out is in
  * its first word, so only that word is read and written. The timeout is
- * whole seconds, the only ones the firmware's clock counts: anything
- * shorter than one is a look rather than a wait. */
+ * seconds and then fractions, per_ms of them to a millisecond: a program
+ * telling a lone Escape from the start of an arrow key waits a few tens of
+ * them, and has to be answered that quickly. */
 static uint64_t wait_ready(uint64_t nfds, uint64_t readfds, uint64_t writefds,
-                           uint64_t exceptfds, uint64_t timeout) {
+                           uint64_t exceptfds, uint64_t timeout, int64_t per_ms) {
     uint64_t want = 0, ready = 0, writable = 0, console_bits = 0;
     int64_t until = 0;
 
@@ -464,17 +570,20 @@ static uint64_t wait_ready(uint64_t nfds, uint64_t readfds, uint64_t writefds,
     if (timeout != 0) {
         const int64_t *spec = (const int64_t *)timeout;
 
-        until = efi_seconds() + spec[0] + (spec[1] > 0 ? 1 : 0);
+        until = (int64_t)efi_uptime_ms() + spec[0] * 1000 + spec[1] / per_ms;
     }
+    uint64_t began = wait_began();
+
     while (console_bits != 0 && ready == 0 && writable == 0) {
         if (console_ready()) {
             ready = console_bits;
             break;
         }
-        if (timeout != 0 && efi_seconds() >= until) {
+        if (timeout != 0 && (int64_t)efi_uptime_ms() >= until) {
             break;                  /* it waited as long as it was asked to */
         }
     }
+    wait_ended(began);
     if (readfds != 0) {
         *(uint64_t *)readfds = ready;
     }
@@ -495,7 +604,11 @@ static uint64_t wait_ready(uint64_t nfds, uint64_t readfds, uint64_t writefds,
 /* select takes a timeval and pselect6 a timespec, which are the same two
    numbers; what the second of them counts is finer than this clock. */
 static uint64_t sys_select(uint64_t nfds, uint64_t readfds, uint64_t writefds) {
-    return wait_ready(nfds, readfds, writefds, arg[3], arg[4]);
+    return wait_ready(nfds, readfds, writefds, arg[3], arg[4], 1000);
+}
+
+static uint64_t sys_pselect6(uint64_t nfds, uint64_t readfds, uint64_t writefds) {
+    return wait_ready(nfds, readfds, writefds, arg[3], arg[4], 1000000);
 }
 
 /* Reads from where the descriptor is, in the run of sectors starting at
@@ -534,7 +647,11 @@ static uint64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count) {
         return ERR(EBADF);
     }
     if (h->start == CONSOLE_MARK) {
-        return console_read((char *)buf, count);
+        uint64_t began = wait_began();      /* waiting on whoever is typing */
+        uint64_t got = console_read((char *)buf, count);
+
+        wait_ended(began);
+        return got;
     }
     if (h->start == WRITE_MARK) {
         /* Open for writing, and being read: where its sectors are has to be
@@ -823,7 +940,10 @@ static uint64_t sys_lseek(uint64_t fd, uint64_t offset, uint64_t whence) {
     int64_t base = whence == 0 ? 0 : whence == 1 ? (int64_t)h->offset : (int64_t)h->size;
     int64_t where = base + (int64_t)offset;
 
-    if (where < 0 || where > (int64_t)h->size) {
+    /* Past the end is allowed, as on Linux: a read there finds nothing, and
+       a write there leaves zeroes in between - which is how an assembler
+       lays out the sections of what it writes. */
+    if (where < 0 || where > (int64_t)UINT32_MAX) {
         return ERR(EINVAL);
     }
     h->offset = (uint32_t)where;
@@ -937,14 +1057,9 @@ static uint64_t program_map;     /* where the next mmap goes */
    program's own region where it has one, and otherwise sharing the fixed
    window with the program, the heap from the top of it and mmap from the
    far end growing down. */
-static void program_memory_start(uint64_t after) {
-    if (!loaded_flat) {
-        program_break = vm_base() + USER_BRK;
-        program_map = vm_base() + USER_MMAP;
-        return;
-    }
-    program_break = (after + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
-    program_map = PROGRAM_STACK - 0x10000;
+static void program_memory_start(void) {
+    program_break = vm_base() + USER_BRK;
+    program_map = vm_base() + USER_MMAP;
 }
 
 static uint64_t sys_brk(uint64_t addr, uint64_t b, uint64_t c) {
@@ -1323,8 +1438,10 @@ static uint64_t statfs_fill(uint64_t out) {
     stats->blocks = disk.total;
     stats->bfree = disk.total - disk.used;
     stats->bavail = stats->bfree;
-    stats->files = FS_MAX_FILES;
-    stats->ffree = FS_MAX_FILES - disk.files;
+    /* The table grows while there is disk to grow into, so free space is
+       as good a count of the files still to come as any. */
+    stats->files = disk.files + stats->bfree;
+    stats->ffree = stats->bfree;
     stats->namelen = FS_NAME_LEN - 1;
     return 0;
 }
@@ -1435,7 +1552,7 @@ static uint64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t out) {
         if (!user_range(out, sizeof *size)) {
             return ERR(EFAULT);
         }
-        size->rows = (uint16_t)(vga_pixel_height() / 16);
+        size->rows = (uint16_t)vga_height();
         size->columns = (uint16_t)vga_width();
         size->pixel_w = (uint16_t)vga_pixel_width();
         size->pixel_h = (uint16_t)vga_pixel_height();
@@ -1706,7 +1823,8 @@ static uint64_t sys_pwrite64(uint64_t fd, uint64_t text, uint64_t count) {
     return count;
 }
 
-/* poll, which is select spelled differently. Everything here is ready. */
+/* poll, which is select spelled differently: everything but the keyboard
+   is ready at once, and that is waited for as long as it is asked. */
 struct pollfd {
     int32_t  fd;
     int16_t  events, revents;
@@ -1715,14 +1833,9 @@ struct pollfd {
 #define POLLIN  0x001
 #define POLLOUT 0x004
 
-static uint64_t sys_poll(uint64_t fds, uint64_t count, uint64_t timeout) {
-    struct pollfd *p = (struct pollfd *)fds;
+static uint64_t poll_once(struct pollfd *p, uint64_t count) {
     uint64_t ready = 0;
 
-    (void)timeout;
-    if (!user_range(fds, count * sizeof *p)) {
-        return ERR(EFAULT);
-    }
     for (uint64_t i = 0; i < count; i++) {
         p[i].revents = 0;
         if (handle_of((uint64_t)p[i].fd) == NULL) {
@@ -1741,6 +1854,39 @@ static uint64_t sys_poll(uint64_t fds, uint64_t count, uint64_t timeout) {
         ready += p[i].revents != 0;
     }
     return ready;
+}
+
+/* Until something is ready, or wait_ms has gone by; a negative wait is for
+   ever. */
+static uint64_t poll_until(uint64_t fds, uint64_t count, int64_t wait_ms) {
+    struct pollfd *p = (struct pollfd *)fds;
+    int64_t until = (int64_t)efi_uptime_ms() + wait_ms;
+    uint64_t ready;
+
+    if (!user_range(fds, count * sizeof *p)) {
+        return ERR(EFAULT);
+    }
+    uint64_t began = wait_began();
+
+    while ((ready = poll_once(p, count)) == 0 &&
+           (wait_ms < 0 || (int64_t)efi_uptime_ms() < until)) {
+    }
+    wait_ended(began);
+    return ready;
+}
+
+static uint64_t sys_poll(uint64_t fds, uint64_t count, uint64_t timeout) {
+    return poll_until(fds, count, (int32_t)timeout);
+}
+
+/* ppoll's timeout is a timespec, and no timespec is for ever. */
+static uint64_t sys_ppoll(uint64_t fds, uint64_t count, uint64_t timeout) {
+    const int64_t *spec = (const int64_t *)timeout;
+
+    if (timeout != 0 && !user_range(timeout, 16)) {
+        return ERR(EFAULT);
+    }
+    return poll_until(fds, count, timeout == 0 ? -1 : spec[0] * 1000 + spec[1] / 1000000);
 }
 
 static uint64_t sys_getrandom(uint64_t buf, uint64_t length, uint64_t flags) {
@@ -1791,7 +1937,7 @@ static uint64_t sys_prlimit64(uint64_t pid, uint64_t resource, uint64_t new_limi
            of the way puts it just under this, and one told it may have
            millions would ask for a descriptor this kernel has no room for. */
         old[0] = resource == RLIMIT_NOFILE ? PROGRAM_FILES
-               : loaded_flat ? PROGRAM_BYTES : USER_STACK_BYTES;
+               : USER_STACK_BYTES;
         old[1] = (uint64_t)-1;      /* RLIM64_INFINITY */
     }
     return 0;
@@ -2258,15 +2404,13 @@ static uint64_t sys_getdents64(uint64_t fd, uint64_t buf, uint64_t count) {
     } else if (fs_file(h->folder - 1, &folder) != 0) {
         return ERR(EBADF);
     }
-    while (h->offset < FS_MAX_FILES) {
-        size_t index = h->offset;
-        const char *leaf;
+    for (;;) {
+        size_t next = h->offset, index;
 
-        if (fs_file(index, &entry) != 0 ||
-            (leaf = fs_inside(folder.name, entry.name)) == NULL) {
-            h->offset++;
-            continue;
+        if (fs_list(folder.name, &next, &entry, &index) != 0) {
+            break;
         }
+        const char *leaf = fs_inside(folder.name, entry.name);
         size_t length = strlen(leaf);
         bool is_folder = leaf[length - 1] == '/';
         uint64_t reclen = (sizeof(struct dirent64) + length + 1 + 7) & ~7ull;
@@ -2276,14 +2420,14 @@ static uint64_t sys_getdents64(uint64_t fd, uint64_t buf, uint64_t count) {
         }
         struct dirent64 *out = (struct dirent64 *)(buf + used);
         out->ino = is_folder ? folder_ino((unsigned)index + 1) : entry.start;
-        out->off = (int64_t)(index + 1);
+        out->off = (int64_t)next;
         out->reclen = (uint16_t)reclen;
         out->type = is_folder ? DT_DIR : (entry.size & FS_LINK) != 0 ? DT_LNK : DT_REG;
         memcpy(out->name, leaf, length);
         out->name[is_folder ? length - 1 : length] = '\0';
 
         used += reclen;
-        h->offset++;
+        h->offset = (uint32_t)next;
     }
     return used;
 }
@@ -2345,8 +2489,6 @@ static uint64_t sys_uname(uint64_t out, uint64_t b, uint64_t c) {
    count from 1970. Seconds is all the firmware's clock offers either way,
    except for the monotonic ones, where the loader's own millisecond count
    can do better. */
-#define CLOCK_MONOTONIC     1
-#define CLOCK_MONOTONIC_RAW 4
 
 static uint64_t sys_clock_gettime(uint64_t clock, uint64_t out, uint64_t c) {
     int64_t *spec = (int64_t *)out;
@@ -2355,15 +2497,15 @@ static uint64_t sys_clock_gettime(uint64_t clock, uint64_t out, uint64_t c) {
     if (!user_range(out, 16)) {
         return ERR(EFAULT);
     }
-    if (clock == CLOCK_MONOTONIC || clock == CLOCK_MONOTONIC_RAW) {
-        uint64_t ms = efi_uptime_ms();
+    /* The realtime ones - REALTIME, its coarse twin, TAI - count from 1970;
+       the CPU-time ones, what the program has used; the rest - MONOTONIC,
+       BOOTTIME and their variants - from boot. */
+    uint64_t ms = clock == 0 || clock == 5 || clock == 11 ? realtime_ms()
+                : clock == 2 || clock == 3 ? self_us() / 1000
+                : efi_uptime_ms();
 
-        spec[0] = (int64_t)(ms / 1000);
-        spec[1] = (int64_t)(ms % 1000) * 1000000;
-        return 0;
-    }
-    spec[0] = (int64_t)efi_epoch();
-    spec[1] = 0;
+    spec[0] = (int64_t)(ms / 1000);
+    spec[1] = (int64_t)(ms % 1000) * 1000000;
     return 0;
 }
 
@@ -2381,13 +2523,69 @@ static uint64_t sys_gettimeofday(uint64_t tv, uint64_t tz, uint64_t c) {
     if (!user_range(tv, 16)) {
         return ERR(EFAULT);
     }
-    out[0] = (int64_t)efi_epoch();
-    out[1] = 0;
+    uint64_t ms = realtime_ms();
+
+    out[0] = (int64_t)(ms / 1000);
+    out[1] = (int64_t)(ms % 1000) * 1000;
+    return 0;
+}
+
+/* Waits until the clock reaches until_ms. There is nothing else to run, so
+   the waiting is the whole of it. */
+static void sleep_until(uint64_t until_ms) {
+    uint64_t began = wait_began();
+
+    while (efi_uptime_ms() < until_ms) {
+        __asm__ volatile("pause");
+    }
+    wait_ended(began);
+}
+
+static uint64_t timespec_ms(uint64_t spec) {
+    const int64_t *t = (const int64_t *)spec;
+
+    return (uint64_t)t[0] * 1000 + (uint64_t)(t[1] + 999999) / 1000000;
+}
+
+static uint64_t sys_nanosleep(uint64_t req, uint64_t rem, uint64_t c) {
+    (void)c;
+    if (!user_range(req, 16) || (rem != 0 && !user_range(rem, 16))) {
+        return ERR(EFAULT);
+    }
+    sleep_until(efi_uptime_ms() + timespec_ms(req));
+    if (rem != 0) {
+        memset((void *)rem, 0, 16);
+    }
+    return 0;
+}
+
+#define TIMER_ABSTIME 1
+
+/* The same, on a named clock, and with TIMER_ABSTIME until a time on it
+   rather than for a while. */
+static uint64_t sys_clock_nanosleep(uint64_t clock, uint64_t flags, uint64_t req) {
+    uint64_t rem = arg[3];
+    uint64_t want;
+
+    if (!user_range(req, 16) || (rem != 0 && !user_range(rem, 16))) {
+        return ERR(EFAULT);
+    }
+    want = timespec_ms(req);
+    if (flags & TIMER_ABSTIME) {
+        uint64_t now = clock == 0 || clock == 5 || clock == 11 ? realtime_ms()
+                     : efi_uptime_ms();
+
+        want = want > now ? want - now : 0;
+    }
+    sleep_until(efi_uptime_ms() + want);
+    if (rem != 0) {
+        memset((void *)rem, 0, 16);
+    }
     return 0;
 }
 
 static uint64_t sys_time(uint64_t out, uint64_t b, uint64_t c) {
-    int64_t now = (int64_t)efi_epoch();
+    int64_t now = (int64_t)(realtime_ms() / 1000);
 
     (void)b;
     (void)c;
@@ -2572,8 +2770,8 @@ void syscall_init(void) {
     syscall_register(SYS_SYSINFO, sys_sysinfo);
     syscall_register(SYS_SCHED_YIELD, sys_ok);
     syscall_register(SYS_MADVISE, sys_ok);
-    syscall_register(SYS_GETRUSAGE, sys_zeroed);
-    syscall_register(SYS_TIMES, sys_zeroed);
+    syscall_register(SYS_GETRUSAGE, sys_getrusage);
+    syscall_register(SYS_TIMES, sys_times);
     syscall_register(SYS_UTIMENSAT, sys_ok);
     syscall_register(SYS_UTIMES, sys_ok);
     syscall_register(SYS_FUTIMESAT, sys_ok);
@@ -2588,7 +2786,7 @@ void syscall_init(void) {
     syscall_register(SYS_FDATASYNC, sys_ok);
     syscall_register(SYS_SYNC, sys_ok);
     syscall_register(SYS_FADVISE64, sys_ok);
-    syscall_register(SYS_CLOCK_NANOSLEEP, sys_ok);
+    syscall_register(SYS_CLOCK_NANOSLEEP, sys_clock_nanosleep);
     syscall_register(SYS_RT_SIGSUSPEND, sys_ok);
     syscall_register(SYS_KILL, sys_ok);
     syscall_register(SYS_TGKILL, sys_ok);
@@ -2622,7 +2820,7 @@ void syscall_init(void) {
     syscall_register(SYS_GETEGID, sys_root);
     syscall_register(SYS_RT_SIGACTION, sys_ok);
     syscall_register(SYS_RT_SIGPROCMASK, sys_ok);
-    syscall_register(SYS_NANOSLEEP, sys_ok);
+    syscall_register(SYS_NANOSLEEP, sys_nanosleep);
     syscall_register(SYS_EXIT, sys_exit);
     syscall_register(SYS_EXIT_GROUP, sys_exit);
     syscall_register(SYS_OPENAT, sys_openat);
@@ -2648,10 +2846,16 @@ void syscall_init(void) {
     syscall_register(SYS_GETRESUID, sys_getresuid);
     syscall_register(SYS_GETRESGID, sys_getresuid);
     syscall_register(SYS_SELECT, sys_select);
-    syscall_register(SYS_PSELECT6, sys_select);
+    syscall_register(SYS_PSELECT6, sys_pselect6);
     syscall_register(SYS_FORK, sys_fork);
     syscall_register(SYS_VFORK, sys_fork);
     syscall_register(SYS_CLONE, sys_clone);
+    syscall_register(SYS_RT_SIGTIMEDWAIT, sys_rt_sigtimedwait);
+    syscall_register(SYS_TIMER_CREATE, sys_timer_create);
+    syscall_register(SYS_TIMER_SETTIME, sys_timer_settime);
+    syscall_register(SYS_TIMER_GETTIME, sys_timer_gettime);
+    syscall_register(SYS_TIMER_GETOVERRUN, sys_ok);
+    syscall_register(SYS_TIMER_DELETE, sys_ok);
     syscall_register(SYS_EXECVE, sys_execve);
     syscall_register(SYS_WAIT4, sys_wait4);
     syscall_register(SYS_PIPE, sys_pipe);
@@ -2671,7 +2875,7 @@ void syscall_init(void) {
     syscall_register(SYS_READV, sys_readv);
     syscall_register(SYS_PWRITE64, sys_pwrite64);
     syscall_register(SYS_POLL, sys_poll);
-    syscall_register(SYS_PPOLL, sys_poll);
+    syscall_register(SYS_PPOLL, sys_ppoll);
     syscall_register(SYS_FSTATFS, sys_fstatfs);
     syscall_register(SYS_GETRLIMIT, sys_getrlimit);
     syscall_register(SYS_SETRLIMIT, sys_ok);
@@ -2744,7 +2948,10 @@ uint64_t syscall_dispatch(uint64_t a, uint64_t b, uint64_t c,
     syscall_fn handler = handler_for(number);
 
     if (handler != NULL) {
+        struct kernel_mark mark = kernel_began();
+
         result = handler(a, b, c);
+        kernel_ended(mark);
     }
 
     /* SYS_EXIT does not come back, and neither does a program killed
@@ -2760,59 +2967,9 @@ uint64_t syscall_dispatch(uint64_t a, uint64_t b, uint64_t c,
  * touched and handed back the moment the program ends. An idle machine holds
  * none of it.
  *
- * There is a second arrangement as well, for the one thing a region cannot
- * do. A program linked to run at a fixed address - a flat binary written for
- * this machine, or a static Linux executable, both of which land at 0x400000 -
- * has to be at that address, and a region begins half a terabyte up. So the
- * old fixed window is still here: two megabytes at PROGRAM_BASE, with a page
- * table of its own hung off the tables the firmware already built, bought a
- * page at a time as the program touches it.
- *
- * A program in the window cannot fork: there is one window, so there would be
- * nothing to put the parent's copy in. Nothing in it wants to - they are the
- * small fixed-address programs - and fork tells them so. */
-
-#define PAGE_2MIB    0x200000
-#define PAGE_PRESENT 0x01
-#define PAGE_WRITE   0x02
-#define PAGE_USER    0x04
-#define PAGE_BIG     0x80
-#define PAGE_ADDR    0x000FFFFFFFFFF000ull
-#define PAGE_USER_RW (PAGE_PRESENT | PAGE_WRITE | PAGE_USER)
-
-#define WINDOW_PAGES (PROGRAM_BYTES / PAGE_SIZE)
-
-/* The window's page table, and the page directory that has to be split to
-   hang it off the firmware's. Both are bought from the firmware the first
-   time something needs the window rather than kept in the kernel: every
-   program here is position-independent and gets a region instead, so on most
-   machines they are never bought at all. */
-static uint64_t *program_pt;
-static uint64_t *split_pd;      /* only if the firmware used a huge page */
-static bool      window_tried;
-static unsigned  window_pages;  /* how many are out on loan right now */
-
-/* The tables that are the machine's rather than any program's: the fixed
-   window's, which stay until the machine is switched off. The tables
-   describing a region come and go with the program they describe, so they
-   are counted as the program's - which is what keeps what the machine costs
-   the same figure whoever asks and whatever is running. */
-size_t program_tables(void) {
-    return (program_pt != NULL ? PAGE_SIZE : 0) + (split_pd != NULL ? PAGE_SIZE : 0);
-}
-
-size_t program_memory(void) {
-    return (size_t)window_pages * PAGE_SIZE + vm_memory() + vm_tables();
-}
-
-
-static uint64_t *table_at(uint64_t entry) {
-    return (uint64_t *)(entry & PAGE_ADDR);
-}
-
-static void flush_tlb(void) {
-    __asm__ volatile("mov %%cr3, %%rax\n\tmov %%rax, %%cr3" : : : "rax", "memory");
-}
+ * A program linked to run at a fixed address - 0x400000, where a plain `ld`
+ * puts things - gets low memory as well, for its own image; the rest of it,
+ * the loader, the heap and the stack, is in its region like anyone's. */
 
 /* The firmware write-protects its own page tables and its own descriptors -
    CR0.WP, which makes even ring 0 respect a read-only page - so editing one
@@ -2825,112 +2982,17 @@ static uint64_t write_protect(bool on) {
     return cr0;
 }
 
-/* Gives the window a page table of its own inside the tables the firmware
-   built, leaving every other mapping exactly as it was. */
-static void window_map(void) {
-    uint64_t cr3;
-    uint64_t *pml4, *pdpt, *pd;
-    uint64_t table = 0;
-
-    if (window_tried) {
-        return;
-    }
-    window_tried = true;
-    if ((table = mem_pages(1)) == 0) {
-        return;
-    }
-    memset((void *)table, 0, PAGE_SIZE);
-    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
-    pml4 = (uint64_t *)(cr3 & PAGE_ADDR);
-    if (!(pml4[0] & PAGE_PRESENT)) {
-        return;
-    }
-    uint64_t cr0 = write_protect(false);
-
-    pml4[0] |= PAGE_USER;           /* ring 3 has to be let through at every level */
-
-    pdpt = table_at(pml4[0]);
-    if (!(pdpt[0] & PAGE_PRESENT)) {
-        __asm__ volatile("mov %0, %%cr0" : : "r"(cr0) : "memory");
-        return;
-    }
-    if (pdpt[0] & PAGE_BIG) {
-        /* The firmware mapped the first gigabyte as a single page. Split it
-           into two-megabyte ones so that two of those megabytes can be given
-           a table of four-kilobyte pages. The page directory that takes is
-           bought from the firmware, since most firmware never needs it. */
-        uint64_t base = pdpt[0] & PAGE_ADDR;
-        uint64_t flags = pdpt[0] & 0xFFF;
-        uint64_t at = 0;
-
-        if ((at = mem_pages(1)) == 0) {
-            __asm__ volatile("mov %0, %%cr0" : : "r"(cr0) : "memory");
-            return;
-        }
-        split_pd = (uint64_t *)at;
-        for (unsigned i = 0; i < PAGE_SIZE / 8; i++) {
-            split_pd[i] = (base + (uint64_t)i * PAGE_2MIB) | flags;
-        }
-        pdpt[0] = at | PAGE_PRESENT | PAGE_WRITE;
-    }
-    pdpt[0] |= PAGE_USER;
-
-    pd = table_at(pdpt[0]);
-    pd[PROGRAM_BASE / PAGE_2MIB] = table | PAGE_USER_RW;
-
-    __asm__ volatile("mov %0, %%cr0" : : "r"(cr0) : "memory");
-    flush_tlb();
-    program_pt = (uint64_t *)table;
+/* The tables that are the machine's rather than any program's: what low
+   memory has cost, which stays until the machine is switched off. The tables
+   describing a region come and go with the program they describe, so they
+   are counted as the program's - which is what keeps what the machine costs
+   the same figure whoever asks and whatever is running. */
+size_t program_tables(void) {
+    return vm_fixed_tables();
 }
 
-/* Empties the window, handing every page it borrowed back to the firmware. */
-static void window_reset(void) {
-    if (program_pt == NULL) {
-        return;
-    }
-    for (unsigned i = 0; i < WINDOW_PAGES; i++) {
-        if (program_pt[i] != 0) {
-            uint64_t at = program_pt[i] & PAGE_ADDR;
-
-            if (at >= PROGRAM_BASE && at < PROGRAM_STACK) {
-                mem_window_give(at);
-            } else {
-                mem_pages_free(at, 1);
-            }
-            program_pt[i] = 0;
-        }
-    }
-    window_pages = 0;
-    flush_tlb();
-}
-
-/* Lets ring 3 have the window page holding addr, buying it if this is the
-   first touch. The page is zeroed as it is handed over, so
-   nothing of whatever used it last shows through. */
-static bool map_page(uint64_t addr) {
-    uint64_t page = addr & ~(uint64_t)(PAGE_SIZE - 1);
-    uint64_t at = page;
-    uint64_t *entry;
-
-    window_map();                   /* the first time anything wants it */
-    if (program_pt == NULL) {
-        return false;
-    }
-    entry = &program_pt[(page - PROGRAM_BASE) / PAGE_SIZE];
-    if (*entry == 0) {
-        /* At this exact address where it is free, so that the window maps
-           one to one; where something else has it - the firmware's leftovers,
-           on a small machine - any page will do, the window's own table
-           saying where it is. */
-        if (!mem_window_take(page) && (at = mem_pages(1)) == 0) {
-            return false;
-        }
-        *entry = at | PAGE_USER_RW;
-        window_pages++;
-        __asm__ volatile("invlpg (%0)" : : "r"(page) : "memory");
-        memset((void *)page, 0, PAGE_SIZE);
-    }
-    return true;
+size_t program_memory(void) {
+    return vm_memory() + vm_tables();
 }
 
 /* Called by a trap stub with the vector that fired, just before the program
@@ -2960,10 +3022,12 @@ void trap_report(unsigned vector, const uint64_t *frame) {
 
 /* Called by page_fault_entry with the address that faulted, and where from. */
 void page_fault(uint64_t addr, uint64_t rip) {
+    struct kernel_mark mark = kernel_began();
+
     /* Something promised to a mapping comes first: the page is not merely
        empty, it has a stretch of a file that belongs in it. */
-    if (map_fill(addr) || vm_fault(addr) ||
-        (addr >= PROGRAM_BASE && addr < PROGRAM_STACK && map_page(addr))) {
+    if (map_fill(addr) || vm_fault(addr)) {
+        kernel_ended(mark);
         return;
     }
     dbg("fault at %x from %x: killed\n", addr, rip);
@@ -3054,27 +3118,14 @@ static int read_at(const struct fs_file *file, uint64_t offset, void *dest, uint
 }
 
 /* True if addr .. addr + size is room a program may load into or start at:
-   its own region, or the fixed window for one linked to run at a fixed
-   address. */
+   its own region, or the low memory given one linked to a fixed address. */
 static bool fits(uint64_t addr, uint64_t size) {
-    if (vm_holds(addr, size)) {
-        return true;
-    }
-    return addr >= PROGRAM_BASE && addr <= PROGRAM_STACK && size <= PROGRAM_STACK - addr;
+    return vm_holds(addr, size);
 }
 
-/* Makes the pages under addr .. addr + size real, wherever they are. */
+/* Makes the pages under addr .. addr + size real. */
 static bool claim(uint64_t addr, uint64_t size) {
-    if (vm_holds(addr, size)) {
-        return vm_reserve(addr, size);
-    }
-    for (uint64_t page = addr & ~(uint64_t)(PAGE_SIZE - 1); page < addr + size;
-         page += PAGE_SIZE) {
-        if (!map_page(page)) {
-            return false;
-        }
-    }
-    return true;
+    return vm_reserve(addr, size);
 }
 
 /* Maps the pages under vaddr .. vaddr + size and fills them from offset in
@@ -3097,9 +3148,30 @@ static int load_segment(const struct fs_file *file, uint64_t offset, uint64_t va
     return file_size > 0 ? read_at(file, offset, (void *)vaddr, file_size) : 0;
 }
 
-/* The highest address anything loaded reached, so that the heap can start
-   clear of it. */
-static uint64_t loaded_end;
+/* Where the loadable segments of one linked to a fixed address begin and
+   end: what it needs of low memory. False if it has none. */
+static bool elf_span(const struct fs_file *file, const struct elf_header *header,
+                     uint64_t *low, uint64_t *high) {
+    struct elf_program program;
+
+    *low = (uint64_t)-1;
+    *high = 0;
+    for (unsigned i = 0; i < header->phnum; i++) {
+        if (read_at(file, header->phoff + (uint64_t)i * header->phentsize,
+                    &program, sizeof program) != 0) {
+            return false;
+        }
+        if (program.type == PT_LOAD && program.memsz != 0) {
+            if (program.vaddr < *low) {
+                *low = program.vaddr;
+            }
+            if (program.vaddr + program.memsz > *high) {
+                *high = program.vaddr + program.memsz;
+            }
+        }
+    }
+    return *high > *low;
+}
 
 /* Loads one ELF - the program, or the loader it asks for - shifted by bias,
    which is 0 for something linked to run at a fixed address. Reports where
@@ -3158,9 +3230,6 @@ static int load_elf_at(const struct fs_file *file, const struct elf_header *head
             header->phoff < program.offset + program.filesz) {
             *phdr = bias + program.vaddr + (header->phoff - program.offset);
         }
-        if (bias + program.vaddr + program.memsz > loaded_end) {
-            loaded_end = bias + program.vaddr + program.memsz;
-        }
     }
     *entry = bias + header->entry;
     return 0;
@@ -3189,10 +3258,7 @@ int program_load(const struct fs_file *file, uint64_t *entry) {
     interp[0] = '\0';
     dbg("load: %s size %u\n", file->name, (uint64_t)file->size);
     memset(mappings, 0, sizeof mappings);   /* nothing of the last one is owed */
-    window_reset();
     vm_reset();
-    loaded_end = PROGRAM_BASE;
-    loaded_flat = true;
     started_base = 0;
     started_phdr = started_phent = started_phnum = 0;
 
@@ -3204,14 +3270,20 @@ int program_load(const struct fs_file *file, uint64_t *entry) {
         goto done;
     }
     uint64_t bias = header.type == ET_DYN ? vm_base() + USER_EXEC : 0;
+    uint64_t low, high;
 
-    /* Something linked to run at a fixed address goes there, in the
-       window; anything position-independent goes in a region. */
-    if (header.type == ET_DYN && vm_base() == 0) {
+    /* Something linked to run at a fixed address goes there, in low memory;
+       anything position-independent goes in its region. */
+    if (vm_base() == 0) {
         err = PROGRAM_EINVAL;
         goto done;
     }
-    loaded_flat = header.type != ET_DYN;
+    if (header.type == ET_EXEC &&
+        (!elf_span(file, &header, &low, &high) || !vm_low(low, high))) {
+        dbg("load: no low memory for %x..%x\n", low, high);
+        err = FS_ENOSPC;
+        goto done;
+    }
     err = load_elf_at(file, &header, bias, entry, &started_phdr,
                       interp, FS_NAME_LEN);
     if (err < 0) {
@@ -3239,7 +3311,7 @@ int program_load(const struct fs_file *file, uint64_t *entry) {
         }
     }
     if (err == 0) {
-        program_memory_start(loaded_end);
+        program_memory_start();
     }
 done:
     mem_free(w);
@@ -3294,8 +3366,7 @@ struct stack_work {
 static uint64_t build_stack(unsigned argc, const char *const *argv,
                             unsigned envc, const char *const *envv) {
     struct stack_work *work = NULL;
-    bool big = !loaded_flat;
-    uint64_t top = big ? vm_base() + USER_STACK : PROGRAM_STACK;
+    uint64_t top = vm_base() + USER_STACK;
     uint64_t random_at, rsp;
     uint64_t *out;
     unsigned n = 0, count = 0;
@@ -3304,7 +3375,7 @@ static uint64_t build_stack(unsigned argc, const char *const *argv,
        touched, like every other page of a region - most programs use a few
        of the sixty-four, and buying them all up front was a quarter of a
        megabyte each program had whether it wanted it or not. */
-    if (big && !vm_holds(top - USER_STACK_BYTES, USER_STACK_BYTES)) {
+    if (!vm_holds(top - USER_STACK_BYTES, USER_STACK_BYTES)) {
         return 0;
     }
     if ((work = mem_alloc(sizeof *work)) == NULL) {
@@ -3397,6 +3468,7 @@ int program_run(uint64_t entry, unsigned argc, const char *const *argv,
     if (fresh) {
         handles_reset();
         console_reset();
+        now_running = (struct times){ .started = efi_uptime_us() };
     }
 
     dbg("run: entry %x rsp %x phdr %x base %x\n", entry, rsp, started_phdr,
@@ -3421,7 +3493,6 @@ int program_run(uint64_t entry, unsigned argc, const char *const *argv,
 
     /* Every page it was lent goes back now rather than at the next program:
        an idle machine should be holding nothing on its behalf. */
-    window_reset();
     vm_reset();
     return code;
 }
@@ -3479,7 +3550,7 @@ struct saved {
     char      cwd[FS_NAME_LEN + 1];
     uint64_t  brk, map;
     uint64_t  fs_base;      /* where its libc keeps its thread's own data */
-    bool      flat;         /* whether it is the one in the fixed window */
+    struct times times;     /* its time, while a child runs */
     struct mapping maps[MAPPINGS];  /* what its mmaps still owe it */
 };
 
@@ -3592,7 +3663,8 @@ static struct saved *context_save(void) {
        program being started sets FS to its own. Putting this back is what
        lets the one underneath find its own again. */
     s->fs_base = rdmsr(MSR_FS_BASE);
-    s->flat = loaded_flat;
+    s->times = now_running;
+    now_running = (struct times){ .started = efi_uptime_us() };  /* the child's */
     memcpy(s->maps, mappings, sizeof mappings);
     pipes_hold(1);                  /* it still holds its ends of them */
     return s;
@@ -3607,7 +3679,16 @@ static void context_restore(struct saved *s) {
     program_break = s->brk;
     program_map = s->map;
     wrmsr(MSR_FS_BASE, s->fs_base);
-    loaded_flat = s->flat;
+    /* All the child ran, its own children included, is the parent's
+       children's; what of it was CPU time is their CPU time. */
+    struct times child = now_running;
+    uint64_t wall = efi_uptime_us() - child.started;
+    uint64_t user = user_us();
+
+    now_running = s->times;
+    now_running.children_wall += wall;
+    now_running.children_user += user + child.children_user;
+    now_running.children_sys += child.sys + child.children_sys;
     memcpy(mappings, s->maps, sizeof mappings);
     mem_free(s);
 }
@@ -3626,15 +3707,23 @@ struct user_regs {
 extern struct user_regs *user_frame;
 extern int user_resume(const struct user_regs *regs, uint64_t rax);
 
+static uint64_t fork_on(uint64_t stack);
+
 static uint64_t sys_fork(uint64_t a, uint64_t b, uint64_t c) {
+    (void)a;
+    (void)b;
+    (void)c;
+    return fork_on(0);
+}
+
+/* A fork whose child starts on stack, if that is not 0: what vfork and
+   posix_spawn ask for, the child running on memory its parent set aside. */
+static uint64_t fork_on(uint64_t stack) {
     struct user_regs *child = NULL;
     struct saved *state;
     unsigned was_level = vm_level();
     int pid, code;
 
-    (void)a;
-    (void)b;
-    (void)c;
     /* A program starting a program starting a program is a stack of syscalls
        inside each other, and all of them are on the kernel's own stack. How
        much each costs depends on what they do, so the room left is measured
@@ -3646,11 +3735,6 @@ static uint64_t sys_fork(uint64_t a, uint64_t b, uint64_t c) {
         (uintptr_t)&state - (uintptr_t)stack_bottom < STACK_MARGIN) {
         return ERR(EAGAIN);
     }
-    if (loaded_flat) {
-        /* There is one window, so there is nowhere to put the parent's copy
-           of it. Nothing that runs there wants to fork. */
-        return ERR(ENOSYS);
-    }
     /* The child's registers are borrowed rather than kept on the kernel
        stack: the child runs inside this call, and everything it does is
        nested inside it. */
@@ -3658,6 +3742,9 @@ static uint64_t sys_fork(uint64_t a, uint64_t b, uint64_t c) {
         return ERR(ENOMEM);
     }
     *child = *user_frame;
+    if (stack != 0) {
+        child->rsp = stack;
+    }
     if ((state = context_save()) == NULL) {
         mem_free(child);
         return ERR(ENOMEM);
@@ -3684,19 +3771,136 @@ static uint64_t sys_fork(uint64_t a, uint64_t b, uint64_t c) {
     return (uint64_t)pid;
 }
 
-/* glibc's fork is a clone, and so is anything else that starts a process.
-   The flags that would make it a thread are refused - there is one of those
-   here and there always will be - and the rest is a fork. */
-#define CLONE_VM     0x00000100
-#define CLONE_THREAD 0x00010000
+/* glibc's fork is a clone, and so is anything else that starts a process -
+   or a thread. There is no scheduler, so a thread is run the way a forked
+   child is: there and then, on its own stack and in the same memory, until
+   it ends, and pthread_join finds it finished. One that sits down to wait for
+   a signal for ever - glibc's timer helper does - is left parked there
+   instead, and never runs again; its parent is told it started, which it
+   did. */
+#define CLONE_VM             0x00000100
+#define CLONE_VFORK          0x00004000     /* a fork that shares until execve */
+#define CLONE_THREAD         0x00010000
+#define CLONE_SETTLS         0x00080000
+#define CLONE_PARENT_SETTID  0x00100000
+#define CLONE_CHILD_CLEARTID 0x00200000
+
+static unsigned threads;        /* threads being run inside their clone */
+static bool     parking;        /* the one running is waiting for ever */
+
+static uint64_t start_thread(uint64_t flags, uint64_t stack, uint64_t parent_tid) {
+    uint64_t child_tid = arg[3], tls = arg[4];
+    uint64_t fs = rdmsr(MSR_FS_BASE);
+    struct user_regs *regs;
+    bool parked;
+    int tid;
+
+    if (nest >= NEST_DEPTH ||
+        (uintptr_t)&regs - (uintptr_t)stack_bottom < STACK_MARGIN) {
+        return ERR(EAGAIN);
+    }
+    if (((flags & CLONE_PARENT_SETTID) && !user_range(parent_tid, 4)) ||
+        ((flags & CLONE_CHILD_CLEARTID) && !user_range(child_tid, 4))) {
+        return ERR(EFAULT);
+    }
+    if ((regs = mem_alloc(sizeof *regs)) == NULL) {
+        return ERR(ENOMEM);
+    }
+    *regs = *user_frame;            /* from this syscall, on its own stack */
+    regs->rsp = stack;
+    tid = ++last_pid;
+    if (flags & CLONE_PARENT_SETTID) {
+        *(int32_t *)parent_tid = tid;
+    }
+    if (flags & CLONE_SETTLS) {
+        wrmsr(MSR_FS_BASE, tls);
+    }
+    nest++;
+    threads++;
+    user_resume(regs, 0);
+    threads--;
+    nest--;
+    parked = parking;
+    parking = false;
+    mem_free(regs);
+    wrmsr(MSR_FS_BASE, fs);
+
+    /* Ended, so whoever joins it is told; a parked one is still there. */
+    if ((flags & CLONE_CHILD_CLEARTID) && !parked) {
+        *(int32_t *)child_tid = 0;
+    }
+    return (uint64_t)tid;
+}
 
 static uint64_t sys_clone(uint64_t flags, uint64_t stack, uint64_t parent_tid) {
-    (void)stack;
-    (void)parent_tid;
+    /* vfork, and posix_spawn built on it, share memory only until the child
+       starts a program - which a fork, run to the end and then undone, is
+       the same as from where the parent stands. */
+    if ((flags & CLONE_VFORK) && !(flags & CLONE_THREAD)) {
+        return fork_on(stack);
+    }
     if (flags & (CLONE_VM | CLONE_THREAD)) {
-        return ERR(ENOSYS);
+        return start_thread(flags, stack, parent_tid);
     }
     return sys_fork(0, 0, 0);
+}
+
+/* Waiting for a signal. Nothing can send one, so a thread doing it is
+   parked for good; the program itself is told the wait timed out. */
+static uint64_t sys_rt_sigtimedwait(uint64_t set, uint64_t info, uint64_t timeout) {
+    (void)set;
+    (void)info;
+    (void)timeout;
+    if (threads > 0) {
+        parking = true;
+        user_exit(0);
+    }
+    return ERR(EAGAIN);
+}
+
+/* ---- timers ---------------------------------------------------------------
+ *
+ * Nothing can interrupt a running program to say its time is up, so a timer
+ * is taken and never goes off: a program that sets one to cut a slow job
+ * short - vim, for a regex that is taking too long - carries on as it would
+ * on a machine fast enough never to need it. */
+
+static uint64_t sys_timer_create(uint64_t clock, uint64_t event, uint64_t id) {
+    static int32_t next;
+
+    (void)clock;
+    (void)event;
+    if (!user_range(id, 4)) {
+        return ERR(EFAULT);
+    }
+    *(int32_t *)id = next++;
+    return 0;
+}
+
+/* timer_settime's old value, or timer_gettime's: never running. */
+static uint64_t sys_timer_settime(uint64_t id, uint64_t flags, uint64_t spec) {
+    uint64_t old = arg[3];
+
+    (void)id;
+    (void)flags;
+    (void)spec;
+    if (old != 0) {
+        if (!user_range(old, 32)) {
+            return ERR(EFAULT);
+        }
+        memset((void *)old, 0, 32);
+    }
+    return 0;
+}
+
+static uint64_t sys_timer_gettime(uint64_t id, uint64_t spec, uint64_t c) {
+    (void)id;
+    (void)c;
+    if (!user_range(spec, 32)) {
+        return ERR(EFAULT);
+    }
+    memset((void *)spec, 0, 32);
+    return 0;
 }
 
 /* Copies a program's argument or environment list out of its memory, since
@@ -3797,6 +4001,52 @@ static bool shebang(const struct fs_file *file, char *out, size_t max,
     }
     out[n] = '\0';                  /* the end of the line, either way */
     return **interp != '\0';
+}
+
+/* Starts the program at path from the kernel itself - what the shell does -
+   with a clean terminal and the machine's environment. A script that begins
+   with "#!" is handed to the program it names, as execve would. Returns its
+   exit code, or a negative FS_E* or PROGRAM_E* code if it could not start. */
+int program_start(const char *path, unsigned argc, const char *const *argv) {
+    struct {
+        char        line[FS_NAME_LEN * 2];
+        const char *words[EXEC_ARGS + 3];
+    } *w = mem_alloc(sizeof *w);
+    const char *interp, *extra;
+    struct fs_file file;
+    uint64_t entry;
+    unsigned n = 0;
+    int err;
+
+    if (w == NULL) {
+        return FS_ENOSPC;
+    }
+    if ((err = fs_stat(path, &file)) == 0 &&
+        shebang(&file, w->line, sizeof w->line, &interp, &extra)) {
+        w->words[n++] = interp;
+        if (extra != NULL) {
+            w->words[n++] = extra;
+        }
+        w->words[n++] = path;
+        for (unsigned i = 1; i < argc && n < EXEC_ARGS; i++) {
+            w->words[n++] = argv[i];
+        }
+        w->words[n] = NULL;
+        argv = w->words;
+        argc = n;
+        err = fs_stat(interp, &file);
+    }
+    if (err == 0 && file.size == 0) {
+        err = PROGRAM_EINVAL;
+    }
+    if (err == 0) {
+        err = program_load(&file, &entry);
+    }
+    if (err == 0) {
+        err = program_run(entry, argc, argv, 0, NULL, true);
+    }
+    mem_free(w);
+    return err;
 }
 
 static uint64_t sys_execve(uint64_t path, uint64_t argv, uint64_t envp) {

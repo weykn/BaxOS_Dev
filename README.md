@@ -22,7 +22,7 @@ plus `edk2-ovmf` for `make run`.
 | **Boot**     | A UEFI loader that carries the kernel inside itself            |
 | **Kernel**   | Ring 0: screen, keyboard, filesystem, Linux's syscall table    |
 | **Programs** | ELF, static or dynamically linked, straight off a Linux system |
-| **Shell**    | `tsh`, a small shell of its own                                |
+| **Shell**    | `tsh`, a small shell built into the kernel                     |
 | **Layout**   | `/etc`, `/usr`, `/var` and the rest, with real symbolic links  |
 
 ## How it is put together
@@ -53,22 +53,17 @@ commands the kernel provides itself are files under `/proc`, so `mem` and
 
 ### The shell
 
-`tsh` (`src/tsh`) is the shell the machine starts. It reads a line, splits it
-into words on blanks, and runs the first word as a program, looked up on
-`PATH`, with the rest as its arguments. `cd` and `exit` are built in. It
-talks to the kernel through plain syscalls and needs no C library, so it is
-a single static file of about five kilobytes.
+`tsh` (`/proc/tsh`, in `src/kernel/shell.c`) is the shell the machine
+starts. It reads a line, splits it into words on blanks, and runs the first
+word - a kernel command from `/proc`, or a program from `/usr/bin` - with the
+rest as its arguments. `cd`, `exit` and `help` are built in. It is part of
+the kernel, so it costs no memory of a program's; another shell, such as
+bash, is a program on the disk like any other.
 
 Editing the line is the terminal's job, so every program that reads a line
 gets it too: the arrows move through the line, Home, End and Delete do what
 they say, up and down go back through the last few lines, and Tab completes
 a command or a file name, with a second Tab listing the choices.
-
-It is built by hand, like everything else on the disk:
-
-```sh
-src/tsh/build.sh    # writes src/disk/usr/bin/tsh
-```
 
 ### fork, without a scheduler
 
@@ -82,8 +77,8 @@ write to a page copies its old contents aside. When the child finishes, its
 changes are undone page by page, and the parent carries on as if it had only
 been waiting. At `execve` the child gets a region of its own, and the
 parent's is left exactly as the fork found it. A program linked to a fixed
-address has nowhere to keep its parent's copy, so it cannot fork. That is
-why `tsh` is built position-independent.
+address gets the low memory it was linked for in the same way, swapped in
+while it runs and out while a child does.
 
 A pipe is therefore a buffer rather than a channel: the first program fills
 it and finishes, then the second reads it. A writer that never finishes
@@ -130,9 +125,10 @@ that file.
 ├── sys/                the system and its devices
 ├── tmp/                scratch files
 ├── usr/
-│   ├── bin/            programs
-│   ├── lib/            the libraries they were linked against
-│   └── share/          terminfo, wallpapers, other shared data
+│   ├── bin/            programs, cc among them
+│   ├── include/        glibc's and Linux's headers, for cc
+│   ├── lib/            the libraries they were linked against, and gcc's
+│   └── share/          terminfo, vim's runtime, wallpapers, other shared data
 └── var/
     ├── cache/
     ├── lib/            state a program keeps between runs
@@ -142,15 +138,23 @@ that file.
 `/dev`, `/proc` and `/sys` are empty folders on the disk. What appears in
 them comes from the kernel.
 
-**Boot.** `/etc/boot` describes the machine: the screen, the text size, the
-wallpaper and the disk cache, each from a file of its own beside it -
-`/etc/cache` holds the cache's size and whether it is on. The kernel runs it
-itself before there is a shell. `/etc/shell` then names the program to
-start, which is `/usr/bin/tsh`.
+**Compiling.** `cc` is gcc, with `as`, `ld`, the headers and the start-up
+files beside it, so `cc hello.c -o hello` builds and links a program here as
+it would on Linux. gcc's own programs are linked to a fixed address, which
+is what low memory is for (see fork, above); `cc1` alone wants the 47 MiB
+from 4 MiB up, so a machine needs a little more RAM than that free down
+there to compile.
 
-**Settings.** A program keeps its settings where Linux software expects:
-dotfiles directly in the home folder, and everything else in
-`~/.config/<program>/`.
+**Boot.** Tuxlet OS's own settings live in `/etc/tuxlet/`, apart from the
+ones every Linux system has. `/etc/tuxlet/boot` describes the machine: the
+screen, the text size, the wallpaper and the disk cache, each from a file of
+its own beside it - `/etc/tuxlet/cache` holds the cache's size and whether it
+is on. The kernel runs it itself before there is a shell.
+`/etc/tuxlet/shell` then names the shell to start, which is `/proc/tsh`.
+
+**Settings.** A program keeps its settings where Linux software expects, in
+dotfiles in the home folder: a file such as `~/.vimrc`, or a folder such as
+`~/.config/<program>/`. What applies to every user is in `/etc`.
 
 **Symbolic links** work as they do on Linux. Relative targets resolve from
 the folder the link is in, and absolute targets from the root. `open`,

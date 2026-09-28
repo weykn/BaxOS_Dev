@@ -18,9 +18,9 @@
  * can see: code, data and stack alike read-write-execute. Only the pages it
  * touches take up RAM, so it can spread over the whole region on a machine
  * with far less than that free. Something linked to run at a fixed address
- * gets the fixed window from PROGRAM_BASE to PROGRAM_STACK instead, since a
- * region begins half a terabyte up and such a program has to be where it was
- * linked. Reaching outside what it was given, running out of RAM, or raising
+ * gets low memory as well, for its image, since a region begins half a
+ * terabyte up and such a program has to be where it was linked (vm.c).
+ * Reaching outside what it was given, running out of RAM, or raising
  * any other CPU exception ends it with exit code PROGRAM_KILLED.
  *
  * It makes a syscall with the syscall instruction: the number in RAX, up to
@@ -34,13 +34,6 @@
  * Every call that takes a pointer checks it points into the program's own
  * memory, and returns -1 rather than reading or writing the kernel's. */
 
-/* The fixed window, for a program linked to run at a fixed address.
-   PROGRAM_BASE is where a plain `ld` puts things, so no linker flags are
-   needed for one. */
-#define PROGRAM_BASE   0x400000
-#define PROGRAM_STACK  0x600000
-#define PROGRAM_BYTES  (PROGRAM_STACK - PROGRAM_BASE)
-
 #define PROGRAM_KILLED 139      /* what a Linux shell shows for a segfault */
 
 /* Where things go in the region vm.c hands out, as offsets into it. A
@@ -48,12 +41,16 @@
    - itself, its loader, the libraries that loader maps, a heap and a stack -
    and they have to be far enough apart that none of them grows into another.
    The region is half a terabyte; these are a rounding error of it. */
-#define USER_EXEC   0x01000000  /* a position-independent program */
+#define USER_STACK  0x01040000  /* the stack top, growing down */
+#define USER_EXEC   0x01040000  /* a position-independent program, above it */
 #define USER_INTERP 0x08000000  /* its loader, ld.so */
 #define USER_MMAP   0x10000000  /* what mmap hands out, growing up */
 #define USER_BRK    0x30000000  /* the heap, growing up */
-#define USER_STACK  0x3F000000  /* the stack top, growing down */
 #define USER_STACK_BYTES 0x40000
+
+/* The stack sits right under the program, in the same two megabytes: one
+   page table then describes both, which for a program as small as the
+   shell is a quarter of what it costs. */
 
 /* Handlers that can be registered at once. There is no warning when this is
    too small - the registrations past it simply do not happen, and the calls
@@ -205,6 +202,12 @@ enum {
     SYS_FORK       = 57,
     SYS_VFORK      = 58,
     SYS_CLONE      = 56,    /* (flags, stack, ...): glibc's fork is one */
+    SYS_RT_SIGTIMEDWAIT = 128,  /* (set, info, timeout, size) */
+    SYS_TIMER_CREATE    = 222,  /* (clock, sigevent *, timer_t *) */
+    SYS_TIMER_SETTIME   = 223,  /* (timer, flags, new, old) */
+    SYS_TIMER_GETTIME   = 224,  /* (timer, itimerspec *) */
+    SYS_TIMER_GETOVERRUN = 225,
+    SYS_TIMER_DELETE    = 226,
     SYS_EXECVE     = 59,    /* (path, argv, envp) */
     SYS_WAIT4      = 61,    /* (pid, status *, options, rusage *) */
     SYS_PIPE       = 22,    /* (int fds[2]) */
@@ -254,6 +257,11 @@ int syscall_register(uint64_t number, syscall_fn fn);
    entry point in *entry. Returns 0, FS_EIO, FS_ENOSPC if RAM runs out, or
    PROGRAM_EINVAL. */
 int program_load(const struct fs_file *file, uint64_t *entry);
+
+/* Loads and runs the program at path, following a "#!" line - what the
+   shell does. Returns its exit code, or a negative code if it could not be
+   started. */
+int program_start(const char *path, unsigned argc, const char *const *argv);
 
 /* Runs a loaded program until it exits, and returns its exit code. envc of 0
    gives it the machine's own environment, which is what the first program

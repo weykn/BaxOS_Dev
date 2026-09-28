@@ -7,6 +7,7 @@
 #include "ata.h"
 #include "boot.h"
 #include "efi_kernel.h"
+#include "vm.h"
 #include "fs.h"
 #include "ide.h"
 #include "io.h"
@@ -285,16 +286,18 @@ static int read_now(uint32_t lba, unsigned count, void *buffer) {
  * a miss costs a whole line and a line costs one call however big it is. Each
  * is bought the first time it is needed, so a machine that never reads twice
  * never pays for it. How many there may be is set by the `cache` command,
- * which /etc/cache runs at boot. */
+ * which /etc/tuxlet/cache runs at boot. */
 
 #define LINE_SECTORS 256                /* 128 KiB a line */
 #define LINE_BYTES   (LINE_SECTORS * 512)
 
 static struct line {
-    uint32_t first;                     /* its first sector; 0 when unused */
+    uint32_t first;                     /* its first sector; NONE when unused */
     uint32_t used;                      /* when it was last read, for the LRU */
     char    *data;
 } *lines;                               /* line_count of them, or NULL */
+
+#define NONE 0xFFFFFFFFu                 /* sector 0 starts a line like any other */
 
 static unsigned line_count;
 static uint32_t line_clock;
@@ -344,7 +347,7 @@ static struct line *cache_line(uint32_t lba) {
         }
         spare->data = (char *)at;
     }
-    spare->first = 0;
+    spare->first = NONE;
     if (read_now(first, LINE_SECTORS, spare->data) < 0) {
         return NULL;
     }
@@ -353,16 +356,22 @@ static struct line *cache_line(uint32_t lba) {
     return spare;
 }
 
-/* Forgets whatever was kept of lba .. lba + count, which a write makes
-   stale. The line is dropped rather than patched: a write is rare and a
-   dropped line costs one read to get back. */
-static void cache_forget(uint32_t lba, unsigned count) {
+/* Puts what is being written to lba .. lba + count into whatever line holds
+   those sectors, so the line stays good: the file table is written by every
+   change to the disk, and dropping its line each time would have the next
+   lookup read all of it again. */
+static void cache_update(uint32_t lba, unsigned count, const char *data) {
     for (unsigned i = 0; i < line_count; i++) {
-        if (lines[i].data != NULL && lines[i].first < lba + count &&
-            lba < lines[i].first + LINE_SECTORS) {
-            lines[i].first = 0;
-            lines[i].used = 0;
+        uint32_t first = lines[i].first, from, to;
+
+        if (lines[i].data == NULL || first == NONE ||
+            first >= lba + count || lba >= first + LINE_SECTORS) {
+            continue;
         }
+        from = lba > first ? lba : first;
+        to = lba + count < first + LINE_SECTORS ? lba + count : first + LINE_SECTORS;
+        memcpy(lines[i].data + (size_t)(from - first) * 512,
+               data + (size_t)(from - lba) * 512, (size_t)(to - from) * 512);
     }
 }
 
@@ -416,7 +425,7 @@ size_t ata_cache_held(void) {
     size_t held = 0;
 
     for (unsigned i = 0; i < line_count; i++) {
-        held += lines[i].data != NULL && lines[i].first != 0 ? LINE_SECTORS * 512 : 0;
+        held += lines[i].data != NULL && lines[i].first != NONE ? LINE_SECTORS * 512 : 0;
     }
     return held;
 }
@@ -456,7 +465,7 @@ int ata_write_many(uint32_t lba, unsigned count, const void *buffer) {
     if (count == 0 || (disk == NULL && ide_base == 0)) {
         return -1;
     }
-    cache_forget(lba, count);
+    cache_update(lba, count, buffer);
     if (ide_base != 0) {
         return ide_write(ide_base + lba, count, buffer);
     }
@@ -532,12 +541,35 @@ uint64_t efi_uptime_ms(void) {
     return (now - boot->started) * 1000 / ticks_per_second;
 }
 
+/* The same in microseconds, for what is over in a fraction of one - a
+   syscall. Taken in two parts so the multiplication cannot overflow. */
+uint64_t efi_uptime_us(void) {
+    uint64_t ticks;
+
+    efi_uptime_ms();                    /* calibrates, the first time */
+    ticks = rdtsc() - boot->started;
+    return ticks / ticks_per_second * 1000000 +
+           ticks % ticks_per_second * 1000000 / ticks_per_second;
+}
+
+
+/* The firmware's runtime services keep their data in memory a program linked
+   to a fixed address may have mapped over (vm.c), so they are called with
+   the firmware's own view of low memory put back for the length of the call. */
+static efi_status get_time(struct efi_time *now) {
+    efi_status status;
+
+    vm_firmware_view(true);
+    status = boot->system->runtime->get_time(now, NULL);
+    vm_firmware_view(false);
+    return status;
+}
 
 /* Seconds past midnight, from the firmware's own reading of the clock. */
 unsigned efi_seconds(void) {
     struct efi_time now;
 
-    if (EFI_ERROR(boot->system->runtime->get_time(&now, NULL))) {
+    if (EFI_ERROR(get_time(&now))) {
         return 0;
     }
     return ((unsigned)now.hour * 60 + now.minute) * 60 + now.second;
@@ -554,7 +586,7 @@ uint64_t efi_epoch(void) {
     struct efi_time now;
     uint64_t days;
 
-    if (EFI_ERROR(boot->system->runtime->get_time(&now, NULL)) ||
+    if (EFI_ERROR(get_time(&now)) ||
         now.year < 1970 || now.month < 1 || now.month > 12) {
         return 0;
     }
@@ -580,9 +612,11 @@ uint64_t efi_epoch(void) {
 /* ---- switching off ------------------------------------------------------ */
 
 void efi_power_off(void) {
+    vm_firmware_view(true);
     boot->system->runtime->reset_system(EFI_RESET_SHUTDOWN, EFI_SUCCESS, 0, NULL);
 }
 
 void efi_restart(void) {
+    vm_firmware_view(true);
     boot->system->runtime->reset_system(EFI_RESET_COLD, EFI_SUCCESS, 0, NULL);
 }

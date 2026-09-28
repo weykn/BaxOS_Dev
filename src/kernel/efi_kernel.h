@@ -26,6 +26,7 @@ uint64_t efi_epoch(void);
    the reading it returns is taken before that, so it costs the answer
    nothing. */
 uint64_t efi_uptime_ms(void);
+uint64_t efi_uptime_us(void);
 
 /* RAM free right now, as the firmware's memory map has it, in KiB. Only
    while the firmware is still running; mem_free_kib knows which to ask. */

@@ -9,6 +9,7 @@
 #include "log.h"
 #include "mem.h"
 #include "string.h"
+#include "shell.h"
 #include "vga.h"
 
 #define PROC_NAME "proc"
@@ -117,6 +118,23 @@ static void cmd_mode(char *args) {
     list(vga_mode_name, vga_mode());
 }
 
+/* Prints its line, which is how /etc/tuxlet/boot says anything. */
+static void cmd_echo(char *args) {
+    kprintf("%s\n", args);
+}
+
+static void cmd_scale(char *args) {
+    const char *name = str_word(&args);
+
+    if (*name == '\0') {
+        kprintf("  %s\n", vga_scale());
+    } else if (vga_set_scale(name) < 0) {
+        error("scale: %s: not a size within %s\n", name, vga_mode());
+    } else {
+        bg_refresh();               /* the picture is the size of the screen */
+    }
+}
+
 static void cmd_font(char *args) {
     const char *name = str_word(&args);
 
@@ -172,38 +190,65 @@ static void cmd_set_bg(char *args) {
 
 /* ---- the machine --------------------------------------------------------- */
 
+/* What the OS itself uses, out of the RAM it has - which, as on Linux, is
+   the machine's less what the firmware keeps for good. "mem all" is all of
+   the machine's, the firmware's share counted in. */
 static void cmd_mem(char *args) {
     struct mem_stats m;
+    bool all = strcmp(str_word(&args), "all") == 0;
 
-    (void)args;
     mem_get_stats(&m);
     uint32_t ours = m.kernel_kib * 1024 + m.window;
 
-    usage_bar("memory", m.used_kib, m.total_kib, "KiB");
-    /* The firmware's is what is in use that is not ours: its drivers, and
-       everything it keeps for itself for as long as the kernel uses it. */
-    detail("firmware", m.used_kib * 1024 > ours ? m.used_kib * 1024 - ours : 0);
-    vga_putc('\n');
-    detail("kernel image", m.image);
-    vga_putc('\n');
-    detail("kernel data", m.data);
-    vga_putc('\n');
-    detail("kernel stack", m.stack);
-    kprintf(", %u at peak\n", m.stack_peak);
-    detail("page tables", m.page_tables);
-    vga_putc('\n');
-    detail("console", m.console);
-    vga_putc('\n');
+    struct { const char *label; uint32_t bytes; } parts[12];
+    unsigned n = 0;
+
+#define PART(l, b) (parts[n].label = (l), parts[n++].bytes = (b))
+    if (!all) {
+        usage_bar("memory", (ours + 1023) / 1024, m.total_kib, "KiB");
+    } else {
+        /* The firmware's is what is in use that is not ours: what it keeps
+           for good, and while it still runs, its drivers too. */
+        uint32_t firmware = m.used_kib * 1024 > ours ? m.used_kib * 1024 - ours : 0;
+        uint32_t kept = m.firmware_kib * 1024;
+
+        usage_bar("memory", m.used_kib, m.ram_kib, "KiB");
+        PART("firmware (kept)", kept);
+        if (firmware > kept) {
+            PART("firmware (live)", firmware - kept);
+        }
+    }
+    PART("kernel image", m.image);
+    PART("kernel data", m.data);
+    PART("kernel stack", m.stack);
+    PART("page tables", m.page_tables);
+    PART("console", m.console);
     if (m.disk_cache > 0) {
-        detail("disk cache", m.disk_cache);
-        vga_putc('\n');
+        PART("disk cache", m.disk_cache);
     }
     if (m.wallpaper > 0) {
-        detail("wallpaper", m.wallpaper);
+        PART("wallpaper", m.wallpaper);
+    }
+    PART("the program", m.window);
+#undef PART
+
+    /* Biggest first. A dozen lines: sorting them any cleverer way is not
+       worth the code. */
+    for (unsigned i = 1; i < n; i++) {
+        for (unsigned j = i; j > 0 && parts[j].bytes > parts[j - 1].bytes; j--) {
+            __typeof__(parts[0]) swap = parts[j];
+
+            parts[j] = parts[j - 1];
+            parts[j - 1] = swap;
+        }
+    }
+    for (unsigned i = 0; i < n; i++) {
+        detail(parts[i].label, parts[i].bytes);
+        if (strcmp(parts[i].label, "kernel stack") == 0) {
+            kprintf(", %u at peak", m.stack_peak);
+        }
         vga_putc('\n');
     }
-    detail("the program", m.window);
-    vga_putc('\n');
     color(COL_TEXT);
 }
 
@@ -275,8 +320,14 @@ static bool parse_bytes(const char *text, size_t *out) {
 
 static size_t cache_bytes = CACHE_DEFAULT;  /* what `cache on` gives it */
 
-/* Gives the cache cache_bytes, and the loader and C library to start with. */
+/* Gives the cache cache_bytes, and the loader and C library to start with -
+   then the file table and its index, if what is left has room for them:
+   every path looked up reads them, and a line pushed out for them would
+   only be read back. */
 static void cache_start(void) {
+    uint32_t lba[2];
+    unsigned count[2];
+
     if (cache_bytes / 1024 > mem_free_kib()) {
         error("cache: not enough memory\n");
         return;
@@ -284,6 +335,17 @@ static void cache_start(void) {
     if (ata_cache_size(cache_bytes) > 0) {
         cache_preload(LOADER);
         cache_preload(LIBRARY);
+        if (fs_runs(lba, count) == 0) {
+            for (unsigned i = 0; i < 2; i++) {
+                /* Whole lines are what it holds, and a run can straddle one
+                   more than its size says. */
+                size_t need = ((size_t)count[i] + 2 * 256) * 512;
+
+                if (ata_cache_room() - ata_cache_held() >= need) {
+                    ata_cache_read(lba[i], count[i]);
+                }
+            }
+        }
     }
 }
 
@@ -314,11 +376,15 @@ static void cmd_cache(char *args) {
     }
 }
 
+/* Anything after it goes in front, which is how /etc/tuxlet/boot says how long
+   the machine took to come up. */
 static void cmd_uptime(char *args) {
     uint64_t ms = efi_uptime_ms();
     unsigned seconds = (unsigned)(ms / 1000);
 
-    (void)args;
+    if (*args != '\0') {
+        kprintf("%s ", args);
+    }
     if (seconds < 60) {
         kprintf("%u.%02us\n", seconds, (unsigned)(ms % 1000) / 10);
     } else if (seconds < 3600) {
@@ -377,13 +443,16 @@ static void cmd_log(char *args) {
 
 static const struct proc_cmd commands[] = {
     { "mode",   "[size]",            cmd_mode   },
+    { "scale",  "[size|off]",        cmd_scale  },
     { "font",   "[size]",            cmd_font   },
     { "set-bg", "<file> [alpha]",    cmd_set_bg },
-    { "mem",    "",                  cmd_mem    },
+    { "mem",    "[all]",             cmd_mem    },
     { "uptime", "",                  cmd_uptime },
     { "log",    "[on|off|clear]",    cmd_log },
     { "cache",  "[on|off|size]",     cmd_cache },
     { "clear",  "",                  cmd_clear },
+    { "echo",   "[text]",            cmd_echo },
+    { "tsh",    "",                  shell_tsh },
     { "reboot", "",                  cmd_reboot },
     { "poweroff", "",                cmd_poweroff },
 };

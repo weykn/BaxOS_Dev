@@ -3,8 +3,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* A flat filesystem with folders: a one-sector file table, then each file
-   stored as one contiguous run of sectors. The kernel itself lives in it, as
+/* A flat filesystem with folders: a file table that grows as it fills, then
+   each file stored as one contiguous run of sectors. The kernel itself lives in it, as
    kernel.bin.
 
    Folders cost nothing on disk and need no flag of their own. An entry's
@@ -17,19 +17,17 @@
    There is a working directory. Every path below is taken relative to it
    unless it starts with '/', which means from the root.
 
-   To keep RAM use down, everything goes through a single buffer that holds
-   either the table or one sector of file data, so file entries are handed
-   out as copies. */
+   Nothing of the table is kept in memory: a name is found through an index
+   on the disk, and entries are handed out as copies. */
 
 /* Where the filesystem starts on its partition, and how its table announces
    itself. The loader looks for this to tell which partition to hand over, so
    it lives here rather than inside fs.c. */
 #define FS_LBA    1
-#define FS_MAGIC  0x35465842u       /* "BXF5": the Linux layout, with links */
+#define FS_MAGIC  0x39465842u       /* "BXF9": the table, and an index to find names in it */
 #define FS_SECTOR 512               /* bytes in a sector, here and on disk */
 
-#define FS_NAME_LEN  48     /* a whole path, including the NUL */
-#define FS_MAX_FILES 128    /* table entries: files and folders together */
+#define FS_NAME_LEN  120    /* a whole path, including the NUL: an entry is 128 */
 #define FS_LINKS     40     /* links followed in one path, as Linux allows */
 #define FS_LINK_LEN  128    /* a link's target, including the NUL */
 #define FS_LINK      0x80000000u    /* in an entry's size: it is a link */
@@ -65,6 +63,15 @@ int fs_format(uint32_t disk_sectors);
 /* Copies out table entry index, whose name is a whole path. Returns 0,
    FS_ENOENT if it is free, or FS_EIO. */
 int fs_file(size_t index, struct fs_file *file);
+
+/* The next entry directly inside folder - "" for the root, else "docs/" -
+   from *cursor on, which starts at 0 and is moved past it; its entry number
+   goes in *index. Returns 0, or FS_ENOENT once there are no more. */
+int fs_list(const char *folder, size_t *cursor, struct fs_file *file, size_t *index);
+
+/* Where the table and its index are on the disk, for the cache to load them
+   when there is room. */
+int fs_runs(uint32_t lba[2], unsigned count[2]);
 
 /* Copies out the file at path, following links all the way. Returns 0 or an
    FS_E* code. */
@@ -132,5 +139,6 @@ int fs_folder_at(const char *path, unsigned *index);
 int fs_rename(const char *from, const char *to);
 
 /* Writes size bytes into a file at offset, which may be anywhere up to and
-   including its end - past the end is refused. Returns 0 or an FS_E* code. */
+   past its end, where what lies between reads as zeroes. Returns 0 or an
+   FS_E* code. */
 int fs_write_at(const char *path, uint32_t offset, const void *data, size_t size);
