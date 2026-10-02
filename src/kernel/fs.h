@@ -133,6 +133,11 @@ int fs_folder(const char *path, char *out, size_t max);
 
 int fs_get_stats(struct fs_stats *stats);
 
+/* Makes the disk end free sectors past the last one anything is on - more
+   room, or less - and returns how many it is now, or an FS_E* code. For
+   tools/mkfs, which sizes an image to what it holds. */
+long fs_resize(uint32_t free);
+
 const char *fs_error(int err);
 
 /* The table entry of the folder at path, one-based; 0 means the root. Takes

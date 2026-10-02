@@ -279,11 +279,23 @@ static bool low_setup(void) {
         return false;
     }
     if (mem_ours()) {
-        cr0 = write_protect_off();
+        /* The kernel's own tables: a gigabyte page, split here into
+           two-megabyte ones the first time it is wanted. */
+        if (pdpt[0] & BIG) {
+            uint64_t *pd = (uint64_t *)table_page();
+
+            if (pd == NULL) {
+                return false;
+            }
+            for (unsigned i = 0; i < ENTRIES; i++) {
+                pd[i] = low_plain(i);
+            }
+            pdpt[0] = (uint64_t)pd | PRESENT | WRITE;
+            low_fixed = VM_PAGE;
+        }
         top[0] |= USER;
         pdpt[0] |= USER;
         low_pd = table_at(pdpt[0]);
-        write_protect_back(cr0);
         flush_tlb();
         return true;
     }
@@ -365,6 +377,10 @@ bool vm_low(uint64_t start, uint64_t end) {
     return true;
 }
 
+bool vm_low_used(void) {
+    return low_pd != NULL;
+}
+
 void vm_move(uint64_t *top, uint64_t *pd) {
     uint64_t *old = pml4();
 
@@ -402,10 +418,10 @@ size_t vm_fixed_tables(void) {
 }
 
 bool vm_start(void) {
-    if (levels[0].base != 0) {
+    if (levels[depth].base != 0) {
         return true;
     }
-    return slot_take(&levels[0]);
+    return slot_take(&levels[depth]);
 }
 
 uint64_t vm_base(void) {
@@ -801,7 +817,9 @@ void vm_reset(void) {
     if (level->undo != NULL) {
         vm_undo_end(false);         /* whatever forked it is gone */
     }
-    level_empty(level, false);
+    /* The outermost region goes whole, its top table too: an idle machine
+       holds none of it, and the next program takes it again (vm_start). */
+    level_empty(level, depth == 0);
 }
 
 bool vm_push(void) {
@@ -851,8 +869,7 @@ size_t vm_memory(void) {
 }
 
 /* Only each region's top table: the rest are out of its chunks, and so are
-   already in vm_memory. The first region's is the machine's, kept from boot
-   whether anything runs or not, so it is counted with vm_fixed_tables. */
+   already in vm_memory. The first region's is counted with vm_fixed_tables. */
 size_t vm_tables(void) {
     size_t total = 0;
 

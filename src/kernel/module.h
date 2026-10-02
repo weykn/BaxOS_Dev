@@ -27,17 +27,12 @@
 MODULE_EXPORT int  module_init(void);
 MODULE_EXPORT int  module_exit(void);
 
-#define MODULES_CONF "/etc/tuxlet/modules"
-
-/* The script that loads them at boot, `modman enable` a line - run first by
-   /etc/tuxlet/boot, before the firmware is let go of, since the disk and
-   keyboard drivers the kernel needs for that are modules. modman enable and
-   disable edit it. */
 /* RAM the loaded modules' own images take, in bytes. */
 uint32_t module_memory(void);
 
 /* /proc/modman: every module on the disk is there to be had; enable loads
-   one, now and at every boot, and disable unloads it; auto enables every
+   one and disable unloads it, nothing saved - what loads at boot is
+   whatever the boot script enables; auto enables every
    module of a category that starts on this machine, and takeover lets the
    firmware go once the disk and keyboard are modules' - never by itself,
    only from where the boot script says so. With nothing, lists them.

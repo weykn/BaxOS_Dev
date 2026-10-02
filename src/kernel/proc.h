@@ -6,7 +6,7 @@
 /* The kernel's own commands, as files under /proc.
  *
  * Everything the shell cannot do for itself - the screen's size, the text's
- * size, the wallpaper, what memory and the clock say, the syscall log - is
+ * size, what memory and the clock say, the syscall log - is
  * kernel state, and a command that changes it has to run in the kernel. So
  * each one is a file: `mem` at the prompt and /proc/mem are the same thing, because the shell looks
  * the name up in /proc like it looks any other command up on the path, and

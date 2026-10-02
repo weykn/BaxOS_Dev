@@ -95,20 +95,15 @@ MKFS       := $(BUILD)/mkfs
 FS_IMG     := $(BUILD)/fs.img
 IMAGE      := $(BUILD)/TuxletOS.img
 
-# Sizes, in the units their names give. FS_SECTORS is FS_MIB as sectors. Nothing may follow these on the line:
-# a trailing comment leaves its spaces inside the value, and these get stuck
-# straight onto sector numbers and onto sgdisk's "+48M".
-FS_SECTORS := 524288
-ESP_MIB    := 1
-FS_MIB     := 256
-DISK_MIB   := 320
-ESP_LBA    := 2048
-
-FS_LBA      := $(shell expr $(ESP_LBA) + $(ESP_MIB) \* 2048)
-ESP_SECTORS := $(shell expr $(ESP_MIB) \* 2048)
-ESP_AT      := $(IMAGE)@@$(ESP_LBA)s
+# The disk is as big as what is on it: the filesystem holds the kernel, the
+# modules and src/disk, plus FREE for files saved from inside Tuxlet (any
+# size numfmt reads: 0, 512K, 64M). Nothing may follow these on the line: a
+# trailing comment leaves its spaces inside the value, and these get stuck
+# straight onto sector numbers and onto sgdisk's "+1M".
+FREE       ?= 1M
 
 .PHONY: all clean run
+.DELETE_ON_ERROR:                   # a recipe that fails leaves no half-built file
 
 all: $(IMAGE)
 
@@ -119,6 +114,11 @@ FLAGS_FILE := $(BUILD)/flags
 $(shell mkdir -p $(BUILD); \
         [ "$$(cat $(FLAGS_FILE) 2>/dev/null)" = "$(CFLAGS)" ] || \
         printf '%s' "$(CFLAGS)" > $(FLAGS_FILE))
+
+# And what the disk was sized with: a different FREE or src/disk resizes it.
+SIZE_FILE := $(BUILD)/size
+$(shell [ "$$(cat $(SIZE_FILE) 2>/dev/null)" = "$(FREE) $(DISK_ROOT)" ] || \
+        printf '%s' "$(FREE) $(DISK_ROOT)" > $(SIZE_FILE))
 
 $(BUILD)/%.o: src/%.c $(FLAGS_FILE)
 	@mkdir -p $(@D)
@@ -164,20 +164,29 @@ $(MKFS): tools/mkfs.c src/kernel/fs.c src/kernel/fs.h src/kernel/ata.h
 
 # The filesystem partition is updated in place rather than recreated, so files
 # saved from inside Tuxlet OS survive a rebuild. `make clean` wipes them.
-$(FS_IMG): $(KERNEL_BIN) $(MKFS) $(DISK_FILES) $(MODULES)
-	$(MKFS) $@ $(FS_SECTORS) $(DISK_ROOT) $(KERNEL_BIN) $(DISK_FILES) \
+$(FS_IMG): $(KERNEL_BIN) $(MKFS) $(DISK_FILES) $(MODULES) $(SIZE_FILE)
+	$(MKFS) $@ $(shell numfmt --from=iec $(FREE)) $(DISK_ROOT) $(KERNEL_BIN) $(DISK_FILES) \
 	    $(foreach m,$(MODULES),usr/lib/$(m:$(BUILD)/%=%)=$(m))
 
+# Laid end to end, with nothing between: the GPT (sectors 0-33), the EFI
+# system partition sized to the loader - plus 64 sectors for FAT12's own
+# boot sector, tables, root folder and \EFI\BOOT - then the filesystem,
+# then the backup GPT's 33. Nothing in the OS assumes where a partition
+# starts: the loader reads its own, and storage/ide finds Tuxlet's by its
+# magic number. sgdisk -a 1 after -o, which resets it, or it rounds each
+# start up to 1 MiB.
 $(IMAGE): $(LOADER) $(FS_IMG)
 	@rm -f $@
-	@dd if=/dev/zero of=$@ bs=1M count=$(DISK_MIB) status=none
-	@sgdisk -o -n 1:$(ESP_LBA):+$(ESP_MIB)M -t 1:ef00 -c 1:"EFI System" \
-	        -n 2:$(FS_LBA):+$(FS_MIB)M -t 2:8300 -c 2:"Tuxlet OS" $@ > /dev/null
-	@mformat -i $(ESP_AT) -T $(ESP_SECTORS) -v TUXLET ::
-	@mmd -i $(ESP_AT) ::/EFI ::/EFI/BOOT
-	@mcopy -i $(ESP_AT) $(LOADER) ::/EFI/BOOT/BOOTX64.EFI
-	@dd if=$(FS_IMG) of=$@ bs=512 seek=$(FS_LBA) conv=notrunc status=none
-	@echo "$@: EFI system partition + filesystem"
+	@esp=$$(( ($$(stat -c %s $(LOADER)) + 511) / 512 + 64 )); \
+	 fs=$$(( $$(stat -c %s $(FS_IMG)) / 512 )); at=$$(( 34 + esp )); \
+	 truncate -s $$(( (at + fs + 33) * 512 )) $@ && \
+	 sgdisk -o -a 1 -n 1:34:+$$esp -t 1:ef00 -c 1:"EFI System" \
+	        -n 2:$$at:+$$fs -t 2:8300 -c 2:"Tuxlet OS" $@ > /dev/null && \
+	 mformat -i $@@@34s -T $$esp -v TUXLET :: && \
+	 mmd -i $@@@34s ::/EFI ::/EFI/BOOT && \
+	 mcopy -i $@@@34s $(LOADER) ::/EFI/BOOT/BOOTX64.EFI && \
+	 dd if=$(FS_IMG) of=$@ bs=512 seek=$$at conv=notrunc status=none
+	@echo "$@: $$(( $$(stat -c %s $@) / 1024 )) KiB, EFI system partition + filesystem"
 
 -include $(KOBJS:.o=.d) $(patsubst src/%.c,$(BUILD)/%.d,$(MSRCS))
 
@@ -191,14 +200,26 @@ OVMF_VARS := /usr/share/edk2/x64/OVMF_VARS.4m.fd
 # being interpreted rather than run: the same command takes five times as long.
 ACCEL := $(shell test -w /dev/kvm && echo "-enable-kvm -cpu host")
 
+# make run MEM=<size> NET=<card>: the machine's RAM, as QEMU takes it (39M,
+# 1G), and its network card - e1000, rtl8139, virtio, the ones there are
+# modules for, or none. The card comes without its network-boot ROM, which
+# the firmware would otherwise load and keep: at 39M that is the memory the
+# kernel needed. virtio has a driver in OVMF itself, ROM or not, and needs
+# 42M. QEMU adds a card of its own unless told none.
+MEM ?= 39M
+NET ?= none
+
+NET_DEVICE = $(if $(filter virtio,$(NET)),virtio-net-pci,$(NET))
+NIC = $(if $(filter none,$(NET)),-nic none,-netdev user$(comma)id=n0 \
+      -device $(NET_DEVICE)$(comma)netdev=n0$(comma)romfile=)
+comma := ,
+
 run: $(IMAGE)
 	@cp -n $(OVMF_VARS) $(BUILD)/ovmf_vars.fd 2>/dev/null || true
 	qemu-system-x86_64 $(ACCEL) \
 	    -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 	    -drive if=pflash,format=raw,file=$(BUILD)/ovmf_vars.fd \
-	    -drive format=raw,file=$(IMAGE) -nic user,model=e1000 -m 67M
+	    -drive format=raw,file=$(IMAGE) $(NIC) -m $(MEM)
 
-# -nic none
-# -nic user,model=e1000
 clean:
 	rm -rf $(BUILD)

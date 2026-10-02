@@ -40,12 +40,6 @@
 #define SCRIPT_LINE   128       /* the longest line a script may hold */
 #define SCRIPT_DEPTH  4         /* scripts running scripts, at most */
 
-static const char *path_now = BOOT_CONF;    /* the file being run, to name it */
-
-bool shell_running(const char *path) {
-    return strcmp(path_now, path[0] == '/' ? path + 1 : path) == 0;
-}
-
 static bool memcmp_n(const char *a, const char *b, size_t n) {
     while (n > 0 && *a == *b) {
         a++;
@@ -277,7 +271,6 @@ static unsigned scripts;            /* how many are running, one inside another 
 
 static void script_run(const char *path) {
     char text[SCRIPT_LINE];
-    const char *outer = path_now;
     struct fs_file file;
     void *script = NULL;
     size_t len = 0;
@@ -302,7 +295,6 @@ static void script_run(const char *path) {
         }
     }
 
-    path_now = file.name;
     scripts++;
 
     for (unsigned at = 0; at <= file.size; at++) {
@@ -336,7 +328,6 @@ static void script_run(const char *path) {
     }
 
     scripts--;
-    path_now = outer;
     if (script != NULL) {
         mem_free(script);
     }
@@ -383,10 +374,9 @@ void shell_tsh(char *args) {
 __attribute__((noreturn)) void shell_run(void) {
     struct fs_file file;
 
-    /* The boot script loads the modules first (/etc/tuxlet/modules): the
-       rest of it may want one - set-bg is the wallpaper's - and the firmware
-       goes only where it says `modman takeover`, once the disk and keyboard
-       drivers are in. */
+    /* The boot script loads the modules first, and the firmware goes only
+       where it says `modman takeover`, once the disk and keyboard drivers
+       are in. */
     /* It runs in its own folder, so that it can call the rest of /etc/tuxlet
        by name - `tsh cache`. */
     if (fs_stat(BOOT_CONF, &file) == 0) {

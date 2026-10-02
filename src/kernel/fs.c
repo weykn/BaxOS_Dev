@@ -519,7 +519,7 @@ static const char *resolve_any(const char *path, bool follow) {
     strcpy(walk, path);
 
     /* Part by part, so that "." and ".." mean what they do everywhere else:
-       a script saying ./wallpaper/one.png names a file beside it. */
+       a script saying ./notes/one.txt names a file beside it. */
     while (*p != '\0') {
         size_t len = 0;
 
@@ -810,6 +810,14 @@ int fs_format(uint32_t disk_sectors) {
     }
     mem_free(zero);
     return done(save_header());
+}
+
+long fs_resize(uint32_t free) {
+    if (load_table() < 0) {
+        return FS_EIO;
+    }
+    head.disk_sectors = head.data_end + free;
+    return save_header() < 0 ? FS_EIO : (long)head.disk_sectors;
 }
 
 int fs_runs(uint32_t lba[2], unsigned count[2]) {

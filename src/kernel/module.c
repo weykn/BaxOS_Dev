@@ -23,7 +23,6 @@
 
 const struct net_ops         *net;
 const struct keyboard_driver *keyboard_driver;
-const struct wallpaper       *wallpaper;
 const struct tracer          *tracer;
 
 const struct net_card        *net_card;
@@ -55,10 +54,6 @@ void disk_cache_register(const struct disk_cache *c) {
     disk_cache = c;
 }
 
-void wallpaper_register(const struct wallpaper *w) {
-    wallpaper = w;
-}
-
 void tracer_register(const struct tracer *t) {
     tracer = t;
 }
@@ -72,15 +67,13 @@ static const struct {
     X(memcpy), X(memset), X(memmove), X(strlen), X(strcmp),
     X(str_word),
     X(kprintf), X(ksprintf), X(vga_putc), X(vga_puts), X(vga_set_color),
-    X(vga_background), X(vga_has_background), X(vga_pixel_width), X(vga_pixel_height),
-    X(vga_rgb),
     X(efi_boot), X(efi_seconds), X(efi_uptime_ms), X(efi_uptime_us),
     X(mem_pages), X(mem_pages_below), X(mem_pages_free), X(mem_alloc), X(mem_free),
     X(mem_ours),
     X(fs_stat), X(fs_sector), X(fs_read_many), X(fs_write), X(fs_error),
     X(pci_read), X(pci_write), X(pci_find), X(pci_find_class),
     X(net_register), X(net_card_register), X(disk_register), X(keyboard_register),
-    X(wallpaper_register), X(tracer_register), X(disk_cache_register), X(fs_runs),
+    X(tracer_register), X(disk_cache_register), X(fs_runs),
     X(mem_free_kib), X(usage_bar), X(net_card), X(disk_driver),
     X(fs_mkdir), X(fs_write_at), X(strcpy),
     X(proc_add), X(proc_remove),
@@ -477,64 +470,6 @@ uint32_t module_memory(void) {
     return held * 4096;
 }
 
-/* ---- the boot script ---------------------------------------------------------
- *
- * What loads at boot is /etc/tuxlet/modules, a script like the rest of
- * /etc/tuxlet: one `modman enable <module>` line a module, run by the boot
- * script before anything else. Enabling one loads it and adds its line, if
- * it is not there already - which at boot it is, so nothing is written;
- * disabling unloads it and takes the line out, leaving the rest of the
- * file - comments too - as it was. */
-
-#define CONF_MAX 1024
-#define LOAD     "modman enable "
-
-static uint32_t conf_read(char *out) {
-    struct fs_file file;
-    uint32_t size = 0;
-    char *text;
-
-    if (fs_stat(MODULES_CONF, &file) == 0 && file.size < CONF_MAX &&
-        (text = read_file(MODULES_CONF, &size)) != NULL) {
-        memcpy(out, text, size);
-        mem_free(text);
-    }
-    out[size] = '\0';
-    return size;
-}
-
-static bool same(const char *a, const char *b, size_t n) {
-    while (n > 0 && *a == *b) {
-        a++;
-        b++;
-        n--;
-    }
-    return n == 0;
-}
-
-/* The line that loads name, into out. */
-static size_t load_line(char *out, const char *name) {
-    ksprintf(out, LOAD "%s", name);
-    return strlen(out);
-}
-
-/* That line in text, or NULL. */
-static char *conf_line(char *text, const char *name) {
-    char want[sizeof LOAD + NAME_LEN];
-    size_t len = load_line(want, name);
-
-    for (char *line = text; *line != '\0';) {
-        char *end = strchr(line, '\n');
-        size_t n = end != NULL ? (size_t)(end - line) : strlen(line);
-
-        if (n == len && same(line, want, len)) {
-            return line;
-        }
-        line += n + (end != NULL);
-    }
-    return NULL;
-}
-
 /* ---- modman ------------------------------------------------------------------ */
 
 /* The module a table entry is, into out, if it is one: its path below the
@@ -553,7 +488,7 @@ static bool module_named(const char *entry, size_t dir, char *out) {
 
 /* The modules in the folder whose table name is top: its category folders,
    and the .kmod files in each. */
-static void list_in(const char *top, const char *conf) {
+static void list_in(const char *top) {
     char cat[FS_NAME_LEN], name[NAME_LEN];
     struct fs_file folder, file;
     size_t outer = 0, inner, index;
@@ -578,21 +513,19 @@ static void list_in(const char *top, const char *conf) {
                 vga_puts(" ");
             } while (++pad < 20);
             if (slot >= 0) {
-                kprintf("loaded %uK", (mods[slot].span + 1023) / 1024);
+                kprintf("loaded %uK\n", (mods[slot].span + 1023) / 1024);
             } else {
-                vga_puts("-");
+                vga_puts("-\n");
             }
-            vga_puts(conf_line((char *)conf, name) != NULL ? "  enabled\n" : "\n");
         }
     }
 }
 
 /* Every module there is, in each folder of MODPATH. */
 static void list(void) {
-    char conf[CONF_MAX], dir[FS_NAME_LEN], top[FS_NAME_LEN];
+    char dir[FS_NAME_LEN], top[FS_NAME_LEN];
     const char *dirs = shell_env("MODPATH");
 
-    conf_read(conf);
     while (dirs != NULL && *dirs != '\0') {
         const char *end = strchr(dirs, ':');
         size_t n = end != NULL ? (size_t)(end - dirs) : strlen(dirs);
@@ -601,40 +534,11 @@ static void list(void) {
             memcpy(dir, dirs, n);
             dir[n] = '\0';
             if (fs_folder(dir, top, sizeof top) == 0) {
-                list_in(top, conf);
+                list_in(top);
             }
         }
         dirs = end != NULL ? end + 1 : dirs + n;
     }
-}
-
-static void conf_change(const char *name, bool add) {
-    char text[CONF_MAX + sizeof LOAD + NAME_LEN + 2], want[sizeof LOAD + NAME_LEN];
-    uint32_t size = conf_read(text);
-    char *line = conf_line(text, name);
-    size_t len = load_line(want, name);
-
-    if (add == (line != NULL)) {
-        return;
-    }
-    if (add) {
-        if (size > 0 && text[size - 1] != '\n') {
-            text[size++] = '\n';
-        }
-        memcpy(text + size, want, len);
-        size += (uint32_t)len;
-        text[size++] = '\n';
-    } else {
-        size_t gone = len + (line[len] == '\n');
-
-        memmove(line, line + gone, size - (size_t)(line - text) - gone);
-        size -= (uint32_t)gone;
-    }
-    if (size + 1 > CONF_MAX) {
-        kprintf("modman: %s is full\n", MODULES_CONF);
-        return;
-    }
-    fs_write(MODULES_CONF, text, size);
 }
 
 /* modman auto <category>: every module of the category that starts on
@@ -642,13 +546,11 @@ static void conf_change(const char *name, bool add) {
    -ENODEV and is let go again. Each one enabled is named. */
 static void auto_enable(const char *cat) {
     char dir[FS_NAME_LEN], top[FS_NAME_LEN], folder[FS_NAME_LEN], name[NAME_LEN];
-    char conf[CONF_MAX];
     const char *dirs = shell_env("MODPATH");
     struct fs_file file;
     size_t cursor, index;
     unsigned enabled = 0;
 
-    conf_read(conf);
     while (dirs != NULL && *dirs != '\0') {
         const char *end = strchr(dirs, ':');
         size_t n = end != NULL ? (size_t)(end - dirs) : strlen(dirs);
@@ -669,10 +571,6 @@ static void auto_enable(const char *cat) {
                             kprintf("modman: %s: %s\n", name, why);
                         }
                         continue;
-                    }
-                    if (conf_line(conf, name) == NULL) {
-                        conf_change(name, true);
-                        conf_read(conf);
                     }
                     kprintf("enabled %s\n", name);
                     enabled++;
@@ -721,13 +619,6 @@ void module_command(char *args) {
 
         if (slot >= 0 && !unload(slot)) {
             kprintf("modman: %s: %s\n", name, why);
-            return;
         }
-    }
-    /* A line of the script itself is already in it: at boot, nothing to
-       read back, which is ten milliseconds a line while the firmware has
-       the disk. */
-    if (!shell_running(MODULES_CONF)) {
-        conf_change(name, on);
     }
 }

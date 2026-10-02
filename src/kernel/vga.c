@@ -65,9 +65,6 @@ static uint32_t gop_taken = 0xFFFFFFFF;     /* the mode the console was laid out
 static volatile uint16_t *screen;
 static size_t screen_bytes;
 
-/* The wallpaper, owned by bg.c: one pixel for each of the screen's, or NULL
-   for a plain black background. */
-static const uint32_t *picture;
 
 static const struct font *glyphs = &fonts[FONT_DEFAULT];
 static const uint8_t *shapes;                   /* its 256 glyphs */
@@ -145,16 +142,12 @@ static void emit(unsigned x, unsigned y, const uint32_t *px, unsigned n) {
     }
 }
 
-/* Draws one cell's glyph, foreground and background both. A cell whose
-   background is black shows the wallpaper instead, where there is one: that
-   is the whole of how the text comes to sit on a picture. */
+/* Draws one cell's glyph, foreground and background both. */
 static void draw_cell(size_t i, uint16_t value) {
     const uint8_t *glyph = shapes + (value & 0xFF) * 16;
     unsigned step = 16 / glyphs->height;
     uint32_t fg = palette[value >> 8 & 0x0F];
     uint32_t bg = palette[value >> 12 & 0x0F];
-    const uint32_t *behind = picture != NULL && (value >> 12 & 0x0F) == VGA_BLACK
-                           ? picture : NULL;
     unsigned left = (unsigned)(i % width) * cell_w;
     unsigned top_y = (unsigned)(i / width) * cell_h;
     uint32_t line[GLYPH_W * 4];         /* one scan line, at the largest scale */
@@ -166,17 +159,13 @@ static void draw_cell(size_t i, uint16_t value) {
            pixels scale times across, which is what makes the cell bigger. */
         for (unsigned again = 0; again < glyphs->scale; again++) {
             unsigned screen_y = top_y + y * glyphs->scale + again;
-            const uint32_t *from = behind != NULL
-                                 ? behind + (size_t)screen_y * fb_width + left : NULL;
             uint32_t *to = line;
 
             for (unsigned x = 0; x < GLYPH_W; x++) {
                 bool ink = (bits & 0x80 >> x) != 0;
 
                 for (unsigned wide = 0; wide < glyphs->scale; wide++) {
-                    uint32_t under = from != NULL ? *from++ : bg;
-
-                    *to++ = ink ? fg : under;
+                    *to++ = ink ? fg : bg;
                 }
             }
             emit(left, screen_y, line, cell_w);
@@ -184,18 +173,11 @@ static void draw_cell(size_t i, uint16_t value) {
     }
 }
 
-/* Paints scan lines y0 up to y1 from the wallpaper, or in one colour when
-   there is none - which is the same cheap sweep as before. */
+/* Paints scan lines y0 up to y1 black. */
 static void fill_rows(unsigned y0, unsigned y1, uint32_t rgb);
 
 static void fill_background(unsigned y0, unsigned y1) {
-    if (picture == NULL) {
-        fill_rows(y0, y1, palette[VGA_BLACK]);
-        return;
-    }
-    for (unsigned y = y0; y < y1; y++) {
-        emit(0, y, picture + (size_t)y * fb_width, fb_width);
-    }
+    fill_rows(y0, y1, palette[VGA_BLACK]);
 }
 
 /* Paints scan lines y0 up to y1 in one colour. Clearing a whole screen this
@@ -259,15 +241,6 @@ static void use_font(const struct font *f) {
    takes memory for its cells from the firmware, agrees with what is on
    screen, and clears it. False if the grid would be too small to use or the
    memory could not be had, having changed nothing. */
-bool vga_has_background(void) {
-    return picture != NULL;
-}
-
-uint32_t vga_rgb(uint8_t r, uint8_t g, uint8_t b) {
-    return red_first ? (uint32_t)r | (uint32_t)g << 8 | (uint32_t)b << 16
-                     : (uint32_t)b | (uint32_t)g << 8 | (uint32_t)r << 16;
-}
-
 static bool layout(void) {
     unsigned columns = fb_width / cell_w;
     unsigned rows = fb_height / cell_h;
@@ -390,12 +363,6 @@ static void fit(void) {
             }
         }
     }
-    /* A wallpaper is exactly the size of the screen it was made for. If the
-       screen has changed - which the firmware does on its own, and vga_follow
-       then notices - it is dropped rather than read past the end of. */
-    if (w != fb_width || h != fb_height) {
-        picture = NULL;
-    }
     fb_width = w;
     fb_height = h;
 }
@@ -422,15 +389,6 @@ unsigned vga_pixel_height(void) {
 }
 
 static void repaint(void);
-
-void vga_background(const uint32_t *new_picture) {
-    picture = new_picture;
-    /* Only the scan lines below the last row of text: repainting the cells
-       covers everything above, and a screen's worth of writes into a
-       framebuffer is slow enough to be worth not doing twice. */
-    fill_background((unsigned)(cells / width) * cell_h, fb_height);
-    repaint();
-}
 
 uint16_t vga_get(unsigned column, unsigned row) {
     size_t i = (size_t)row * width + column;

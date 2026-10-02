@@ -1,5 +1,3 @@
-src/disk/
-
 # Everything the Makefile produces: the kernel, the loader, the utilities,
 # the filesystem and the disk image. `make` rebuilds all of it from src.
 build/

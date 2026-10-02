@@ -1,9 +1,10 @@
 /* Host tool: builds the Tuxlet OS filesystem, or updates one in place.
  *
- *   mkfs IMAGE SECTORS ROOT KERNEL_BIN [PATH...]
+ *   mkfs IMAGE FREE ROOT KERNEL_BIN [PATH...]
  *
  * Formats the filesystem if the image has none yet, then stores the kernel
- * and every PATH in it. A PATH under ROOT keeps its position relative to
+ * and every PATH in it, and sizes the image to what it holds plus FREE
+ * bytes of room: it grows while being written and shrinks to fit after. A PATH under ROOT keeps its position relative to
  * ROOT, folders and all - so src/disk/home/ed becomes home/ed, and the
  * folders it needs are made on the way. A PATH that is itself a folder is
  * made and left empty, which is the only way one with nothing in it yet can
@@ -33,6 +34,8 @@
 #include "mem.h"
 
 #define SECTOR_SIZE 512
+#define WORKING     (1u << 24)  /* room while writing: 8 GiB, past whatever is
+                                   there already, in a sparse file */
 
 static int image;
 
@@ -147,21 +150,21 @@ static void make_folders(const char *name) {
 
 int main(int argc, char **argv) {
     if (argc < 5) {
-        fprintf(stderr, "usage: %s IMAGE SECTORS ROOT KERNEL_BIN [FILE...]\n", argv[0]);
+        fprintf(stderr, "usage: %s IMAGE FREE ROOT KERNEL_BIN [FILE...]\n", argv[0]);
         return 1;
     }
-    uint32_t sectors = (uint32_t)strtoul(argv[2], NULL, 0);
+    uint32_t free_sectors = (uint32_t)((strtoull(argv[2], NULL, 0) + SECTOR_SIZE - 1) / SECTOR_SIZE);
     const char *root = argv[3];
 
     image = open(argv[1], O_RDWR | O_CREAT, 0644);
-    if (image < 0 || ftruncate(image, (off_t)sectors * SECTOR_SIZE) < 0) {
+    if (image < 0 || ftruncate(image, (off_t)WORKING * 2 * SECTOR_SIZE) < 0) {
         perror(argv[1]);
         return 1;
     }
 
     size_t size;
 
-    if (fs_init() != 0 && fs_format(sectors) != 0) {
+    if (fs_init() == 0 ? fs_resize(WORKING) < 0 : fs_format(WORKING) != 0) {
         fprintf(stderr, "%s: cannot format\n", argv[1]);
         return 1;
     }
@@ -223,6 +226,13 @@ int main(int argc, char **argv) {
             return 1;
         }
         free(data);
+    }
+
+    long sectors = fs_resize(free_sectors);
+
+    if (sectors < 0 || ftruncate(image, (off_t)sectors * SECTOR_SIZE) < 0) {
+        fprintf(stderr, "%s: cannot size\n", argv[1]);
+        return 1;
     }
     return 0;
 }

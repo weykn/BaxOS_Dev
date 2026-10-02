@@ -14,7 +14,7 @@
  *
  * Waiting for a key is also the only time the machine is idle, so everything
  * that has to keep moving without interrupts moves here: the clock in the
- * status bar, the wallpaper, and writing out what the last program did. */
+ * status bar, and writing out what the last program did. */
 
 /* A plain terminal again: lines gathered here, typing echoed, Ctrl-D ending
    the input. Run before each program, so one that left the terminal raw

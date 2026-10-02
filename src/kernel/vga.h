@@ -68,22 +68,9 @@ const char *vga_font(void);
 /* Blanks the screen and puts the cursor in its corner. */
 void vga_clear(void);
 
-/* The screen in pixels, which is what a picture behind the text is drawn in. */
+/* The screen in pixels. */
 unsigned vga_pixel_width(void);
 unsigned vga_pixel_height(void);
-
-/* Packs a colour the way this screen's pixels want it. */
-uint32_t vga_rgb(uint8_t r, uint8_t g, uint8_t b);
-
-/* A picture behind the text: one pixel for each of the screen's, which the
-   caller owns and keeps for as long as it is in use, or NULL for plain
-   black. Wherever a cell's background is black, the picture shows through.
-   The screen is repainted either way. */
-void vga_background(const uint32_t *picture);
-
-/* Whether a wallpaper is in use. It is dropped if the screen changes size
-   under it, so whoever owns the pixels has to look. */
-bool vga_has_background(void);
 
 /* Reads and writes one cell anywhere on screen, title bar included, as a
    character in the low byte and an attribute in the high one. For things

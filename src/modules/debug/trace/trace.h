@@ -35,7 +35,7 @@ struct log_entry {
     uint64_t a, b, c;           /* the call's arguments */
     uint64_t result;
     uint32_t number;            /* the syscall number, as in syscall.h */
-    uint8_t  who;               /* which program: log_who spells it out */
+    uint8_t  who;               /* which program, as log_program named it */
     uint8_t  returned;          /* false while the call is still running */
 };
 
@@ -43,9 +43,6 @@ struct log_entry {
    back the name that was being recorded before - which a program that starts
    another puts back when that one ends. NULL is the kernel's own. */
 static const char *log_program(const char *name);
-
-/* The name that goes with an entry, or "kernel". */
-static const char *log_who(const struct log_entry *entry);
 
 /* Records the start of a call and returns the entry to finish, or NULL if
    logging is off. */
@@ -58,13 +55,6 @@ static void log_end(struct log_entry *entry, uint64_t result);
 /* Entries held right now, at most LOG_SIZE. */
 static unsigned log_count(void);
 
-/* Syscalls made since boot, including any already written out. */
-static unsigned log_total(void);
-
-/* How many were dropped rather than kept, because the ring filled before the
-   machine was next idle. */
-static unsigned log_dropped(void);
-
 /* Entry i, counting 0 as the oldest one still held. */
 static const struct log_entry *log_get(unsigned i);
 
@@ -76,12 +66,6 @@ static size_t log_format(const struct log_entry *entry, char *buf);
    the ring. Called when the ring fills and when a program ends; a folder
    named /var/log is made if there is none. */
 static void log_flush(void);
-
-static void log_clear(void);
-
-/* Whether calls are being recorded. Logging starts on. */
-static int  log_enabled(void);
-static void log_enable(int on);
 
 /* The name of a syscall number, or NULL if this kernel has none. */
 static const char *log_name(uint64_t number);

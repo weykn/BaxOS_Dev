@@ -24,7 +24,7 @@
  * go of rather than refusing the free - a few pages lost, never a crash. */
 
 #define PAGE  4096
-#define RUNS  128
+#define RUNS  64
 
 static struct run {
     uint64_t at, count;
@@ -247,10 +247,11 @@ void mem_free(void *memory) {
  * guarded or write-protected something of its own: over a hundred pages of
  * tables, for protection that is nobody's once it is gone. The kernel's are
  * all of memory one to one, readable, writable and runnable, a gigabyte an
- * entry: three pages. The first gigabyte is two-megabyte entries instead,
- * since that is where a program linked to a fixed address is put (vm.c). A
- * processor without gigabyte pages gets a directory a gigabyte up to the top
- * of memory - four at least, for what is mapped below 4 GiB. */
+ * entry: two pages. The first gigabyte gets a directory of two-megabyte
+ * entries only once a program linked to a fixed address wants it (vm.c) -
+ * here, if one already has. A processor without gigabyte pages gets a
+ * directory a gigabyte up to the top of memory - four at least, for what is
+ * mapped below 4 GiB. */
 
 #define PRESENT 0x01
 #define WRITE   0x02
@@ -268,7 +269,7 @@ bool mem_own_tables(uint64_t top) {
 
     __asm__ volatile("cpuid" : "+a"(a), "=b"(b), "+c"(c), "=d"(d));
     bool gig = (d >> 26) & 1;
-    uint64_t gigs = gig ? 1 : (top + (1ull << 30) - 1) >> 30;
+    uint64_t gigs = gig ? (vm_low_used() ? 1 : 0) : (top + (1ull << 30) - 1) >> 30;
 
     if (!gig && gigs < 4) {
         gigs = 4;
@@ -318,7 +319,7 @@ void mem_take_over(const void *map, size_t size, size_t stride) {
     /* Onto the kernel's own tables, and what programs had hung off the
        firmware's with them: the firmware's are then as free as the rest of
        its memory. */
-    vm_move((uint64_t *)own_cr3, (uint64_t *)(own_cr3 + 2 * PAGE));
+    vm_move((uint64_t *)own_cr3, own_pages > 2 ? (uint64_t *)(own_cr3 + 2 * PAGE) : NULL);
     __asm__ volatile("mov %0, %%cr3" : : "r"(own_cr3) : "memory");
 
     for (size_t at = 0; at < size; at += stride) {
@@ -398,7 +399,6 @@ void mem_get_stats(struct mem_stats *stats) {
     stats->page_tables = (uint32_t)(program_tables() + own_pages * PAGE);
     stats->console = (uint32_t)vga_memory();
     stats->disk_cache = disk_cache != NULL ? (uint32_t)disk_cache->memory() : 0;
-    stats->wallpaper = wallpaper != NULL ? wallpaper->memory() : 0;
     stats->modules = module_memory();
     stats->network = net != NULL ? net->memory() : 0;
     stats->window = (uint32_t)program_memory();
@@ -409,7 +409,7 @@ void mem_get_stats(struct mem_stats *stats) {
        agree with a program that measured memory while running. The window is
        reported on its own, by whatever wants to show it. */
     stats->kernel_kib = (stats->image + stats->data + stats->stack + stats->page_tables +
-                       stats->console + stats->wallpaper + stats->network + stats->modules +
+                       stats->console + stats->network + stats->modules +
                        1023) / 1024;
 
     /* The stack started out zeroed, so its deepest non-zero byte marks how

@@ -1,7 +1,6 @@
 /* debug/trace: a record of every syscall, in a ring, written to
- * /var/log/<program>.log whenever the machine is idle - and the `log`
- * command that shows it. Off unless enabled: it costs a disk write after
- * every command. */
+ * /var/log/<program>.log whenever the machine is idle. Only while the module
+ * is loaded: it costs a disk write after every command. */
 
 #include "trace.h"
 
@@ -13,7 +12,6 @@
 #include "syscall.h"
 #include "driver.h"
 #include "module.h"
-#include "proc.h"
 #include "vga.h"
 
 #define LOG_DIR      "/var/log"
@@ -27,11 +25,9 @@
    whichever total is about to overwrite. `written` is how much of it has gone
    to disk already. */
 static struct log_entry entries[LOG_SIZE];
-static unsigned total, written, dropped;
-/* Off until something asks for it. Writing what a program did costs a disk
-   write, and a disk write is ten milliseconds the machine spends not
-   listening to the keyboard - felt as the shell stopping for a moment after
-   every command. `log on` is worth that; running is not. */
+static unsigned total, written;
+/* On while the module is loaded, and off for good if the disk will not take
+   the log. */
 static int      enabled;
 static bool     flushing;   /* the writes a flush makes are not logged */
 
@@ -159,10 +155,6 @@ static const char *log_name(uint64_t number) {
 
 /* ---- who --------------------------------------------------------------- */
 
-static const char *log_who(const struct log_entry *entry) {
-    return entry->who == 0 ? "kernel" : who_names[entry->who - 1];
-}
-
 /* Where in the ring the entries that have yet to go to disk begin. */
 static unsigned unwritten(void) {
     return log_count() - (total - written);
@@ -230,7 +222,6 @@ static struct log_entry *log_begin(uint32_t number, uint64_t a, uint64_t b, uint
            program did. Writing it all out here instead would be a disk write
            in the middle of a running program, and felt as one. */
         written++;
-        dropped++;
     }
     struct log_entry *entry = &entries[total % LOG_SIZE];
 
@@ -251,10 +242,6 @@ static unsigned log_count(void) {
     return total < LOG_SIZE ? total : LOG_SIZE;
 }
 
-static unsigned log_total(void) {
-    return total;
-}
-
 static const struct log_entry *log_get(unsigned i) {
     if (i >= log_count()) {
         return NULL;
@@ -263,37 +250,6 @@ static const struct log_entry *log_get(unsigned i) {
        will go, so counting starts there instead of at slot 0. */
     unsigned oldest = total < LOG_SIZE ? 0 : total % LOG_SIZE;
     return &entries[(oldest + i) % LOG_SIZE];
-}
-
-static unsigned log_dropped(void) {
-    return dropped;
-}
-
-static void log_clear(void) {
-    char running[LOG_NAME] = "";
-
-    /* Whatever is running is still running, and its next call is still its
-       own - so its name survives the entries being thrown away. */
-    if (who_now != 0) {
-        strcpy(running, who_names[who_now - 1]);
-    }
-    total = written = dropped = 0;
-    who_now = 0;
-    memset(who_names, 0, sizeof who_names);
-    if (running[0] != '\0') {
-        log_program(running);
-    }
-}
-
-static int log_enabled(void) {
-    return enabled;
-}
-
-static void log_enable(int on) {
-    if (!on) {
-        log_flush();
-    }
-    enabled = on;
 }
 
 /* ---- formatting -------------------------------------------------------- */
@@ -446,51 +402,6 @@ static void log_flush(void) {
     flushing = false;
 }
 
-/* ---- the log -------------------------------------------------------------
- *
- * What is on screen is the ring: the last few dozen calls, whoever made
- * them. What has been written out is on the disk, under /var/log, a file per
- * program, put there whenever the machine is idle. */
-
-static void cmd_log(char *args) {
-    const char *what = str_word(&args);
-
-    if (strcmp(what, "clear") == 0) {
-        log_clear();
-        return;
-    }
-    if (strcmp(what, "on") == 0 || strcmp(what, "off") == 0) {
-        log_enable(strcmp(what, "on") == 0);
-        return;
-    }
-    if (*what != '\0') {
-        vga_puts("usage: log [on|off|clear]\n");
-        return;
-    }
-    for (unsigned i = 0; i < log_count(); i++) {
-        const struct log_entry *e = log_get(i);
-        char text[LOG_LINE];
-
-        log_format(e, text);
-        vga_set_color(VGA_LIGHTCYAN, VGA_BLACK);
-        kprintf("%s", log_who(e));
-        vga_set_color(VGA_LIGHTGRAY, VGA_BLACK);
-        vga_puts(text);
-    }
-    vga_set_color(VGA_DARKGRAY, VGA_BLACK);
-    kprintf("  %u call%s since boot", log_total(), log_total() == 1 ? "" : "s");
-    if (log_total() > log_count()) {
-        kprintf(", last %u held", log_count());
-    }
-    if (!log_enabled()) {
-        vga_puts(", logging off");
-    } else if (log_dropped() > 0) {
-        kprintf(", %u dropped", log_dropped());
-    }
-    vga_putc('\n');
-    vga_set_color(VGA_LIGHTGRAY, VGA_BLACK);
-}
-
 /* ---- the module ------------------------------------------------------- */
 
 static void *begin(uint32_t number, uint64_t a, uint64_t b, uint64_t c) {
@@ -502,19 +413,16 @@ static void end(void *entry, uint64_t result) {
 }
 
 static const struct tracer ops = { begin, end, log_program, log_flush };
-static const struct proc_cmd log_cmd = { "log", "[on|off|clear]", cmd_log };
 
 MODULE_EXPORT int module_init(void) {
     enabled = 1;                    /* enabling the module is asking for it */
     tracer_register(&ops);
-    proc_add(&log_cmd);
     return 0;
 }
 
 /* What is held goes to the disk first. */
 MODULE_EXPORT int module_exit(void) {
     log_flush();
-    proc_remove(&log_cmd);
     tracer_register(NULL);
     return 0;
 }

@@ -1,6 +1,0 @@
-export PATH=/proc:/usr/bin
-export MODPATH=/usr/lib/modules
-export HOME=/root
-export TERM=linux
-export TMPDIR=/tmp
-export LANG=C

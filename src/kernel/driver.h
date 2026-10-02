@@ -41,13 +41,6 @@ struct keyboard_driver {
     char (*key)(void);              /* the next character typed, or 0 */
 };
 
-/* The picture behind the text (display/wallpaper). */
-struct wallpaper {
-    void     (*refresh)(void);      /* again, at the screen's new size */
-    void     (*check)(void);        /* back, if the screen dropped it */
-    uint32_t (*memory)(void);
-};
-
 /* A record of the syscalls programs make (debug/trace). begin answers
    what end is handed back, or NULL for nothing to finish; program names
    whose calls these are from now on, and answers the name before, which
@@ -66,11 +59,9 @@ extern const struct disk_driver    *disk_driver;
 extern const struct disk_cache     *disk_cache;
 extern const struct tracer         *tracer;
 extern const struct keyboard_driver *keyboard_driver;
-extern const struct wallpaper      *wallpaper;
 
 /* Called by a module as it starts, and with NULL as it goes. */
 void disk_register(const struct disk_driver *d);
 void disk_cache_register(const struct disk_cache *c);
 void keyboard_register(const struct keyboard_driver *k);
-void wallpaper_register(const struct wallpaper *w);
 void tracer_register(const struct tracer *t);

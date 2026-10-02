@@ -24,9 +24,6 @@ static uint64_t last_key;
 static char idle(void) {
     vga_follow();                /* the firmware may have taken the screen
                                     back; this notices and repaints */
-    if (wallpaper != NULL) {
-        wallpaper->check();      /* ...and that loses the wallpaper */
-    }
     /* The syscalls of whatever ran last, to /log - but only once the
        keyboard has been quiet for a moment. Writing costs a tenth of a
        second, and doing it the instant a command finishes put that delay in

@@ -3542,7 +3542,6 @@ void syscall_init(void) {
     gdt_init();
     sse_init();
     traps_init();
-    vm_start();                     /* the region a program runs in */
     wrmsr(MSR_EFER, rdmsr(MSR_EFER) | EFER_SCE);
     /* syscall takes its code segment from one half and sysret counts on from
        the other: the four descriptors gdt_init laid down, in their order. */
@@ -3903,6 +3902,7 @@ int program_load(const struct fs_file *file, uint64_t *entry) {
     dbg("load: %s size %u\n", file->name, (uint64_t)file->size);
     memset(mappings, 0, sizeof mappings);   /* nothing of the last one is owed */
     vm_reset();
+    vm_start();                     /* the region it runs in */
     started_base = 0;
     started_phdr = started_phent = started_phnum = 0;
 

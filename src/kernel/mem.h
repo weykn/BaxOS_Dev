@@ -70,7 +70,6 @@ struct mem_stats {
     uint32_t console;       /* the console's cells, taken from the firmware */
     uint32_t disk_cache;    /* what the disk cache holds: free memory lent out,
                                so not in kernel_kib */
-    uint32_t wallpaper;     /* the picture behind the text, if there is one */
     uint32_t modules;       /* the loaded modules' own code and data */
     uint32_t network;       /* the network's buffers, the card's and sockets' */
     uint32_t window;        /* what the running program has, the tables

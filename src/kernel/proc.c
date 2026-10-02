@@ -95,12 +95,6 @@ static void list(const char *(*name)(unsigned), const char *now) {
 
 /* ---- the screen ---------------------------------------------------------- */
 
-static void refresh(void) {
-    if (wallpaper != NULL) {
-        wallpaper->refresh();
-    }
-}
-
 static void cmd_mode(char *args) {
     const char *name = str_word(&args);
 
@@ -112,8 +106,6 @@ static void cmd_mode(char *args) {
     if (*name != '\0') {
         if (vga_set_mode(name) < 0) {
             error("mode: %s: no such mode\n", name);
-        } else {
-            refresh();              /* the picture is the size of the screen */
         }
         return;
     }
@@ -136,8 +128,6 @@ static void cmd_scale(char *args) {
         kprintf("  %s\n", vga_scale());
     } else if (vga_set_scale(name) < 0) {
         error("scale: %s: not a size within %s\n", name, vga_mode());
-    } else {
-        refresh();                  /* the picture is the size of the screen */
     }
 }
 
@@ -198,9 +188,6 @@ static void cmd_mem(char *args) {
     }
     if (m.network > 0) {
         PART("network", m.network);
-    }
-    if (m.wallpaper > 0) {
-        PART("wallpaper", m.wallpaper);
     }
     PART("the program", m.window);
 #undef PART
@@ -283,8 +270,8 @@ static const struct proc_cmd commands[] = {
 
 #define COMMAND_COUNT (sizeof commands / sizeof commands[0])
 
-/* Commands a module added, packed at the front. */
-#define ADDED 4
+/* Commands a module added - cache and net - packed at the front. */
+#define ADDED 2
 static const struct proc_cmd *added[ADDED];
 
 const struct proc_cmd *proc_at(unsigned i) {

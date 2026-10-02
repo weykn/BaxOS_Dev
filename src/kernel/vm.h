@@ -28,7 +28,8 @@
 
 #define VM_PAGE 4096
 
-/* Finds room in the firmware's tables. False if there is none. */
+/* Takes the region the program at this level runs in, if it has none yet:
+   a free slot of the top-level table. False if there is none. */
 bool vm_start(void);
 
 /* Where the program's region begins and ends. Zero until vm_start. */
@@ -49,6 +50,10 @@ void vm_firmware_view(bool on);
    top is the new top-level table, pd its directory for the first gigabyte.
    What programs have hung off the firmware's is carried across. */
 void vm_move(uint64_t *top, uint64_t *pd);
+
+/* Whether a program linked to a fixed address has had the first gigabyte's
+   directory: then vm_move needs a pd to carry it to. */
+bool vm_low_used(void);
 
 /* The page tables the machine has for good: the first region's top table,
    and what low memory has cost. */
