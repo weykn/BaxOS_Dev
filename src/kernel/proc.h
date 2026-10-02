@@ -35,5 +35,14 @@ bool proc_folder(const char *path);
    many bytes that is, and copies at most max of them from offset on. */
 size_t proc_read(const struct proc_cmd *cmd, unsigned offset, char *out, size_t max);
 
+/* A command a module brings, until it takes it away again. False if there
+   is no room for another. */
+bool proc_add(const struct proc_cmd *cmd);
+void proc_remove(const struct proc_cmd *cmd);
+
 /* Runs one, with the rest of the command line as its arguments. */
 void proc_run(const struct proc_cmd *cmd, char *args);
+
+/* A labelled bar of used out of total, in unit, as `mem` draws one - for the
+   commands modules bring. */
+void usage_bar(const char *label, unsigned used, unsigned total, const char *unit);

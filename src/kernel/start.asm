@@ -14,7 +14,7 @@ SECTION .text.start
 GLOBAL _start
 GLOBAL stack_bottom, stack_top
 EXTERN kernel_main
-EXTERN __rela_start, __rela_end
+EXTERN __rela_start, __rela_end, __relr_start, __relr_end
 
 R_X86_64_RELATIVE equ 8
 
@@ -43,6 +43,41 @@ _start:
     add rsi, 24
     jmp .relocate
 .relocated:
+    ; Most of them come packed as RELR instead: an even entry is an offset
+    ; to relocate, and the word after it is the next; an odd one is a bitmap
+    ; of the 63 words from there on, one bit each, before moving past them.
+    ; Each word relocated has the base added to what it already holds.
+    lea rsi, [__relr_start]
+    lea rdx, [__relr_end]
+    xor r9, r9                      ; where the next word to relocate is
+.relr:
+    cmp rsi, rdx
+    jae .relrd
+    mov rax, [rsi]
+    add rsi, 8
+    test al, 1
+    jnz .bitmap
+    lea r9, [r8 + rax]
+    add [r9], r8
+    add r9, 8
+    jmp .relr
+.bitmap:
+    shr rax, 1                      ; the marker bit goes
+    mov rcx, r9
+.bit:
+    test rax, rax
+    jz .bits_done
+    test al, 1
+    jz .skip
+    add [rcx], r8
+.skip:
+    shr rax, 1
+    add rcx, 8
+    jmp .bit
+.bits_done:
+    add r9, 63 * 8
+    jmp .relr
+.relrd:
     xor rbp, rbp                ; terminate the frame-pointer chain
     call kernel_main
 

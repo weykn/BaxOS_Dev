@@ -13,12 +13,13 @@
 
 #define GLYPH_W 8
 
-/* The text sizes, named by how tall a character cell ends up. There are two
-   sets of shapes in the image; the larger sizes are the 8x16 one drawn with
-   every glyph pixel as a square block, which costs nothing but the drawing. */
+/* The text sizes, named by how tall a character cell ends up. There is one
+   set of shapes in the image, 8x16: the larger sizes draw every glyph pixel
+   as a square block, and 8 draws each pair of scan lines as one, which costs
+   nothing but the drawing. */
 static const struct font {
     const char *name;
-    uint8_t     height;     /* the shapes it draws from, in scan lines */
+    uint8_t     height;     /* scan lines of the glyph it draws */
     uint8_t     scale;      /* pixels drawn per glyph pixel */
 } fonts[] = {
     { "8",   8, 1 },
@@ -148,7 +149,8 @@ static void emit(unsigned x, unsigned y, const uint32_t *px, unsigned n) {
    background is black shows the wallpaper instead, where there is one: that
    is the whole of how the text comes to sit on a picture. */
 static void draw_cell(size_t i, uint16_t value) {
-    const uint8_t *glyph = shapes + (value & 0xFF) * glyphs->height;
+    const uint8_t *glyph = shapes + (value & 0xFF) * 16;
+    unsigned step = 16 / glyphs->height;
     uint32_t fg = palette[value >> 8 & 0x0F];
     uint32_t bg = palette[value >> 12 & 0x0F];
     const uint32_t *behind = picture != NULL && (value >> 12 & 0x0F) == VGA_BLACK
@@ -158,7 +160,7 @@ static void draw_cell(size_t i, uint16_t value) {
     uint32_t line[GLYPH_W * 4];         /* one scan line, at the largest scale */
 
     for (unsigned y = 0; y < glyphs->height; y++) {
-        uint8_t bits = glyph[y];
+        uint8_t bits = glyph[y * step] | glyph[y * step + step - 1];
 
         /* Each scan line of the glyph is drawn scale times, and each of its
            pixels scale times across, which is what makes the cell bigger. */
@@ -248,7 +250,7 @@ static void put(size_t i, uint16_t value) {
 
 static void use_font(const struct font *f) {
     glyphs = f;
-    shapes = font_glyphs(f->height);
+    shapes = font_glyphs();
     cell_w = GLYPH_W * f->scale;
     cell_h = f->height * f->scale;
 }
@@ -323,6 +325,10 @@ static bool parse_size(const char *s, unsigned *w, unsigned *h) {
             return false;
         }
     }
+}
+
+uint64_t vga_framebuffer_end(void) {
+    return (uint64_t)fb + (uint64_t)fb_pitch * real_h * 4;
 }
 
 /* Takes the framebuffer the firmware is using now. */

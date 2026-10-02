@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -56,6 +57,10 @@ struct fs_stats {
 
 /* Checks the disk has a filesystem. Returns 0 or FS_EIO. */
 int fs_init(void);
+
+/* Sizes the cache of recent sectors for reads that are slow - the
+   firmware's, at boot - or quick. */
+void fs_cache(bool slow);
 
 /* Writes an empty file table for a disk of disk_sectors sectors. */
 int fs_format(uint32_t disk_sectors);

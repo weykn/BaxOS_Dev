@@ -37,8 +37,12 @@ CFLAGS := -Isrc/kernel $(if $(filter 1,$(DEBUG)),-DDEBUG) -std=gnu11 -Oz -flto -
 # The kernel is linked through gcc so LTO can run, as a static PIE at 0 that
 # relocates itself (start.asm). --no-warn-rwx-segments: a flat binary has no
 # segment permissions to enforce.
+# -z pack-relative-relocs: the relocations as RELR, a bitmap of where they
+# are, rather than 24 bytes apiece - a fortieth of the size, in an image
+# that has to hold them for good.
 LDFLAGS := -static-pie \
-           -Wl,-n,--no-warn-rwx-segments,--gc-sections,--build-id=none,-T,src/kernel/kernel.ld
+           -Wl,-n,--no-warn-rwx-segments,--gc-sections,--build-id=none,-T,src/kernel/kernel.ld \
+           -Wl,-z,pack-relative-relocs
 
 # The loader is built by a compiler that emits PE and speaks the calling
 # convention UEFI uses; subsystem 10 is what makes firmware accept the file.
@@ -49,6 +53,26 @@ EFIFLAGS := -std=gnu11 -Oz -Wall -Wextra -ffreestanding -fno-builtin -nostdlib \
 # legacy/ holds the drivers the BIOS path used, and is not built; see the
 # README there.
 KSRCS := $(shell find src/kernel -name '*.c')
+
+# Kernel modules, Tuxlet's own format rather than Linux's: src/modules/
+# <category>/<name>.c - or every .c in the folder <category>/<name>/ -
+# becomes /usr/lib/modules/<category>/<name>.kmod on the disk, loaded by
+# modman. Each is a shared object linked against nothing: what it calls is
+# resolved by name when it is loaded (src/kernel/module.c). Hidden by
+# default, so only what a module marks MODULE_EXPORT is seen by the others;
+# SysV hashing, since the loader counts symbols by the hash table's chain.
+MSRCS    := $(shell find src/modules -name '*.c')
+MODULES  := $(sort $(foreach c,$(MSRCS),$(BUILD)/$(shell echo $(c:src/%=%) | \
+                cut -d/ -f1-3 | sed 's/\.c$$//').kmod))
+# No PLT and no CET landing pads: a call into the kernel goes through the GOT,
+# and every byte counts, since a module is loaded in whole pages.
+MCFLAGS  := $(filter-out -flto -fpie,$(CFLAGS)) -fPIC -fvisibility=hidden -fno-plt \
+            -fcf-protection=none
+# Its segments are packed rather than page-aligned: nothing maps a module,
+# it is copied into RAM whole, and the alignment was most of what one cost.
+MLDFLAGS := -shared -nostdlib -s \
+            -Wl,--hash-style=sysv,-z,noseparate-code,--gc-sections,--build-id=none \
+            -Wl,-z,max-page-size=16,-z,common-page-size=16,-z,norelro
 KASMS := $(shell find src/kernel -name '*.asm' ! -name start.asm)
 KOBJS := $(KSRCS:src/%.c=$(BUILD)/%.o) $(KASMS:src/%.asm=$(BUILD)/%.o)
 
@@ -104,6 +128,17 @@ $(BUILD)/%.o: src/%.asm $(FLAGS_FILE)
 	@mkdir -p $(@D)
 	$(NASM) -f elf64 $< -o $@
 
+$(BUILD)/modules/%.o: src/modules/%.c $(FLAGS_FILE)
+	@mkdir -p $(@D)
+	$(CC) $(MCFLAGS) -MMD -MP -c $< -o $@
+
+# A module's objects: its one file, or everything in its folder.
+mod_objs = $(patsubst src/%.c,$(BUILD)/%.o,$(wildcard src/modules/$(1).c src/modules/$(1)/*.c))
+
+.SECONDEXPANSION:
+$(BUILD)/modules/%.kmod: $$(call mod_objs,$$*)
+	$(CC) $(MLDFLAGS) $^ -o $@
+
 $(KERNEL_ELF): $(START_OBJ) $(KOBJS) src/kernel/kernel.ld
 	$(CC) $(CFLAGS) $(LDFLAGS) $(START_OBJ) $(KOBJS) -o $@
 
@@ -129,8 +164,9 @@ $(MKFS): tools/mkfs.c src/kernel/fs.c src/kernel/fs.h src/kernel/ata.h
 
 # The filesystem partition is updated in place rather than recreated, so files
 # saved from inside Tuxlet OS survive a rebuild. `make clean` wipes them.
-$(FS_IMG): $(KERNEL_BIN) $(MKFS) $(DISK_FILES)
-	$(MKFS) $@ $(FS_SECTORS) $(DISK_ROOT) $(KERNEL_BIN) $(DISK_FILES)
+$(FS_IMG): $(KERNEL_BIN) $(MKFS) $(DISK_FILES) $(MODULES)
+	$(MKFS) $@ $(FS_SECTORS) $(DISK_ROOT) $(KERNEL_BIN) $(DISK_FILES) \
+	    $(foreach m,$(MODULES),usr/lib/$(m:$(BUILD)/%=%)=$(m))
 
 $(IMAGE): $(LOADER) $(FS_IMG)
 	@rm -f $@
@@ -143,7 +179,7 @@ $(IMAGE): $(LOADER) $(FS_IMG)
 	@dd if=$(FS_IMG) of=$@ bs=512 seek=$(FS_LBA) conv=notrunc status=none
 	@echo "$@: EFI system partition + filesystem"
 
--include $(KOBJS:.o=.d)
+-include $(KOBJS:.o=.d) $(patsubst src/%.c,$(BUILD)/%.d,$(MSRCS))
 
 # OVMF stands in for a real machine's firmware. The variables file is copied
 # so that boot entries written by the firmware do not dirty the system's.
@@ -160,7 +196,9 @@ run: $(IMAGE)
 	qemu-system-x86_64 $(ACCEL) \
 	    -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 	    -drive if=pflash,format=raw,file=$(BUILD)/ovmf_vars.fd \
-	    -drive format=raw,file=$(IMAGE) -net none -m 1G
+	    -drive format=raw,file=$(IMAGE) -nic user,model=e1000 -m 67M
 
+# -nic none
+# -nic user,model=e1000
 clean:
 	rm -rf $(BUILD)

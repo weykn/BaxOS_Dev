@@ -1,0 +1,5 @@
+# Kernel modules to load at boot: modman enable <category/name>
+modman enable storage/ide
+modman enable storage/cache
+modman enable input/ps2
+modman auto network

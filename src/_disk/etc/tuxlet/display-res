@@ -1,0 +1,4 @@
+# Set the screen size as <width>x<height>
+mode 1920x1080
+# Draw at a smaller <width>x<height> scaled up
+scale off

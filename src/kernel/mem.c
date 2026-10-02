@@ -1,14 +1,17 @@
 #include "mem.h"
 
 #include "ata.h"
-#include "bg.h"
+#include "driver.h"
 #include "boot.h"
 #include "debug.h"
 #include "efi.h"
 #include "efi_kernel.h"
 #include "string.h"
+#include "module.h"
+#include "net.h"
 #include "syscall.h"
 #include "vga.h"
+#include "vm.h"
 
 /* ---- the pages ------------------------------------------------------------
  *
@@ -114,7 +117,20 @@ static bool run_take(uint64_t page) {
     return false;
 }
 
+static uint64_t take(size_t count);
+
+/* Memory the disk cache holds is free memory lent out: before an allocation
+   fails, the cache gives some back, as Linux's page cache does. */
 uint64_t mem_pages(size_t count) {
+    uint64_t at;
+
+    while ((at = take(count)) == 0 && disk_cache != NULL &&
+           disk_cache->shrink(count * PAGE) > 0) {
+    }
+    return at;
+}
+
+static uint64_t take(size_t count) {
     if (!ours) {
         uint64_t at = 0;
 
@@ -128,6 +144,42 @@ uint64_t mem_pages(size_t count) {
 
             if (runs[i].count == 0) {
                 run_remove(i);
+            }
+            return at;
+        }
+    }
+    return 0;
+}
+
+static uint64_t take_below(size_t count, uint64_t limit);
+
+uint64_t mem_pages_below(size_t count, uint64_t limit) {
+    uint64_t at;
+
+    while ((at = take_below(count, limit)) == 0 && disk_cache != NULL &&
+           disk_cache->shrink(count * PAGE) > 0) {
+    }
+    return at;
+}
+
+static uint64_t take_below(size_t count, uint64_t limit) {
+    if (!ours) {
+        uint64_t at = limit - 1;
+
+        return EFI_ERROR(firmware()->allocate_pages(EFI_ALLOCATE_MAX, EFI_LOADER_DATA,
+                                                    count, &at)) ? 0 : at;
+    }
+    for (unsigned i = run_count; i-- > 0;) {
+        uint64_t end = runs[i].at + runs[i].count * PAGE;
+
+        if (end > limit) {
+            end = limit;
+        }
+        if (end >= runs[i].at + count * PAGE) {
+            uint64_t at = end - count * PAGE;
+
+            for (size_t k = 0; k < count; k++) {
+                run_take(at + k * PAGE);
             }
             return at;
         }
@@ -189,60 +241,85 @@ void mem_free(void *memory) {
     }
 }
 
-/* The page table pages the processor is walking right now, which the
-   firmware made in memory that is about to be called free. Two-megabyte and
-   one-gigabyte entries map memory rather than naming another table. */
+/* ---- the kernel's own page tables -----------------------------------------
+ *
+ * The firmware's tables map memory four kilobytes at a time wherever it
+ * guarded or write-protected something of its own: over a hundred pages of
+ * tables, for protection that is nobody's once it is gone. The kernel's are
+ * all of memory one to one, readable, writable and runnable, a gigabyte an
+ * entry: three pages. The first gigabyte is two-megabyte entries instead,
+ * since that is where a program linked to a fixed address is put (vm.c). A
+ * processor without gigabyte pages gets a directory a gigabyte up to the top
+ * of memory - four at least, for what is mapped below 4 GiB. */
+
 #define PRESENT 0x01
 #define WRITE   0x02
 #define HUGE    0x80
-#define NX      (1ull << 63)
-#define ADDR    0x000FFFFFFFFFF000ull
 
-/* Makes page reachable at its own address, readable, writable and not
-   refused for executing. The firmware's tables map all of memory that way
-   except where it chose not to: guard pages around its own allocations left
-   out, its code made read-only, its data made unexecutable. Those are ours
-   now. False if no table reaches it at all. */
-static bool open_page(uint64_t cr3, uint64_t page) {
-    uint64_t *entry = (uint64_t *)(cr3 & ADDR);
+static uint64_t own_cr3;            /* the tables, contiguous: top, pdpt, directories */
+static size_t   own_pages;
 
-    for (unsigned shift = 39; ; shift -= 9) {
-        uint64_t *e = &entry[(page >> shift) & 511];
+#define ACPI_RECLAIM 9              /* the memory type of ACPI's tables */
 
-        if (shift == 12) {
-            *e = page | PRESENT | WRITE;
-            return true;
-        }
-        if (!(*e & PRESENT)) {
-            return false;
-        }
-        *e = (*e | WRITE) & ~NX;
-        if (*e & HUGE) {
-            return true;            /* two megabytes or a gigabyte at once */
-        }
-        entry = (uint64_t *)(*e & ADDR);
+static uint64_t reclaimed_kib;      /* of what the firmware kept, taken back */
+
+bool mem_own_tables(uint64_t top) {
+    uint32_t a = 0x80000001, b, c = 0, d;
+
+    __asm__ volatile("cpuid" : "+a"(a), "=b"(b), "+c"(c), "=d"(d));
+    bool gig = (d >> 26) & 1;
+    uint64_t gigs = gig ? 1 : (top + (1ull << 30) - 1) >> 30;
+
+    if (!gig && gigs < 4) {
+        gigs = 4;
     }
+    if (gigs > 512) {
+        gigs = 512;
+    }
+    size_t count = 2 + (size_t)gigs;
+    uint64_t at = mem_pages(count);
+
+    if (at == 0) {
+        return false;
+    }
+    uint64_t *pml4 = (uint64_t *)at, *pdpt = pml4 + 512, *pd = pdpt + 512;
+
+    memset(pml4, 0, PAGE);
+    for (uint64_t i = 0; i < 512; i++) {
+        pdpt[i] = i < gigs ? (uint64_t)&pd[i * 512] | PRESENT | WRITE
+                : gig      ? (i << 30) | PRESENT | WRITE | HUGE : 0;
+    }
+    for (uint64_t i = 0; i < gigs * 512; i++) {
+        pd[i] = (i << 21) | PRESENT | WRITE | HUGE;
+    }
+    pml4[0] = (uint64_t)pdpt | PRESENT | WRITE;
+    own_cr3 = at;
+    own_pages = count;
+    return true;
 }
 
-static void keep_tables(uint64_t table, unsigned level) {
-    const uint64_t *entry = (const uint64_t *)table;
+/* The loader takes KERNEL_BYTES for the kernel, which is what it may grow
+   to, not what it is: whatever lies past the end of its .bss is handed back
+   as soon as it runs. */
+void mem_trim_kernel(void) {
+    extern char __kernel_start[], __bss_end[];
+    uint64_t from = ((uint64_t)__bss_end + PAGE - 1) & ~(uint64_t)(PAGE - 1);
+    uint64_t to = (uint64_t)__kernel_start + KERNEL_BYTES;
 
-    run_take(table);
-    if (level == 1) {
-        return;
-    }
-    for (unsigned i = 0; i < 512; i++) {
-        if ((entry[i] & PRESENT) && !(level < 4 && (entry[i] & HUGE))) {
-            keep_tables(entry[i] & ADDR, level - 1);
-        }
+    if (to > from) {
+        mem_pages_free(from, (to - from) / PAGE);
     }
 }
 
 void mem_take_over(const void *map, size_t size, size_t stride) {
     struct { uint16_t limit; uint64_t base; } __attribute__((packed)) idtr;
-    uint64_t cr3;
-
     uint64_t kept[16] = { 0 };      /* KiB not taken, by type: for the log */
+
+    /* Onto the kernel's own tables, and what programs had hung off the
+       firmware's with them: the firmware's are then as free as the rest of
+       its memory. */
+    vm_move((uint64_t *)own_cr3, (uint64_t *)(own_cr3 + 2 * PAGE));
+    __asm__ volatile("mov %0, %%cr3" : : "r"(own_cr3) : "memory");
 
     for (size_t at = 0; at < size; at += stride) {
         const struct efi_memory_descriptor *d = (const void *)((const char *)map + at);
@@ -252,15 +329,18 @@ void mem_take_over(const void *map, size_t size, size_t stride) {
             kept[d->type] += count * 4;
         }
 
-        if (d->type != EFI_CONVENTIONAL_MEMORY && d->type > 4 &&
+        if (d->type != EFI_CONVENTIONAL_MEMORY && d->type > 4 && d->type != ACPI_RECLAIM &&
             start < (1ull << 30) && kept_low_count < KEPT_LOW) {
             kept_low[kept_low_count++] = (struct run){ start, count };
         }
         /* Free, or the firmware's for as long as it was running - its code,
-           its data, and the loader it started. Not loader data: that is
-           every page the kernel has, itself included. */
-        if (d->type != EFI_CONVENTIONAL_MEMORY && d->type != 1 &&
-            d->type != 3 && d->type != 4) {
+           its data, and the loader it started - or ACPI's tables, which
+           nothing here reads. Not loader data: that is every page the
+           kernel has, itself included. */
+        if (d->type == ACPI_RECLAIM) {
+            reclaimed_kib += count * 4;
+        } else if (d->type != EFI_CONVENTIONAL_MEMORY && d->type != 1 &&
+                   d->type != 3 && d->type != 4) {
             continue;
         }
         /* Page 0 would be taken for "none". */
@@ -275,35 +355,12 @@ void mem_take_over(const void *map, size_t size, size_t stride) {
     dbg("mem: kept KiB - loader data %u, runtime code %u, runtime data %u, "
         "ACPI %u, ACPI NVS %u, reserved %u\n", kept[2], kept[5], kept[6], kept[9],
         kept[10], kept[0]);
-    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
-    keep_tables(cr3 & ADDR, 4);
+    /* The firmware's IDT, which the kernel's handlers were put in. */
     __asm__ volatile("sidt %0" : "=m"(idtr));
     for (uint64_t page = idtr.base & ~(uint64_t)(PAGE - 1); page <= idtr.base + idtr.limit;
          page += PAGE) {
         run_take(page);
     }
-
-    /* Every page now free has to be one the kernel can use. A page no table
-       reaches is dropped rather than handed out to fault. The firmware may
-       have made its tables read-only as well, so write protection is off
-       while they are changed. */
-    uint64_t cr0;
-
-    __asm__ volatile("mov %%cr0, %0" : "=r"(cr0));
-    __asm__ volatile("mov %0, %%cr0" : : "r"(cr0 & ~(1ull << 16)) : "memory");
-    for (unsigned i = 0; i < run_count; i++) {
-        for (uint64_t n = 0; n < runs[i].count; n++) {
-            uint64_t page = runs[i].at + n * PAGE;
-
-            if (!open_page(cr3, page)) {
-                run_take(page);
-                i = (unsigned)-1;   /* the list changed: start over */
-                break;
-            }
-        }
-    }
-    __asm__ volatile("mov %0, %%cr3" : : "r"(cr3) : "memory");    /* flush */
-    __asm__ volatile("mov %0, %%cr0" : : "r"(cr0) : "memory");
     ours = true;
 }
 
@@ -330,7 +387,7 @@ static uint32_t span(const char *start, const char *end) {
 
 void mem_get_stats(struct mem_stats *stats) {
     stats->ram_kib = (uint32_t)efi_boot()->ram_kib;
-    stats->firmware_kib = (uint32_t)efi_boot()->firmware_kib;
+    stats->firmware_kib = (uint32_t)(efi_boot()->firmware_kib - reclaimed_kib);
     stats->total_kib = stats->ram_kib - stats->firmware_kib;
     stats->free_kib = (uint32_t)mem_free_kib();
     stats->used_kib = stats->ram_kib > stats->free_kib ?
@@ -338,10 +395,12 @@ void mem_get_stats(struct mem_stats *stats) {
     stats->image = span(__kernel_start, __bss_start);
     stats->stack = span(stack_bottom, stack_top);
     stats->data = span(__bss_start, __bss_end) - stats->stack;
-    stats->page_tables = (uint32_t)program_tables();
+    stats->page_tables = (uint32_t)(program_tables() + own_pages * PAGE);
     stats->console = (uint32_t)vga_memory();
-    stats->disk_cache = (uint32_t)ata_cache_memory();
-    stats->wallpaper = bg_memory();
+    stats->disk_cache = disk_cache != NULL ? (uint32_t)disk_cache->memory() : 0;
+    stats->wallpaper = wallpaper != NULL ? wallpaper->memory() : 0;
+    stats->modules = module_memory();
+    stats->network = net != NULL ? net->memory() : 0;
     stats->window = (uint32_t)program_memory();
     /* What the machine costs, which is everything above but the window: that
        is what whatever is running has borrowed, and it comes and goes with
@@ -350,7 +409,7 @@ void mem_get_stats(struct mem_stats *stats) {
        agree with a program that measured memory while running. The window is
        reported on its own, by whatever wants to show it. */
     stats->kernel_kib = (stats->image + stats->data + stats->stack + stats->page_tables +
-                       stats->console + stats->wallpaper + stats->disk_cache +
+                       stats->console + stats->wallpaper + stats->network + stats->modules +
                        1023) / 1024;
 
     /* The stack started out zeroed, so its deepest non-zero byte marks how

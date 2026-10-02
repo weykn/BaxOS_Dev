@@ -36,8 +36,9 @@ uint64_t efi_free_kib(void);
    drivers and everything it kept for itself become the kernel's memory. It
    only happens if the kernel can do without it - a PS/2 keyboard and an IDE
    disk holding the filesystem - and otherwise nothing changes and the
-   firmware's drivers go on being used. Returns whether it went. */
-bool efi_leave(void);
+   firmware's drivers go on being used. Only `modman takeover` asks for it,
+   once: the screen mode cannot change after. NULL if it went, else why not. */
+const char *efi_leave(void);
 
 /* Asks the machine to switch itself off; returns only if it would not. */
 void efi_power_off(void);

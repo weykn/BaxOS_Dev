@@ -17,15 +17,26 @@
 uint64_t mem_pages(size_t count);
 void     mem_pages_free(uint64_t at, size_t count);
 
+/* The same, all of it below limit: for a device that can only reach the
+   first four gigabytes. */
+uint64_t mem_pages_below(size_t count, uint64_t limit);
+
 /* bytes of memory, not zeroed, or NULL; given back with mem_free. Whole
    pages underneath, so for things that are big or do not stay long. */
 void *mem_alloc(size_t bytes);
 void  mem_free(void *memory);
 
+/* Builds the tables mem_take_over moves onto, while the firmware can still
+   give memory for them; top is the highest address there is to map. */
+bool mem_own_tables(uint64_t top);
+
 /* Takes the free memory in the firmware's final memory map for the kernel's
    own - the map got just before ExitBootServices succeeded - except the
-   pages still in use as page tables or the interrupt table. */
+   interrupt table, after moving onto the tables mem_own_tables built. */
 void mem_take_over(const void *map, size_t size, size_t stride);
+
+/* Gives back the part of the kernel's own region it does not use. */
+void mem_trim_kernel(void);
 
 /* Whether mem_take_over has happened: the firmware is gone. */
 bool mem_ours(void);
@@ -57,11 +68,14 @@ struct mem_stats {
     uint32_t stack_peak;    /* the most of the stack ever in use */
     uint32_t page_tables;   /* the fixed window's, hung off the firmware's */
     uint32_t console;       /* the console's cells, taken from the firmware */
-    uint32_t disk_cache;    /* sectors kept so the next program need not read */
+    uint32_t disk_cache;    /* what the disk cache holds: free memory lent out,
+                               so not in kernel_kib */
     uint32_t wallpaper;     /* the picture behind the text, if there is one */
+    uint32_t modules;       /* the loaded modules' own code and data */
+    uint32_t network;       /* the network's buffers, the card's and sockets' */
     uint32_t window;        /* what the running program has, the tables
                                describing it counted in */
-    uint32_t kernel_kib;    /* all of the above but the window, in KiB
+    uint32_t kernel_kib;    /* all of the above but the window and the disk cache, in KiB
                                rounded up: what the machine costs, whoever is
                                asking and whatever is running */
     uint32_t used_kib;      /* all of ram_kib that is not free: the

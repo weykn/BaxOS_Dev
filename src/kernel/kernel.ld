@@ -29,6 +29,11 @@ SECTIONS
         *(.rela*)
         __rela_end = .;
     }
+    .relr   : {
+        __relr_start = .;
+        *(.relr*)
+        __relr_end = .;
+    }
     .dynsym : { *(.dynsym) }
     .dynstr : { *(.dynstr) }
     .hash   : { *(.hash .gnu.hash) }

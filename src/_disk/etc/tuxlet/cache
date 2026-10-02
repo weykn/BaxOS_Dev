@@ -1,0 +1,4 @@
+cache auto
+cache add /usr/lib/ld-linux-x86-64.so.2
+cache add /usr/lib/libc.so.6
+cache on

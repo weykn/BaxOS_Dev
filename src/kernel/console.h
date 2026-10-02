@@ -29,6 +29,9 @@ uint64_t console_read(char *buf, uint64_t count);
    for the next read. */
 bool console_ready(void);
 
+/* Whether Ctrl-C has been typed, taking it if so. */
+bool console_interrupted(void);
+
 /* The settings, as Linux's tcgetattr and tcsetattr pass them. size is how
    much of them the program asked for or handed over. */
 void console_get(void *out, size_t size);

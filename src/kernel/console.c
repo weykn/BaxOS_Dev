@@ -1,12 +1,16 @@
 #include "console.h"
 
-#include "bg.h"
+#include "ata.h"
+
+#include "driver.h"
 #include "efi_kernel.h"
 #include "fs.h"
 #include "keyboard.h"
-#include "log.h"
+#include "net.h"
 #include "proc.h"
+#include "shell.h"
 #include "string.h"
+#include "thread.h"
 #include "vga.h"
 
 /* When the last key arrived, so that work put off until the machine is idle
@@ -20,13 +24,21 @@ static uint64_t last_key;
 static char idle(void) {
     vga_follow();                /* the firmware may have taken the screen
                                     back; this notices and repaints */
-    bg_check();                  /* ...and that loses the wallpaper */
+    if (wallpaper != NULL) {
+        wallpaper->check();      /* ...and that loses the wallpaper */
+    }
     /* The syscalls of whatever ran last, to /log - but only once the
        keyboard has been quiet for a moment. Writing costs a tenth of a
        second, and doing it the instant a command finishes put that delay in
        front of whoever was already typing the next one. */
     if (efi_uptime_ms() - last_key > QUIET_MS) {
-        log_flush();
+        if (tracer != NULL) {
+            tracer->flush();
+        }
+        ata_sync();              /* what was written, made to last */
+        if (net != NULL) {
+            net->idle();         /* an address, before anything asks */
+        }
     }
 
     return 0;
@@ -81,6 +93,12 @@ static unsigned handed, ready;      /* a finished line not yet all read */
 static char peeked;
 
 static char take_key(void) {
+    /* While other threads can run, the wait is theirs as well as the
+       keyboard's. */
+    while (peeked == 0 && !thread_alone() && !console_ready()) {
+        thread_yield();
+    }
+
     char c = peeked;
 
     if (c != 0) {
@@ -100,6 +118,14 @@ bool console_ready(void) {
         }
     }
     return peeked != 0;
+}
+
+bool console_interrupted(void) {
+    if ((settings.lflag & ISIG) != 0 && console_ready() && peeked == 3) {
+        peeked = 0;
+        return true;
+    }
+    return false;
 }
 
 void console_reset(void) {
@@ -130,7 +156,7 @@ void console_set(const void *in, size_t size) {
  * A cooked read hands a program a finished line, so the editing is here and
  * every program that reads a line gets it: the arrows move through the line
  * and back through the last few, Home, End and Delete do what they say, and
- * Tab completes a name - a command in /usr/bin or /proc for the first word,
+ * Tab completes a name - a command in a folder of PATH for the first word,
  * a file for the rest, and a second Tab lists the choices.
  *
  * Where the line starts on screen is remembered, and every move is made
@@ -290,19 +316,48 @@ static void candidate(const char *name, size_t n, const char *typed, size_t type
     common[same] = '\0';
 }
 
-/* Every name in folder, or every command when command, through candidate. */
-static void candidates(const char *folder, bool command, const char *typed,
-                       size_t typed_n, bool list) {
+/* Every name in folder, through candidate. /proc is the kernel's commands. */
+static void candidates(const char *folder, const char *typed, size_t typed_n, bool list) {
     struct fs_file entry;
     size_t cursor = 0, index;
 
+    if (proc_folder(folder)) {
+        for (unsigned i = 0; proc_at(i) != NULL; i++) {
+            candidate(proc_at(i)->name, strlen(proc_at(i)->name), typed, typed_n, list);
+        }
+        return;
+    }
     while (fs_list(folder, &cursor, &entry, &index) == 0) {
         const char *leaf = fs_inside(folder, entry.name);
 
         candidate(leaf, strlen(leaf), typed, typed_n, list);
     }
-    for (unsigned i = 0; command && proc_at(i) != NULL; i++) {
-        candidate(proc_at(i)->name, strlen(proc_at(i)->name), typed, typed_n, list);
+}
+
+/* The same for the first word: every folder of PATH, or folder alone. */
+static void choices(const char *folder, bool command, const char *typed, size_t typed_n,
+                    bool list) {
+    const char *dirs = command ? shell_env("PATH") : NULL;
+    char dir[FS_NAME_LEN], name[FS_NAME_LEN];
+
+    if (!command) {
+        candidates(folder, typed, typed_n, list);
+        return;
+    }
+    while (dirs != NULL && *dirs != '\0') {
+        const char *end = strchr(dirs, ':');
+        size_t n = end != NULL ? (size_t)(end - dirs) : strlen(dirs);
+
+        if (n > 0 && n < sizeof dir) {
+            memcpy(dir, dirs, n);
+            dir[n] = '\0';
+            if (proc_folder(dir)) {
+                candidates(dir, typed, typed_n, list);
+            } else if (fs_folder(dir, name, sizeof name) == 0) {
+                candidates(name, typed, typed_n, list);
+            }
+        }
+        dirs = end != NULL ? end + 1 : dirs + n;
     }
 }
 
@@ -329,7 +384,7 @@ static void complete(bool list) {
             return;
         }
     } else if (command) {
-        strcpy(folder, "usr/bin/");
+        folder[0] = '\0';          /* PATH's folders, in choices */
     } else {
         strcpy(folder, fs_cwd());
     }
@@ -351,7 +406,7 @@ static void complete(bool list) {
         }
         move(pos, have);
         draw("\n", 1);
-        candidates(folder, command, typed, typed_n, true);
+        choices(folder, command, typed, typed_n, true);
         draw("\n", 1);
         draw(prompt, n);
         draw(line, have);
@@ -359,7 +414,7 @@ static void complete(bool list) {
         return;
     }
     matches = 0;
-    candidates(folder, command, typed, typed_n, false);
+    choices(folder, command, typed, typed_n, false);
     if (matches == 0) {
         return;
     }

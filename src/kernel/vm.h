@@ -45,6 +45,11 @@ bool vm_low(uint64_t start, uint64_t end);
    into its runtime services, and the running program's when it is off. */
 void vm_firmware_view(bool on);
 
+/* The kernel's own tables taking over from the firmware's (mem_take_over):
+   top is the new top-level table, pd its directory for the first gigabyte.
+   What programs have hung off the firmware's is carried across. */
+void vm_move(uint64_t *top, uint64_t *pd);
+
 /* The page tables the machine has for good: the first region's top table,
    and what low memory has cost. */
 size_t vm_fixed_tables(void);

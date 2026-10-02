@@ -64,14 +64,21 @@ struct slot {
 static struct header head;
 /* The last few sectors read, whatever they were - the index and table
    sectors a path's lookup goes through are the same few again and again, and
-   through the firmware each read costs milliseconds. sector points at the one
-   in use, which stays good until the next call here. */
-#define RECENT 8
+   through the firmware each read costs milliseconds. So while the firmware
+   reads, at boot, a borrowed page holds eight; once the disk driver module
+   has the disk a read is quick, and four of the kernel's own are enough
+   (fs_cache). sector points at the one in use, which stays good until the
+   next call here. */
+#define RECENT     4
+#define RECENT_MAX 8
+#define MOVE_RUN   128              /* sectors a call when a file is moved */
 
-static char     recent[RECENT][SECTOR_SIZE];
-static uint32_t recent_lba[RECENT];     /* 0 for a slot holding nothing */
-static uint32_t recent_used[RECENT], recent_clock;
-static char    *sector = recent[0];
+static char     small[RECENT][SECTOR_SIZE];
+static char   (*recent)[SECTOR_SIZE] = small;
+static unsigned slots = RECENT;
+static uint32_t recent_lba[RECENT_MAX]; /* 0 for a slot holding nothing */
+static uint32_t recent_used[RECENT_MAX], recent_clock;
+static char    *sector = small[0];
 static bool     held_table; /* whether head is the disk's */
 
 static unsigned sectors_for(unsigned size);
@@ -112,7 +119,7 @@ static uint32_t parent_hash(const char *name) {
 static unsigned take_slot(uint32_t lba) {
     unsigned old = 0;
 
-    for (unsigned i = 1; i < RECENT; i++) {
+    for (unsigned i = 1; i < slots; i++) {
         if (recent_used[i] < recent_used[old]) {
             old = i;
         }
@@ -128,7 +135,7 @@ static void scratch(void) {
 }
 
 static int load_sector(uint32_t lba) {
-    for (unsigned i = 0; i < RECENT; i++) {
+    for (unsigned i = 0; i < slots; i++) {
         if (recent_lba[i] == lba && lba != 0) {
             recent_used[i] = ++recent_clock;
             sector = recent[i];
@@ -147,7 +154,7 @@ static int load_sector(uint32_t lba) {
 /* Writes to the disk, and forgets what was kept of those sectors - unless
    it is what is being written, which is then already what the disk says. */
 static int put(uint32_t lba, unsigned count, const void *data) {
-    for (unsigned i = 0; i < RECENT; i++) {
+    for (unsigned i = 0; i < slots; i++) {
         if (recent_lba[i] >= lba && recent_lba[i] < lba + count && data != recent[i]) {
             recent_lba[i] = 0;
         }
@@ -158,7 +165,7 @@ static int put(uint32_t lba, unsigned count, const void *data) {
 /* Forgets the sector in use: a write of it failed, so what the disk has is
    anyone's guess. */
 static void forget(void) {
-    for (unsigned i = 0; i < RECENT; i++) {
+    for (unsigned i = 0; i < slots; i++) {
         if (sector == recent[i]) {
             recent_lba[i] = 0;
         }
@@ -227,10 +234,9 @@ static int write_entry(size_t index, const char *name, uint32_t start, uint32_t 
     return 0;
 }
 
-/* Ends an operation: nothing is durable until the disk has caught up, and
-   catching up is what a write costs, so it is done once at the end. */
+/* Ends an operation. Its sectors are on the disk; the flush that makes the
+   drive keep them waits for idle, sync or power off (ata_sync). */
 static int done(int err) {
-    ata_sync();
     return err;
 }
 
@@ -760,6 +766,21 @@ static int drop_entry(size_t index, const char *name) {
     return err;
 }
 
+void fs_cache(bool slow) {
+    char (*page)[SECTOR_SIZE] = slow ? mem_alloc(RECENT_MAX * SECTOR_SIZE) : NULL;
+
+    if (slow && page == NULL) {
+        return;
+    }
+    if (recent != small) {
+        mem_free(recent);
+    }
+    recent = slow ? page : small;
+    slots = slow ? RECENT_MAX : RECENT;
+    memset(recent_lba, 0, sizeof recent_lba);
+    sector = recent[0];
+}
+
 int fs_init(void) {
     if (load_table() < 0) {
         held_table = false;
@@ -1264,39 +1285,56 @@ int fs_write_at(const char *path, uint32_t offset, const void *data, size_t size
         if (room == 0) {
             return FS_ENOSPC;
         }
-        if (room != start && have > 0) {
-            for (unsigned i = 0; i < have; i++) {
-                scratch();
-                if (ata_read(start + i, sector) < 0 ||
-                    put(room + i, 1, sector) < 0) {
+        /* The file moves whole, a run of sectors a call: what a write costs
+           is the call, not the bytes. Past the old end, as a program that
+           seeks beyond it and writes may, the whole sectors in between read
+           as zeroes, as they do on Linux; the one the old end was in is
+           zero past it already. */
+        unsigned gap = offset / SECTOR_SIZE > have ? offset / SECTOR_SIZE : have;
+
+        if ((room != start && have > 0) || gap > have) {
+            char *run = mem_alloc(MOVE_RUN * SECTOR_SIZE);
+
+            if (run == NULL) {
+                return FS_ENOSPC;
+            }
+            for (unsigned i = room != start ? 0 : have; i < gap; i += MOVE_RUN) {
+                unsigned n = gap - i < MOVE_RUN ? gap - i : MOVE_RUN;
+                unsigned old = i < have ? (have - i < n ? have - i : n) : 0;
+
+                memset(run, 0, (size_t)n * SECTOR_SIZE);
+                if ((old > 0 && ata_read_many(start + i, old, run) < 0) ||
+                    put(room + i, n, run) < 0) {
+                    mem_free(run);
                     return FS_EIO;
                 }
             }
-        }
-        /* Past the end, as a program that seeks beyond it and writes may:
-           the whole sectors in between read as zeroes, as they do on Linux.
-           The one the old end was in is zero past it already. */
-        for (unsigned i = have; i < offset / SECTOR_SIZE; i++) {
-            scratch();
-            memset(sector, 0, SECTOR_SIZE);
-            if (put(room + i, 1, sector) < 0) {
-                return FS_EIO;
-            }
+            mem_free(run);
         }
         start = room;
     }
 
-    /* Sector by sector. One only partly covered by the write is read back
-       first, so the bytes already in it are kept. */
+    /* The sectors it covers whole go straight from the data, in one call;
+       one only partly covered - its first and last - is read back first, so
+       the bytes already in it are kept. */
     for (size_t done = 0; done < size;) {
         unsigned at = (unsigned)((offset + done) / SECTOR_SIZE);
         unsigned into = (unsigned)((offset + done) % SECTOR_SIZE);
+        size_t whole = into == 0 ? (size - done) / SECTOR_SIZE : 0;
+
+        if (whole > 0) {
+            if (put(start + at, (unsigned)whole, (const char *)data + done) < 0) {
+                return FS_EIO;
+            }
+            done += whole * SECTOR_SIZE;
+            continue;
+        }
         size_t room = SECTOR_SIZE - into;
         size_t n = size - done < room ? size - done : room;
 
         scratch();
         memset(sector, 0, SECTOR_SIZE);
-        if (n < SECTOR_SIZE && at < have && ata_read(start + at, sector) < 0) {
+        if (at < have && ata_read(start + at, sector) < 0) {
             return FS_EIO;
         }
         memcpy(sector + into, (const char *)data + done, n);

@@ -106,6 +106,9 @@ size_t vga_memory(void);
    in use now is the mode for good. */
 void vga_firmware_gone(void);
 
+/* Past the end of the framebuffer, for what has to be mapped. */
+uint64_t vga_framebuffer_end(void);
+
 /* Puts the console back on screen if the firmware has taken the mode over.
    Everything that waits for a key calls this. */
 void vga_follow(void);

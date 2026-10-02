@@ -1,0 +1,2 @@
+# The shell to start once the machine is up: tsh, or a program such as bash
+tsh

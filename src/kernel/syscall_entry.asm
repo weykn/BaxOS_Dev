@@ -7,8 +7,8 @@ DEFAULT REL
 
 SECTION .text
 GLOBAL user_enter, user_resume, user_exit, syscall_entry, trap_stubs, page_fault_entry
-GLOBAL user_frame, user_cs, user_ss, user_flags
-EXTERN syscall_dispatch, page_fault, trap_report, tss
+GLOBAL user_frame, user_cs, user_ss, user_flags, thread_switch
+EXTERN syscall_dispatch, page_fault, trap_report, tss, process_exit
 
 ; A program's RFLAGS, in user_flags below: the always-one bit, and IF while
 ; the firmware is running. Interrupts have to stay on in ring 3 then: the
@@ -136,6 +136,27 @@ user_exit:
     pop rbx
     ret
 
+; void thread_switch(uint64_t *save, uint64_t to)
+; Leaves this kernel stack for another thread's (thread.c): what a C caller
+; expects kept goes on this one, its pointer into *save, and the same comes
+; off the other before returning there instead.
+thread_switch:
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    mov [rdi], rsp
+    mov rsp, rsi
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+
 ; SYSCALL lands here in ring 0 but still on the user stack, with RCX = the
 ; program's RIP and R11 = its RFLAGS. The number is in RAX, the arguments in
 ; RDI, RSI and RDX, and the result goes back in RAX.
@@ -232,7 +253,7 @@ trap_common:
     je .stop
     call trap_report                    ; EDI is still the vector
     mov edi, KILLED
-    jmp user_exit
+    call process_exit                   ; every thread of it, not only this one
 .stop:
     cli
     hlt

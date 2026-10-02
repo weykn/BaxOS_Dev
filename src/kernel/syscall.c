@@ -2,13 +2,16 @@
 
 #include <stdbool.h>
 
+#include "ata.h"
 #include "console.h"
 #include "debug.h"
 #include "efi_kernel.h"
-#include "log.h"
+#include "driver.h"
 #include "mem.h"
+#include "net.h"
 #include "proc.h"
 #include "string.h"
+#include "thread.h"
 #include "vga.h"
 #include "vm.h"
 
@@ -52,6 +55,10 @@ static uint64_t write_protect(bool on);
 #define ENFILE 23
 #define EPIPE  32
 #define ELOOP  40
+#define EPROTONOSUPPORT 93
+#define ESOCKTNOSUPPORT 94
+#define EAFNOSUPPORT    97
+#define ENOTSOCK        88
 
 /* The arguments of the call being handled, all six of them. Handlers take
    the first three, which is all but a few of them want; the rest read the
@@ -60,10 +67,16 @@ static uint64_t write_protect(bool on);
    reads it before it runs anything, which every one of them does. */
 static uint64_t arg[6];
 
+/* For thread.c, which keeps each thread's while another runs. */
+uint64_t *syscall_args(void) {
+    return arg;
+}
+
 /* Defined further down, where the loader and the page tables are. */
 static uint64_t sys_execve(uint64_t path, uint64_t argv, uint64_t envp);
 static uint64_t sys_fork(uint64_t a, uint64_t b, uint64_t c);
 static uint64_t sys_clone(uint64_t flags, uint64_t stack, uint64_t parent_tid);
+static uint64_t sys_clone3(uint64_t args, uint64_t size, uint64_t c);
 static uint64_t sys_rt_sigtimedwait(uint64_t set, uint64_t info, uint64_t timeout);
 static uint64_t sys_timer_create(uint64_t clock, uint64_t event, uint64_t id);
 static uint64_t sys_timer_settime(uint64_t id, uint64_t flags, uint64_t spec);
@@ -71,11 +84,14 @@ static uint64_t sys_timer_gettime(uint64_t id, uint64_t spec, uint64_t c);
 static uint64_t sys_wait4(uint64_t pid, uint64_t status, uint64_t options);
 static uint64_t sys_pipe(uint64_t out, uint64_t b, uint64_t c);
 static uint64_t sys_pipe2(uint64_t out, uint64_t flags, uint64_t c);
+static uint64_t sys_eventfd(uint64_t count, uint64_t b, uint64_t c);
+static uint64_t sys_eventfd2(uint64_t count, uint64_t flags, uint64_t c);
 static uint64_t sys_getrandom(uint64_t buf, uint64_t length, uint64_t flags);
 static bool fits(uint64_t addr, uint64_t size);
 static bool claim(uint64_t addr, uint64_t size);
 static int  read_at(const struct fs_file *file, uint64_t offset, void *dest, uint64_t size);
 static uint64_t fs_errno(int err);
+struct handle;
 
 /* What the loaded program turned out to be, for the auxiliary vector its
    libc reads off the stack. */
@@ -91,7 +107,7 @@ void page_fault_entry(void);
 int  user_enter(uint64_t entry, uint64_t stack);
 __attribute__((noreturn)) void user_exit(int code);
 
-/* The registered handlers.
+/* The handlers (the table is before syscall_init).
  *
  * A table of pairs, because an array with a slot per syscall number would be
  * a thousand entries long for the seventy that are answered. Walking it on
@@ -99,10 +115,6 @@ __attribute__((noreturn)) void user_exit(int code);
  * Linux system makes thousands of calls before it prints anything - so the
  * numbers below 256, which is all but a handful of them, are looked up in a
  * byte apiece instead. */
-static uint16_t   numbers[SYSCALL_SLOTS];
-static syscall_fn handlers[SYSCALL_SLOTS];
-static unsigned   registered;
-
 #define LOW_NUMBERS 256
 static uint8_t low[LOW_NUMBERS];    /* the slot, one-based; 0 means none */
 
@@ -124,7 +136,7 @@ static void wrmsr(uint32_t msr, uint64_t value) {
  * would - so a bad pointer inside the window is simply zeroes, and one
  * outside it never gets that far. */
 
-static bool user_range(uint64_t addr, uint64_t size) {
+bool user_range(uint64_t addr, uint64_t size) {
     return fits(addr, size);
 }
 
@@ -160,28 +172,21 @@ static const char *user_string(uint64_t addr) {
 
 static char writer_names[WRITERS][FS_NAME_LEN];
 
-static struct handle {
-    uint32_t used;          /* 0 in a free slot; a folder and an empty file
-                               both have no first sector to go by */
-    uint32_t writer;        /* which of the names above, one-based */
-    uint32_t start;         /* first sector, or one of the marks below */
-    uint32_t size;
-    uint32_t offset;        /* where we are in it; in a folder, how far through the index */
-    uint32_t folder;        /* the folder's own table entry, one-based */
-} handles[PROGRAM_FILES];
+static struct handle handles[PROGRAM_FILES];
 
 #define FOLDER_MARK  0xFFFFFFFFu
 #define WRITE_MARK   0xFFFFFFFEu    /* a file open for writing */
 #define CONSOLE_MARK 0xFFFFFFFDu    /* the screen and the keyboard */
-#define PROCDIR_MARK 0xFFFFFFFCu    /* /proc, which is not on the disk */
+#define PROCDIR_MARK 0xFFFFFFFCu    /* /proc, or /dev with folder 1: not on the disk */
 #define PROC_MARK    0xFFFFFFFBu    /* one of the commands in it */
 #define PIPE_MARK    0xFFFFFFFAu    /* one end of a pipe */
 #define DEV_MARK     0xFFFFFFF9u    /* one of the made-up files in /dev */
-#define FIRST_MARK   DEV_MARK       /* below this, a start is a sector */
+#define FIRST_MARK   SOCK_MARK      /* below this, a start is a sector */
 
 /* Where a made-up file's number starts, clear of any real one: those are
    sector numbers, and the disk is far smaller than this. */
 #define PROC_INO 0x01000000u
+#define DEV_INO  (PROC_INO + 0x10000u)    /* /dev's, as its listing numbers them */
 
 /* ---- /dev ----------------------------------------------------------------
  *
@@ -214,13 +219,34 @@ static const struct {
 
 #define DEVICES (sizeof devices / sizeof devices[0])
 
+/* What a path names inside /dev - "" for the folder itself - or NULL if it
+   is elsewhere. From inside /dev, a name is spelled against it. */
+static const char *in_dev(const char *name) {
+    if (name == NULL) {
+        return NULL;
+    }
+    if (strcmp(name, "/dev") == 0) {
+        return "";
+    }
+    if (name[0] == '/') {
+        return name[1] == 'd' && name[2] == 'e' && name[3] == 'v' && name[4] == '/'
+             ? name + 5 : NULL;
+    }
+    if (strcmp(fs_cwd(), "dev/") != 0) {
+        return NULL;
+    }
+    if (strcmp(name, ".") == 0) {
+        return "";
+    }
+    return name[0] == '.' && name[1] == '/' ? name + 2 : name;
+}
+
 /* Which of them a path names, or 0. */
 static enum dev dev_named(const char *name) {
-    if (name == NULL) {
-        return 0;
-    }
-    for (unsigned i = 0; i < DEVICES; i++) {
-        if (strcmp(name, devices[i].name) == 0) {
+    const char *leaf = in_dev(name);
+
+    for (unsigned i = 0; leaf != NULL && *leaf != '\0' && i < DEVICES; i++) {
+        if (strcmp(leaf, devices[i].name + 5) == 0) {
             return devices[i].which;
         }
     }
@@ -228,10 +254,12 @@ static enum dev dev_named(const char *name) {
 }
 
 static bool dev_folder(const char *name) {
-    return name != NULL && (strcmp(name, "/dev") == 0 || strcmp(name, "/dev/") == 0);
+    const char *leaf = in_dev(name);
+
+    return leaf != NULL && *leaf == '\0';
 }
 
-static struct handle *handle_of(uint64_t fd) {
+struct handle *handle_of(uint64_t fd) {
     if (fd >= PROGRAM_FILES) {
         return NULL;
     }
@@ -252,6 +280,9 @@ static bool is_console(uint64_t fd) {
    runs before each one rather than after. */
 static void handles_reset(void) {
     memset(handles, 0, sizeof handles);
+    if (net != NULL) {
+        net->close_all();
+    }
     memset(writer_names, 0, sizeof writer_names);
     for (unsigned fd = 0; fd < 3; fd++) {
         handles[fd].used = 1;
@@ -265,27 +296,92 @@ static void handles_reset(void) {
  * grows as it is written to, since the program filling it has to finish
  * before the one draining it starts and there is no way to push back. */
 
-#define PIPES      4
+#define PIPES      8
 #define PIPE_FIRST 8192
 #define PIPE_MAX   (1024 * 1024)
+
+/* A pipe handle's size says which end it is. An eventfd is a pipe with no
+   buffer, only a count; O_NONBLOCK and EFD_SEMAPHORE are in its offset. */
+#define PIPE_READ  0
+#define PIPE_WRITE 1
+#define PIPE_EVENT 2
+#define PIPE_FILE  3                /* a /proc/net file: the text, read once */
+#define PIPE_TEXT  8192             /* the most of one */
+#define EFD_SEMAPHORE 1
 
 static struct pipe {
     char    *data;
     uint32_t size, len, read_at;
     unsigned refs;                  /* descriptors on either end */
+    uint64_t count;                 /* an eventfd's */
 } pipes[PIPES];
 
 static struct pipe *pipe_of(const struct handle *h) {
     return h != NULL && h->start == PIPE_MARK && h->folder > 0 &&
-           h->folder <= PIPES && pipes[h->folder - 1].data != NULL
+           h->folder <= PIPES && pipes[h->folder - 1].refs > 0
          ? &pipes[h->folder - 1] : NULL;
 }
 
 static void pipe_drop(struct pipe *p) {
     if (p != NULL && p->refs > 0 && --p->refs == 0) {
-        mem_free(p->data);
+        if (p->data != NULL) {
+            mem_free(p->data);
+        }
         *p = (struct pipe){ 0 };
     }
+}
+
+
+/* A free one, or PIPES. */
+static unsigned pipe_slot(void) {
+    unsigned slot = 0;
+
+    while (slot < PIPES && pipes[slot].refs > 0) {
+        slot++;
+    }
+    return slot;
+}
+
+/* The name of a /proc/net file the network module has, or NULL. */
+static const char *proc_net_name(const char *path) {
+    static const char dir[] = "/proc/net/";
+
+    if (path == NULL || net == NULL) {
+        return NULL;
+    }
+    for (const char *d = dir; *d != '\0'; d++, path++) {
+        if (*path != *d) {
+            return NULL;
+        }
+    }
+    return net->proc(path, NULL, 0) != (size_t)-1 ? path : NULL;
+}
+
+/* One opened: what it says now, made then, and read from there on. */
+static uint64_t proc_net_open(const char *name) {
+    unsigned slot = pipe_slot();
+    char *text;
+    uint64_t fd;
+
+    if (slot == PIPES || (text = mem_alloc(PIPE_TEXT)) == NULL) {
+        return ERR(ENFILE);
+    }
+    size_t len = net->proc(name, text, PIPE_TEXT);
+
+    fd = give_handle((struct handle){ .start = PIPE_MARK, .folder = slot + 1, .size = PIPE_FILE });
+    if ((int64_t)fd < 0) {
+        mem_free(text);
+        return fd;
+    }
+    pipes[slot] = (struct pipe){ .data = text, .size = PIPE_TEXT, .refs = 1,
+                                 .len = (uint32_t)(len < PIPE_TEXT ? len : PIPE_TEXT) };
+    return fd;
+}
+
+static bool event_ready(const struct handle *h) {
+    struct pipe *p = pipe_of(h);
+
+    return p != NULL && h->size == PIPE_EVENT && p->count > 0;
 }
 
 /* Every pipe the open files hold, counted once more or once less: what the
@@ -295,6 +391,13 @@ static void pipes_hold(int by) {
     for (unsigned fd = 0; fd < PROGRAM_FILES; fd++) {
         struct pipe *p = handles[fd].used != 0 ? pipe_of(&handles[fd]) : NULL;
 
+        if (handles[fd].used != 0 && handles[fd].start == SOCK_MARK && net != NULL) {
+            if (by > 0) {
+                net->hold((int)handles[fd].folder);
+            } else {
+                net->drop((int)handles[fd].folder);
+            }
+        }
         if (p == NULL) {
             continue;
         }
@@ -350,10 +453,38 @@ static uint64_t pipe_read(struct pipe *p, char *to, uint64_t count) {
     return count;
 }
 
+/* exit ends the thread, exit_group the process - all its threads. */
+
+/* An eventfd's count, all of it or one of it, once it is not 0. Another
+   thread is what adds to it, so the wait lets the others run. */
+static uint64_t event_read(struct handle *h, struct pipe *p, uint64_t buf, uint64_t count) {
+    if (count < 8) {
+        return ERR(EINVAL);
+    }
+    while (p->count == 0) {
+        if ((h->offset & O_NONBLOCK) != 0 || thread_alone()) {
+            return ERR(EAGAIN);
+        }
+        interrupt_check();
+        thread_yield();
+    }
+    uint64_t took = (h->offset & EFD_SEMAPHORE) != 0 ? 1 : p->count;
+
+    p->count -= took;
+    *(uint64_t *)buf = took;
+    return 8;
+}
+
 static uint64_t sys_exit(uint64_t code, uint64_t b, uint64_t c) {
     (void)b;
     (void)c;
-    user_exit((int)code);
+    thread_exit((int)code);
+}
+
+static uint64_t sys_exit_group(uint64_t code, uint64_t b, uint64_t c) {
+    (void)b;
+    (void)c;
+    process_exit((int)code);
 }
 
 static uint64_t write_to(struct handle *h, uint64_t text, uint64_t length) {
@@ -378,8 +509,18 @@ static uint64_t write_to(struct handle *h, uint64_t text, uint64_t length) {
     if (h->start == PIPE_MARK) {
         struct pipe *p = pipe_of(h);
 
-        return p == NULL || h->size == 0 ? ERR(EBADF)
-                                         : pipe_write(p, (const char *)text, length);
+        if (p != NULL && h->size == PIPE_EVENT) {
+            if (length < 8) {
+                return ERR(EINVAL);
+            }
+            p->count += *(const uint64_t *)text;
+            return 8;
+        }
+        return p == NULL || h->size != PIPE_WRITE ? ERR(EBADF)
+                                                  : pipe_write(p, (const char *)text, length);
+    }
+    if (h->start == SOCK_MARK) {
+        return net != NULL ? net->write(h, text, length) : ERR(EBADF);
     }
     if (h->start == DEV_MARK) {
         /* Written to nowhere, and gone. /dev/full is the one that cannot
@@ -435,12 +576,23 @@ static uint64_t user_us(void) {
 }
 
 /* Marks the start of a wait, and then its end, which counts it idle. */
-static uint64_t wait_began(void) {
+uint64_t wait_began(void) {
     return efi_uptime_us();
 }
 
-static void wait_ended(uint64_t began) {
+void wait_ended(uint64_t began) {
     now_running.idle += efi_uptime_us() - began;
+}
+
+/* Ctrl-C, while a program waits on the network: there are no signals to
+   deliver, so it ends the program as SIGINT's default would. Only a wait
+   that could last for ever checks, so a program reading keys is left its
+   Ctrl-C. */
+void interrupt_check(void) {
+    if (console_interrupted()) {
+        vga_puts("^C\n");
+        process_exit(130);
+    }
 }
 
 /* The same around the kernel working for a program: what it took is system
@@ -465,13 +617,17 @@ static void kernel_ended(struct kernel_mark m) {
 
 /* The time of day in milliseconds. The firmware's clock counts whole
    seconds, so it is read once and the uptime counted on from there. */
-static uint64_t realtime_ms(void) {
+static uint64_t realtime_us(void) {
     static uint64_t offset;
 
     if (offset == 0) {
-        offset = efi_epoch() * 1000 - efi_uptime_ms();
+        offset = efi_epoch() * 1000000 - efi_uptime_us();
     }
-    return offset + efi_uptime_ms();
+    return offset + efi_uptime_us();
+}
+
+static uint64_t realtime_ms(void) {
+    return realtime_us() / 1000;
 }
 
 #define RUSAGE_CHILDREN (-1)
@@ -527,7 +683,7 @@ static uint64_t sys_times(uint64_t out, uint64_t b, uint64_t c) {
  * them, and has to be answered that quickly. */
 static uint64_t wait_ready(uint64_t nfds, uint64_t readfds, uint64_t writefds,
                            uint64_t exceptfds, uint64_t timeout, int64_t per_ms) {
-    uint64_t want = 0, ready = 0, writable = 0, console_bits = 0;
+    uint64_t want = 0, ready = 0, writable = 0, console_bits = 0, sock_bits = 0, event_bits = 0;
     int64_t until = 0;
 
     if (nfds > PROGRAM_FILES) {
@@ -548,8 +704,12 @@ static uint64_t wait_ready(uint64_t nfds, uint64_t readfds, uint64_t writefds,
         if (handle_of(fd) == NULL) {
             continue;
         }
+        if (handles[fd].start == SOCK_MARK) {
+            sock_bits |= bit & (want | (writefds != 0 ? *(uint64_t *)writefds : 0));
+            continue;
+        }
         if (writefds != 0 && (*(uint64_t *)writefds & bit) != 0) {
-            writable |= bit;        /* nothing here ever has to wait to write */
+            writable |= bit;        /* nothing else here has to wait to write */
         }
         if ((want & bit) == 0) {
             continue;
@@ -562,7 +722,12 @@ static uint64_t wait_ready(uint64_t nfds, uint64_t readfds, uint64_t writefds,
             /* A pipe with nothing left in it is at its end, which is a read
                that returns nothing rather than a wait. */
             (void)p;
-            ready |= bit;           /* what is in it, or its end */
+            if (handles[fd].size == PIPE_EVENT) {
+                event_bits |= bit;  /* ready once something adds to it */
+                ready |= event_ready(&handles[fd]) ? bit : 0;
+            } else {
+                ready |= bit;       /* what is in it, or its end */
+            }
         } else {
             ready |= bit;           /* a file is always there to be read */
         }
@@ -574,14 +739,40 @@ static uint64_t wait_ready(uint64_t nfds, uint64_t readfds, uint64_t writefds,
     }
     uint64_t began = wait_began();
 
-    while (console_bits != 0 && ready == 0 && writable == 0) {
-        if (console_ready()) {
+    uint64_t wanted_out = writefds != 0 ? *(uint64_t *)writefds : 0;
+
+    while ((console_bits | sock_bits | event_bits) != 0 && ready == 0 && writable == 0) {
+        if (console_bits != 0 && console_ready()) {
             ready = console_bits;
-            break;
         }
-        if (timeout != 0 && (int64_t)efi_uptime_ms() >= until) {
+        for (uint64_t fd = 0; fd < nfds; fd++) {
+            if ((event_bits >> fd & 1) != 0 && event_ready(&handles[fd])) {
+                ready |= 1ull << fd;
+            }
+        }
+        for (uint64_t fd = 0; fd < nfds && net != NULL; fd++) {
+            uint64_t bit = 1ull << fd;
+            unsigned r;
+
+            if ((sock_bits & bit) == 0) {
+                continue;
+            }
+            r = net->ready((int)handles[fd].folder);
+            if ((want & bit) != 0 && (r & (NET_IN | NET_HUP | NET_ERR)) != 0) {
+                ready |= bit;
+            }
+            if ((wanted_out & bit) != 0 && (r & (NET_OUT | NET_ERR)) != 0) {
+                writable |= bit;
+            }
+        }
+        if (ready != 0 || writable != 0 ||
+            (timeout != 0 && (int64_t)efi_uptime_ms() >= until)) {
             break;                  /* it waited as long as it was asked to */
         }
+        if (sock_bits != 0) {
+            interrupt_check();
+        }
+        thread_yield();
     }
     wait_ended(began);
     if (readfds != 0) {
@@ -620,6 +811,19 @@ static uint64_t read_run(struct handle *h, uint32_t start, uint64_t buf, uint64_
         count = left;
     }
     for (uint64_t done = 0; done < count;) {
+        /* Whole sectors in one call, straight into the program's buffer: a
+           read costs the call, not the bytes. */
+        uint64_t whole = h->offset % SECTOR_SIZE == 0 ? (count - done) / SECTOR_SIZE : 0;
+
+        if (whole > 0) {
+            if (fs_read_many(start, h->offset / SECTOR_SIZE, (unsigned)whole,
+                             (char *)buf + done) < 0) {
+                return ERR(EIO);
+            }
+            h->offset += (uint32_t)(whole * SECTOR_SIZE);
+            done += whole * SECTOR_SIZE;
+            continue;
+        }
         const char *sector = fs_sector(start, h->offset / SECTOR_SIZE);
 
         if (sector == NULL) {
@@ -673,9 +877,16 @@ static uint64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count) {
     if (h->start == PIPE_MARK) {
         struct pipe *p = pipe_of(h);
 
+        if (p != NULL && h->size == PIPE_EVENT) {
+            return event_read(h, p, buf, count);
+        }
         /* The end of what is there is the end of the input: whatever filled
            it has already finished by the time anything reads. */
-        return p == NULL || h->size != 0 ? ERR(EBADF) : pipe_read(p, (char *)buf, count);
+        return p == NULL || (h->size != PIPE_READ && h->size != PIPE_FILE)
+             ? ERR(EBADF) : pipe_read(p, (char *)buf, count);
+    }
+    if (h->start == SOCK_MARK) {
+        return net != NULL ? net->read(h, buf, count) : ERR(EBADF);
     }
     if (h->start == DEV_MARK) {
         if (h->folder == DEV_NULL) {
@@ -697,7 +908,7 @@ static uint64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count) {
 /* The lowest free descriptor, holding what was found - which is the one
    Linux hands out too, and what a program closing 1 and opening a file
    counts on. */
-static uint64_t give_handle(struct handle h) {
+uint64_t give_handle(struct handle h) {
     for (unsigned i = 0; i < PROGRAM_FILES; i++) {
         if (handles[i].used == 0) {
             h.used = 1;
@@ -783,6 +994,9 @@ static uint64_t open_name(const char *name, uint64_t flags) {
         h.offset = (flags & O_APPEND) != 0 ? file.size : 0;
         return give_handle(h);
     }
+    if (proc_net_name(name) != NULL) {
+        return proc_net_open(proc_net_name(name));
+    }
     for (unsigned i = 0; proc_at(i) != NULL; i++) {
         if (proc_command(name) == proc_at(i)) {
             return give_handle((struct handle){
@@ -790,8 +1004,8 @@ static uint64_t open_name(const char *name, uint64_t flags) {
                 .size = (uint32_t)proc_read(proc_at(i), 0, NULL, 0) });
         }
     }
-    if (proc_folder(name)) {
-        return give_handle((struct handle){ .start = PROCDIR_MARK });
+    if (proc_folder(name) || dev_folder(name)) {
+        return give_handle((struct handle){ .start = PROCDIR_MARK, .folder = dev_folder(name) });
     }
     if (fs_folder_at(name, &folder) == 0) {
         return give_handle((struct handle){ .start = FOLDER_MARK, .folder = folder });
@@ -871,6 +1085,12 @@ static uint64_t sys_close(uint64_t fd, uint64_t b, uint64_t c) {
         pipe_drop(pipe_of(h));
         return 0;
     }
+    if (h->start == SOCK_MARK) {
+        if (net != NULL) {
+            net->drop((int)h->folder);
+        }
+        return 0;
+    }
     /* The name a file is written back to goes only with the last descriptor
        holding it: a copy made with dup keeps the file open. */
     if (h->writer > 0) {
@@ -904,6 +1124,9 @@ static uint64_t dup_to(uint64_t fd, uint64_t to) {
         if (p != NULL) {
             p->refs++;
         }
+        if (h->start == SOCK_MARK && net != NULL) {
+            net->hold((int)h->folder);
+        }
     }
     return to;
 }
@@ -921,6 +1144,9 @@ static uint64_t sys_dup(uint64_t fd, uint64_t b, uint64_t c) {
     made = give_handle(*h);
     if ((int64_t)made >= 0 && p != NULL) {
         p->refs++;
+    }
+    if ((int64_t)made >= 0 && h->start == SOCK_MARK && net != NULL) {
+        net->hold((int)h->folder);
     }
     return made;
 }
@@ -1480,8 +1706,8 @@ static uint64_t sys_getpid(uint64_t a, uint64_t b, uint64_t c) {
 }
 
 /* Only ARCH_SET_FS, which is how a libc points at its thread-local data.
-   Nothing else here has threads, but the pointer still has to be set or the
-   first access to a thread variable reads address zero. */
+   Even a program with one thread has to have it set, or the first access to
+   a thread variable reads address zero; each thread keeps its own. */
 static uint64_t sys_arch_prctl(uint64_t code, uint64_t addr, uint64_t c) {
     (void)c;
     if (code != ARCH_SET_FS || !user_range(addr, 0)) {
@@ -1512,12 +1738,26 @@ static uint64_t sys_arch_prctl(uint64_t code, uint64_t addr, uint64_t c) {
 #define TIOCGPGRP   0x540F      /* which group of programs the keyboard is for */
 #define TIOCSPGRP   0x5410
 #define FIONREAD    0x541B
+#define FIONBIO     0x5421
 
 struct winsize {
     uint16_t rows, columns, pixel_w, pixel_h;
 };
 
 static uint64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t out) {
+    struct handle *h = handle_of(fd);
+
+    if (h != NULL && h->start == SOCK_MARK && net != NULL && request != FIONBIO) {
+        return net->ioctl(h, request, out);
+    }
+
+    if (h != NULL && (h->start == SOCK_MARK || h->start == PIPE_MARK) && request == FIONBIO) {
+        if (!user_range(out, 4)) {
+            return ERR(EFAULT);
+        }
+        h->offset = *(int32_t *)out != 0 ? h->offset | O_NONBLOCK : h->offset & ~O_NONBLOCK;
+        return 0;
+    }
     if (!is_console(fd)) {
         return ERR(ENOTTY);
     }
@@ -1611,7 +1851,7 @@ static uint64_t sys_access(uint64_t path, uint64_t mode, uint64_t c) {
     if (name == NULL) {
         return ERR(EFAULT);
     }
-    if (proc_command(name) != NULL || proc_folder(name) ||
+    if (proc_command(name) != NULL || proc_folder(name) || proc_net_name(name) != NULL ||
         dev_named(name) != 0 || dev_folder(name)) {
         return 0;
     }
@@ -1630,24 +1870,128 @@ static uint64_t sys_faccessat(uint64_t dirfd, uint64_t path, uint64_t mode) {
     if (name == NULL) {
         return ERR(EFAULT);
     }
-    if (proc_command(name) != NULL || proc_folder(name) ||
+    if (proc_command(name) != NULL || proc_folder(name) || proc_net_name(name) != NULL ||
         dev_named(name) != 0 || dev_folder(name) || fs_stat(name, &file) == 0) {
         return 0;
     }
     return fs_folder_at(name, &(unsigned){ 0 }) == 0 ? 0 : ERR(ENOENT);
 }
 
-/* One thread, so nothing can ever be waiting to be woken and nothing that
-   is held can ever be let go. Waking reaches nobody, and a wait is answered
-   with "the value changed" - which sends the caller back to look at the lock
-   again rather than into a wait that would never end. */
-#define FUTEX_WAIT 0
-#define FUTEX_OP   0x7F
+/* Futexes: a thread waits on a word until another wakes it, running the
+   others meanwhile (thread.c). One that is alone has nobody to wake it, so
+   a wait for ever is answered with "the value changed" - which sends it
+   back to look at its lock again rather than into a wait that never ends. */
+#define FUTEX_WAIT           0
+#define FUTEX_WAKE           1
+#define FUTEX_REQUEUE        3
+#define FUTEX_CMP_REQUEUE    4
+#define FUTEX_WAKE_OP        5
+#define FUTEX_WAIT_BITSET    9
+#define FUTEX_WAKE_BITSET    10
+#define FUTEX_CLOCK_REALTIME 256
+#define FUTEX_CMD            0x7F
+#define ETIMEDOUT            110
 
-static uint64_t sys_futex(uint64_t address, uint64_t op, uint64_t c) {
-    (void)address;
-    (void)c;
-    return (op & FUTEX_OP) == FUTEX_WAIT ? ERR(EAGAIN) : 0;
+static uint64_t realtime_ms(void);
+static uint64_t timespec_ms(uint64_t spec);
+
+static uint64_t futex_wait(uint64_t address, uint64_t op, uint32_t value, uint64_t timeout) {
+    uint64_t until = 0;
+
+    if (timeout != 0) {
+        if (!user_range(timeout, 16)) {
+            return ERR(EFAULT);
+        }
+        uint64_t at = timespec_ms(timeout), now = efi_uptime_ms();
+
+        if ((op & FUTEX_CMD) == FUTEX_WAIT_BITSET) {    /* a time, not a wait */
+            uint64_t clock = (op & FUTEX_CLOCK_REALTIME) ? realtime_ms() : now;
+
+            at = at > clock ? at - clock : 0;
+        }
+        until = now + at + 1;
+    }
+    if (*(volatile uint32_t *)address != value) {
+        return ERR(EAGAIN);
+    }
+    if (until == 0 && thread_alone()) {
+        return ERR(EAGAIN);
+    }
+    thread_sleep_on(address);
+    while (!thread_woken()) {
+        if (until != 0 && efi_uptime_ms() >= until) {
+            thread_sleep_on(0);
+            return ERR(ETIMEDOUT);
+        }
+        interrupt_check();
+        thread_yield();
+    }
+    return 0;
+}
+
+/* FUTEX_WAKE_OP: changes the second word, wakes at the first, and at the
+   second too if what was there passes a test. */
+static uint64_t futex_wake_op(uint64_t address, uint32_t n, uint64_t address2, uint32_t n2,
+                              uint32_t code) {
+    uint32_t *word = (uint32_t *)address2, old;
+    int32_t oparg = (int32_t)(code << 8) >> 20, cmparg = (int32_t)(code << 20) >> 20;
+    unsigned op = code >> 28, cmp = code >> 24 & 15;
+    bool pass;
+
+    if (!user_range(address2, 4)) {
+        return ERR(EFAULT);
+    }
+    if (op & 8) {
+        oparg = 1 << (oparg & 31);
+    }
+    old = *word;
+    switch (op & 7) {
+    case 0: *word = (uint32_t)oparg; break;
+    case 1: *word = old + (uint32_t)oparg; break;
+    case 2: *word = old | (uint32_t)oparg; break;
+    case 3: *word = old & ~(uint32_t)oparg; break;
+    case 4: *word = old ^ (uint32_t)oparg; break;
+    default: return ERR(ENOSYS);
+    }
+    switch (cmp) {
+    case 0: pass = (int32_t)old == cmparg; break;
+    case 1: pass = (int32_t)old != cmparg; break;
+    case 2: pass = (int32_t)old < cmparg; break;
+    case 3: pass = (int32_t)old <= cmparg; break;
+    case 4: pass = (int32_t)old > cmparg; break;
+    case 5: pass = (int32_t)old >= cmparg; break;
+    default: return ERR(ENOSYS);
+    }
+    int woke = thread_wake(address, (int)n, 0, 0);
+
+    return (uint64_t)(woke + (pass ? thread_wake(address2, (int)n2, 0, 0) : 0));
+}
+
+static uint64_t sys_futex(uint64_t address, uint64_t op, uint64_t value) {
+    uint64_t timeout = arg[3], address2 = arg[4], value3 = arg[5];
+
+    if (!user_range(address, 4)) {
+        return ERR(EFAULT);
+    }
+    switch (op & FUTEX_CMD) {
+    case FUTEX_WAIT:
+    case FUTEX_WAIT_BITSET:
+        return futex_wait(address, op, (uint32_t)value, timeout);
+    case FUTEX_WAKE:
+    case FUTEX_WAKE_BITSET:
+        return (uint64_t)thread_wake(address, (int)value, 0, 0);
+    case FUTEX_CMP_REQUEUE:
+        if (*(volatile uint32_t *)address != (uint32_t)value3) {
+            return ERR(EAGAIN);
+        }
+        /* fall through */
+    case FUTEX_REQUEUE:
+        return (uint64_t)thread_wake(address, (int)value, address2, (int)timeout);
+    case FUTEX_WAKE_OP:
+        return futex_wake_op(address, (uint32_t)value, address2, (uint32_t)timeout,
+                             (uint32_t)value3);
+    }
+    return ERR(ENOSYS);
 }
 
 /* One processor, and a program may ask which ones it may run on. */
@@ -1707,6 +2051,7 @@ static uint64_t sys_umask(uint64_t mask, uint64_t b, uint64_t c) {
 #define S_IFDIR 0040000
 #define S_IFREG 0100000
 #define S_IFLNK 0120000
+#define S_IFSOCK 0140000
 
 /* Descriptors have no flags worth keeping here: a program setting
    close-on-exec is told it worked, and one asking gets nothing back. The
@@ -1731,15 +2076,23 @@ static uint64_t sys_fcntl(uint64_t fd, uint64_t command, uint64_t c) {
     switch (command) {
     case F_DUPFD:
     case F_DUPFD_CLOEXEC:
-        return give_handle(*h);
+        return sys_dup(fd, 0, 0);
     case F_GETFL:
         /* A file open for writing can be read back too, so that is what it
            says: a libc that asked for "w+" and is told write-only gives up
            on the file it has just been handed. */
+        if (h->start == SOCK_MARK || h->start == PIPE_MARK) {
+            return (h->start == SOCK_MARK || h->size == PIPE_EVENT ? O_RDWR :
+                    h->size == PIPE_WRITE ? O_WRONLY : O_RDONLY) | (h->offset & O_NONBLOCK);
+        }
         return h->start == CONSOLE_MARK || h->start == WRITE_MARK ? O_RDWR : O_RDONLY;
+    case F_SETFL:
+        if (h->start == SOCK_MARK || h->start == PIPE_MARK) {
+            h->offset = (h->offset & ~O_NONBLOCK) | (arg[2] & O_NONBLOCK);
+        }
+        return 0;
     case F_GETFD:
     case F_SETFD:
-    case F_SETFL:
         return 0;
     }
     return ERR(EINVAL);
@@ -1832,19 +2185,34 @@ struct pollfd {
 
 #define POLLIN  0x001
 #define POLLOUT 0x004
+#define POLLERR 0x008
+#define POLLHUP 0x010
 
-static uint64_t poll_once(struct pollfd *p, uint64_t count) {
+static uint64_t poll_once(struct pollfd *p, uint64_t count, bool *sockets) {
     uint64_t ready = 0;
 
     for (uint64_t i = 0; i < count; i++) {
+        struct handle *h = handle_of((uint64_t)p[i].fd);
+
         p[i].revents = 0;
-        if (handle_of((uint64_t)p[i].fd) == NULL) {
+        if (h == NULL) {
             continue;
         }
         /* Reading the console waits for a key, so it is only ready once one
-           has been typed; everything else is there the moment it is asked
-           about. */
+           has been typed, and a socket once a packet has come; everything
+           else is there the moment it is asked about. */
+        if (h->start == SOCK_MARK) {
+            unsigned r = net != NULL ? net->ready((int)h->folder) : NET_ERR;
+
+            *sockets = true;
+            p[i].revents = (int16_t)(((p[i].events & POLLIN) && (r & NET_IN) ? POLLIN : 0) |
+                                     ((p[i].events & POLLOUT) && (r & NET_OUT) ? POLLOUT : 0) |
+                                     (r & NET_ERR ? POLLERR : 0) | (r & NET_HUP ? POLLHUP : 0));
+            ready += p[i].revents != 0;
+            continue;
+        }
         if ((p[i].events & POLLIN) != 0 &&
+            (h->start != PIPE_MARK || h->size != PIPE_EVENT || event_ready(h)) &&
             (!is_console((uint64_t)p[i].fd) || console_ready())) {
             p[i].revents |= POLLIN;
         }
@@ -1862,14 +2230,19 @@ static uint64_t poll_until(uint64_t fds, uint64_t count, int64_t wait_ms) {
     struct pollfd *p = (struct pollfd *)fds;
     int64_t until = (int64_t)efi_uptime_ms() + wait_ms;
     uint64_t ready;
+    bool sockets = false;
 
     if (!user_range(fds, count * sizeof *p)) {
         return ERR(EFAULT);
     }
     uint64_t began = wait_began();
 
-    while ((ready = poll_once(p, count)) == 0 &&
+    while ((ready = poll_once(p, count, &sockets)) == 0 &&
            (wait_ms < 0 || (int64_t)efi_uptime_ms() < until)) {
+        if (sockets) {
+            interrupt_check();
+        }
+        thread_yield();
     }
     wait_ended(began);
     return ready;
@@ -1889,6 +2262,49 @@ static uint64_t sys_ppoll(uint64_t fds, uint64_t count, uint64_t timeout) {
     return poll_until(fds, count, timeout == 0 ? -1 : spec[0] * 1000 + spec[1] / 1000000);
 }
 
+/* Capabilities: root has them all. A program that drops some is told it
+   did. */
+#define CAP_V1 0x19980330u
+#define CAP_V2 0x20071026u
+#define CAP_V3 0x20080522u
+
+static uint64_t sys_capget(uint64_t header, uint64_t data, uint64_t c) {
+    uint32_t *h = (uint32_t *)header;
+
+    (void)c;
+    if (!user_range(header, 8)) {
+        return ERR(EFAULT);
+    }
+    if (h[0] != CAP_V1 && h[0] != CAP_V2 && h[0] != CAP_V3) {
+        h[0] = CAP_V3;
+        return data == 0 ? 0 : ERR(EINVAL);
+    }
+    if (data != 0) {
+        unsigned sets = h[0] == CAP_V1 ? 1 : 2;
+        uint32_t *d = (uint32_t *)data;
+
+        if (!user_range(data, sets * 12)) {
+            return ERR(EFAULT);
+        }
+        for (unsigned i = 0; i < sets; i++) {
+            d[3 * i] = d[3 * i + 1] = 0xFFFFFFFF;   /* effective, permitted */
+            d[3 * i + 2] = 0;                       /* inheritable */
+        }
+    }
+    return 0;
+}
+
+#define PR_CAPBSET_READ 23
+#define CAP_LAST 40
+
+static uint64_t sys_prctl(uint64_t option, uint64_t value, uint64_t c) {
+    (void)c;
+    if (option == PR_CAPBSET_READ) {
+        return value <= CAP_LAST ? 1 : ERR(EINVAL);
+    }
+    return 0;
+}
+
 static uint64_t sys_getrandom(uint64_t buf, uint64_t length, uint64_t flags) {
     uint64_t state = efi_seconds() * 6364136223846793005ull + 1442695040888963407ull;
 
@@ -1903,7 +2319,8 @@ static uint64_t sys_getrandom(uint64_t buf, uint64_t length, uint64_t flags) {
     return length;
 }
 
-/* There is one thread, so there is no list of locks to rob from it. */
+/* A thread that ends holding a lock is not looked for, so the list of its
+   locks is not kept. */
 static uint64_t sys_set_robust_list(uint64_t head, uint64_t length, uint64_t c) {
     (void)head;
     (void)length;
@@ -1915,7 +2332,22 @@ static uint64_t sys_set_tid_address(uint64_t a, uint64_t b, uint64_t c) {
     (void)a;
     (void)b;
     (void)c;
-    return 1;                       /* the one and only thread */
+    return (uint64_t)thread_id();
+}
+
+static uint64_t sys_gettid(uint64_t a, uint64_t b, uint64_t c) {
+    (void)a;
+    (void)b;
+    (void)c;
+    return (uint64_t)thread_id();
+}
+
+static uint64_t sys_sched_yield(uint64_t a, uint64_t b, uint64_t c) {
+    (void)a;
+    (void)b;
+    (void)c;
+    thread_yield();
+    return 0;
 }
 
 /* Resource limits: the stack is the window's top end, and nothing else is
@@ -2131,8 +2563,12 @@ static uint64_t stat_of_handle(uint64_t fd, struct stat *st) {
     } else if (h->start == PIPE_MARK) {
         struct pipe *p = pipe_of(h);
 
-        st->mode = S_IFIFO | 0600;
+        st->mode = h->size == PIPE_FILE ? S_IFREG | 0444 : S_IFIFO | 0600;
         st->size = p == NULL ? 0 : pipe_left(p);
+        st->blocks = 0;
+    } else if (h->start == SOCK_MARK) {
+        st->mode = S_IFSOCK | 0777;
+        st->size = 0;
         st->blocks = 0;
     } else if (h->start == DEV_MARK) {
         st->mode = S_IFCHR | 0666;
@@ -2280,6 +2716,11 @@ static uint64_t sys_newfstatat(uint64_t dirfd, uint64_t path, uint64_t out) {
         fill_stat((struct stat *)out, 0, true, PROC_INO);
         return 0;
     }
+    if (proc_net_name(name) != NULL) {
+        fill_stat((struct stat *)out, 0, false, PROC_INO + 2);
+        ((struct stat *)out)->mode = S_IFREG | 0444;
+        return 0;
+    }
     if (dev_named(name) != 0) {
         fill_stat((struct stat *)out, 0, false, PROC_INO);
         ((struct stat *)out)->mode = S_IFCHR | 0666;
@@ -2350,6 +2791,7 @@ static uint64_t sys_lstat(uint64_t path, uint64_t out, uint64_t c) {
  * how far the walk got, which is what makes repeated calls pick up where the
  * last left off, as Linux's do. */
 
+#define DT_CHR 2
 #define DT_DIR 4
 #define DT_REG 8
 #define DT_LNK 10
@@ -2385,6 +2827,30 @@ static uint64_t proc_dents(struct handle *h, uint64_t buf, uint64_t count) {
     return used;
 }
 
+/* /dev, from its table: names as the folder shows them, without "/dev/". */
+static uint64_t dev_dents(struct handle *h, uint64_t buf, uint64_t count) {
+    uint64_t used = 0;
+
+    for (; h->offset < DEVICES; h->offset++) {
+        const char *name = devices[h->offset].name + sizeof "/dev/" - 1;
+        size_t length = strlen(name);
+        uint64_t reclen = (sizeof(struct dirent64) + length + 1 + 7) & ~7ull;
+
+        if (used + reclen > count) {
+            break;                  /* the rest waits for the next call */
+        }
+        struct dirent64 *out = (struct dirent64 *)(buf + used);
+
+        out->ino = DEV_INO + h->offset + 1;
+        out->off = (int64_t)(h->offset + 1);
+        out->reclen = (uint16_t)reclen;
+        out->type = DT_CHR;
+        memcpy(out->name, name, length + 1);
+        used += reclen;
+    }
+    return used;
+}
+
 static uint64_t sys_getdents64(uint64_t fd, uint64_t buf, uint64_t count) {
     struct handle *h = handle_of(fd);
     struct fs_file folder, entry;
@@ -2394,7 +2860,7 @@ static uint64_t sys_getdents64(uint64_t fd, uint64_t buf, uint64_t count) {
         return ERR(h == NULL ? EBADF : EFAULT);
     }
     if (h->start == PROCDIR_MARK) {
-        return proc_dents(h, buf, count);
+        return h->folder != 0 ? dev_dents(h, buf, count) : proc_dents(h, buf, count);
     }
     if (h->start != FOLDER_MARK) {
         return ERR(ENOTDIR);
@@ -2500,12 +2966,27 @@ static uint64_t sys_clock_gettime(uint64_t clock, uint64_t out, uint64_t c) {
     /* The realtime ones - REALTIME, its coarse twin, TAI - count from 1970;
        the CPU-time ones, what the program has used; the rest - MONOTONIC,
        BOOTTIME and their variants - from boot. */
-    uint64_t ms = clock == 0 || clock == 5 || clock == 11 ? realtime_ms()
-                : clock == 2 || clock == 3 ? self_us() / 1000
-                : efi_uptime_ms();
+    uint64_t us = clock == 0 || clock == 5 || clock == 11 ? realtime_us()
+                : clock == 2 || clock == 3 ? self_us()
+                : efi_uptime_us();
 
-    spec[0] = (int64_t)(ms / 1000);
-    spec[1] = (int64_t)(ms % 1000) * 1000000;
+    spec[0] = (int64_t)(us / 1000000);
+    spec[1] = (int64_t)(us % 1000000) * 1000;
+    return 0;
+}
+
+/* Every clock counts in microseconds. The timespec may be NULL. */
+static uint64_t sys_clock_getres(uint64_t clock, uint64_t out, uint64_t c) {
+    (void)clock;
+    (void)c;
+    if (out == 0) {
+        return 0;
+    }
+    if (!user_range(out, 16)) {
+        return ERR(EFAULT);
+    }
+    ((int64_t *)out)[0] = 0;
+    ((int64_t *)out)[1] = 1000;
     return 0;
 }
 
@@ -2523,10 +3004,10 @@ static uint64_t sys_gettimeofday(uint64_t tv, uint64_t tz, uint64_t c) {
     if (!user_range(tv, 16)) {
         return ERR(EFAULT);
     }
-    uint64_t ms = realtime_ms();
+    uint64_t us = realtime_us();
 
-    out[0] = (int64_t)(ms / 1000);
-    out[1] = (int64_t)(ms % 1000) * 1000;
+    out[0] = (int64_t)(us / 1000000);
+    out[1] = (int64_t)(us % 1000000);
     return 0;
 }
 
@@ -2536,6 +3017,7 @@ static void sleep_until(uint64_t until_ms) {
     uint64_t began = wait_began();
 
     while (efi_uptime_ms() < until_ms) {
+        thread_yield();
         __asm__ volatile("pause");
     }
     wait_ended(began);
@@ -2741,6 +3223,321 @@ static void sse_init(void) {
     __asm__ volatile("fninit");
 }
 
+/* fsync and its kin: every write is on the disk already, and this makes
+   the drive keep it. */
+static uint64_t sys_sync(uint64_t a, uint64_t b, uint64_t c) {
+    (void)a;
+    (void)b;
+    (void)c;
+    ata_sync();
+    return 0;
+}
+
+/* The calls answered, number and handler side by side. The calls a libc
+   makes for the plainest commands are among them: rm is unlinkat, mkdir is
+   mkdirat, mv is renameat2. */
+static const uint16_t numbers[] = {
+    SYS_READ,
+    SYS_WRITE,
+    SYS_OPEN,
+    SYS_CLOSE,
+    SYS_FSTAT,
+    SYS_LSEEK,
+    SYS_MMAP,
+    SYS_MPROTECT,
+    SYS_MUNMAP,
+    SYS_BRK,
+    SYS_IOCTL,
+    SYS_WRITEV,
+    SYS_GETPID,
+    SYS_UNAME,
+    SYS_SYSINFO,
+    SYS_SCHED_YIELD,
+    SYS_MADVISE,
+    SYS_GETRUSAGE,
+    SYS_TIMES,
+    SYS_UTIMENSAT,
+    SYS_UTIMES,
+    SYS_FUTIMESAT,
+    SYS_CHMOD,
+    SYS_FCHMOD,
+    SYS_FCHMODAT,
+    SYS_CHOWN,
+    SYS_FCHOWN,
+    SYS_LCHOWN,
+    SYS_FCHOWNAT,
+    SYS_FSYNC,
+    SYS_FDATASYNC,
+    SYS_SYNC,
+    SYS_FADVISE64,
+    SYS_CLOCK_NANOSLEEP,
+    SYS_RT_SIGSUSPEND,
+    SYS_KILL,
+    SYS_TGKILL,
+    SYS_GETTID,
+    SYS_GETCWD,
+    SYS_ARCH_PRCTL,
+    SYS_GETDENTS64,
+    SYS_SET_TID_ADDRESS,
+    SYS_GETRANDOM,
+    SYS_SET_ROBUST_LIST,
+    SYS_PRLIMIT64,
+    SYS_READLINKAT,
+    SYS_CLOCK_GETTIME,
+    SYS_CLOCK_GETRES,
+    SYS_PREAD64,
+    SYS_UNLINK,
+    SYS_RMDIR,
+    SYS_MKDIR,
+    SYS_RENAME,
+    SYS_STATFS,
+    SYS_REBOOT,
+    SYS_ACCESS,
+    SYS_FACCESSAT,
+    SYS_FACCESSAT2,
+    SYS_STATX,
+    SYS_FCNTL,
+    SYS_FUTEX,
+    SYS_SCHED_GETAFFINITY,
+    SYS_GETUID,
+    SYS_GETGID,
+    SYS_GETEUID,
+    SYS_GETEGID,
+    SYS_RT_SIGACTION,
+    SYS_RT_SIGPROCMASK,
+    SYS_NANOSLEEP,
+    SYS_EXIT,
+    SYS_EXIT_GROUP,
+    SYS_OPENAT,
+    SYS_NEWFSTATAT,
+    SYS_STAT,
+    SYS_LSTAT,
+    SYS_CHDIR,
+    SYS_FCHDIR,
+    SYS_DUP,
+    SYS_DUP2,
+    SYS_DUP3,
+    SYS_FTRUNCATE,
+    SYS_UMASK,
+    SYS_GETTIMEOFDAY,
+    SYS_TIME,
+    SYS_GETPPID,
+    SYS_GETPGRP,
+    SYS_GETPGID,
+    SYS_SETPGID,
+    SYS_SETSID,
+    SYS_READLINK,
+    SYS_SIGALTSTACK,
+    SYS_GETRESUID,
+    SYS_GETRESGID,
+    SYS_SELECT,
+    SYS_PSELECT6,
+    SYS_FORK,
+    SYS_VFORK,
+    SYS_CLONE,
+    SYS_CLONE3,
+    SYS_RT_SIGTIMEDWAIT,
+    SYS_TIMER_CREATE,
+    SYS_TIMER_SETTIME,
+    SYS_TIMER_GETTIME,
+    SYS_TIMER_GETOVERRUN,
+    SYS_TIMER_DELETE,
+    SYS_EXECVE,
+    SYS_WAIT4,
+    SYS_PIPE,
+    SYS_PIPE2,
+    SYS_EVENTFD,
+    SYS_EVENTFD2,
+    SYS_UNLINKAT,
+    SYS_MKDIRAT,
+    SYS_RENAMEAT,
+    SYS_RENAMEAT2,
+    SYS_LINKAT,
+    SYS_SYMLINKAT,
+    SYS_LINK,
+    SYS_SYMLINK,
+    SYS_MKNODAT,
+    SYS_TRUNCATE,
+    SYS_READV,
+    SYS_PWRITE64,
+    SYS_POLL,
+    SYS_PPOLL,
+    SYS_FSTATFS,
+    SYS_GETRLIMIT,
+    SYS_SETRLIMIT,
+    SYS_FLOCK,
+    SYS_FALLOCATE,
+    SYS_MSYNC,
+    SYS_SYNCFS,
+    SYS_GETCPU,
+    SYS_GETGROUPS,
+    SYS_SCHED_GETSCHEDULER,
+    SYS_SCHED_SETSCHEDULER,
+    SYS_SCHED_GETPARAM,
+    SYS_GETPRIORITY,
+    SYS_SETPRIORITY,
+    SYS_CAPGET,
+    SYS_CAPSET,
+    SYS_PRCTL,
+    SYS_SETUID,
+    SYS_SETGID,
+    SYS_SETRESUID,
+    SYS_SETRESGID,
+    SYS_SETGROUPS,
+};
+
+static const syscall_fn handlers[] = {
+    sys_read,
+    sys_write,
+    sys_open,
+    sys_close,
+    sys_fstat,
+    sys_lseek,
+    sys_mmap,
+    sys_ok,
+    sys_munmap,
+    sys_brk,
+    sys_ioctl,
+    sys_writev,
+    sys_getpid,
+    sys_uname,
+    sys_sysinfo,
+    sys_sched_yield,
+    sys_ok,
+    sys_getrusage,
+    sys_times,
+    sys_ok,
+    sys_ok,
+    sys_ok,
+    sys_ok,
+    sys_ok,
+    sys_ok,
+    sys_ok,
+    sys_ok,
+    sys_ok,
+    sys_ok,
+    sys_sync,
+    sys_sync,
+    sys_sync,
+    sys_ok,
+    sys_clock_nanosleep,
+    sys_ok,
+    sys_ok,
+    sys_ok,
+    sys_gettid,
+    sys_getcwd,
+    sys_arch_prctl,
+    sys_getdents64,
+    sys_set_tid_address,
+    sys_getrandom,
+    sys_set_robust_list,
+    sys_prlimit64,
+    sys_readlinkat,
+    sys_clock_gettime,
+    sys_clock_getres,
+    sys_pread64,
+    sys_unlink,
+    sys_unlink,
+    sys_mkdir,
+    sys_rename,
+    sys_statfs,
+    sys_reboot,
+    sys_access,
+    sys_faccessat,
+    sys_faccessat,
+    sys_statx,
+    sys_fcntl,
+    sys_futex,
+    sys_sched_getaffinity,
+    sys_root,
+    sys_root,
+    sys_root,
+    sys_root,
+    sys_ok,
+    sys_ok,
+    sys_nanosleep,
+    sys_exit,
+    sys_exit_group,
+    sys_openat,
+    sys_newfstatat,
+    sys_stat,
+    sys_lstat,
+    sys_chdir,
+    sys_fchdir,
+    sys_dup,
+    sys_dup2,
+    sys_dup2,
+    sys_ftruncate,
+    sys_umask,
+    sys_gettimeofday,
+    sys_time,
+    sys_root,
+    sys_getpgrp,
+    sys_getpgrp,
+    sys_ok,
+    sys_getpgrp,
+    sys_readlink,
+    sys_ok,
+    sys_getresuid,
+    sys_getresuid,
+    sys_select,
+    sys_pselect6,
+    sys_fork,
+    sys_fork,
+    sys_clone,
+    sys_clone3,
+    sys_rt_sigtimedwait,
+    sys_timer_create,
+    sys_timer_settime,
+    sys_timer_gettime,
+    sys_ok,
+    sys_ok,
+    sys_execve,
+    sys_wait4,
+    sys_pipe,
+    sys_pipe2,
+    sys_eventfd,
+    sys_eventfd2,
+    sys_unlinkat,
+    sys_mkdirat,
+    sys_renameat,
+    sys_renameat,
+    sys_no_links,
+    sys_symlinkat,
+    sys_no_links,
+    sys_symlink,
+    sys_no_links,
+    sys_truncate,
+    sys_readv,
+    sys_pwrite64,
+    sys_poll,
+    sys_ppoll,
+    sys_fstatfs,
+    sys_getrlimit,
+    sys_ok,
+    sys_ok,
+    sys_ok,
+    sys_ok,
+    sys_sync,
+    sys_zeroed,
+    sys_root,
+    sys_root,
+    sys_ok,
+    sys_zeroed,
+    sys_root,
+    sys_ok,
+    sys_capget,
+    sys_ok,
+    sys_prctl,
+    sys_ok,
+    sys_ok,
+    sys_ok,
+    sys_ok,
+    sys_ok,
+};
+
+#define SYSCALLS (sizeof numbers / sizeof numbers[0])
+
 void syscall_init(void) {
     gdt_init();
     sse_init();
@@ -2753,170 +3550,11 @@ void syscall_init(void) {
     wrmsr(MSR_LSTAR, (uint64_t)syscall_entry);
     wrmsr(MSR_FMASK, RFLAGS_MASK);
 
-    syscall_register(SYS_READ, sys_read);
-    syscall_register(SYS_WRITE, sys_write);
-    syscall_register(SYS_OPEN, sys_open);
-    syscall_register(SYS_CLOSE, sys_close);
-    syscall_register(SYS_FSTAT, sys_fstat);
-    syscall_register(SYS_LSEEK, sys_lseek);
-    syscall_register(SYS_MMAP, sys_mmap);
-    syscall_register(SYS_MPROTECT, sys_ok);
-    syscall_register(SYS_MUNMAP, sys_munmap);
-    syscall_register(SYS_BRK, sys_brk);
-    syscall_register(SYS_IOCTL, sys_ioctl);
-    syscall_register(SYS_WRITEV, sys_writev);
-    syscall_register(SYS_GETPID, sys_getpid);
-    syscall_register(SYS_UNAME, sys_uname);
-    syscall_register(SYS_SYSINFO, sys_sysinfo);
-    syscall_register(SYS_SCHED_YIELD, sys_ok);
-    syscall_register(SYS_MADVISE, sys_ok);
-    syscall_register(SYS_GETRUSAGE, sys_getrusage);
-    syscall_register(SYS_TIMES, sys_times);
-    syscall_register(SYS_UTIMENSAT, sys_ok);
-    syscall_register(SYS_UTIMES, sys_ok);
-    syscall_register(SYS_FUTIMESAT, sys_ok);
-    syscall_register(SYS_CHMOD, sys_ok);
-    syscall_register(SYS_FCHMOD, sys_ok);
-    syscall_register(SYS_FCHMODAT, sys_ok);
-    syscall_register(SYS_CHOWN, sys_ok);
-    syscall_register(SYS_FCHOWN, sys_ok);
-    syscall_register(SYS_LCHOWN, sys_ok);
-    syscall_register(SYS_FCHOWNAT, sys_ok);
-    syscall_register(SYS_FSYNC, sys_ok);
-    syscall_register(SYS_FDATASYNC, sys_ok);
-    syscall_register(SYS_SYNC, sys_ok);
-    syscall_register(SYS_FADVISE64, sys_ok);
-    syscall_register(SYS_CLOCK_NANOSLEEP, sys_clock_nanosleep);
-    syscall_register(SYS_RT_SIGSUSPEND, sys_ok);
-    syscall_register(SYS_KILL, sys_ok);
-    syscall_register(SYS_TGKILL, sys_ok);
-    syscall_register(SYS_GETTID, sys_getpid);
-    syscall_register(SYS_GETCWD, sys_getcwd);
-    syscall_register(SYS_ARCH_PRCTL, sys_arch_prctl);
-    syscall_register(SYS_GETDENTS64, sys_getdents64);
-    syscall_register(SYS_SET_TID_ADDRESS, sys_set_tid_address);
-    syscall_register(SYS_GETRANDOM, sys_getrandom);
-    syscall_register(SYS_SET_ROBUST_LIST, sys_set_robust_list);
-    syscall_register(SYS_PRLIMIT64, sys_prlimit64);
-    syscall_register(SYS_READLINKAT, sys_readlinkat);
-    syscall_register(SYS_CLOCK_GETTIME, sys_clock_gettime);
-    syscall_register(SYS_PREAD64, sys_pread64);
-    syscall_register(SYS_UNLINK, sys_unlink);
-    syscall_register(SYS_RMDIR, sys_unlink);
-    syscall_register(SYS_MKDIR, sys_mkdir);
-    syscall_register(SYS_RENAME, sys_rename);
-    syscall_register(SYS_STATFS, sys_statfs);
-    syscall_register(SYS_REBOOT, sys_reboot);
-    syscall_register(SYS_ACCESS, sys_access);
-    syscall_register(SYS_FACCESSAT, sys_faccessat);
-    syscall_register(SYS_FACCESSAT2, sys_faccessat);
-    syscall_register(SYS_STATX, sys_statx);
-    syscall_register(SYS_FCNTL, sys_fcntl);
-    syscall_register(SYS_FUTEX, sys_futex);
-    syscall_register(SYS_SCHED_GETAFFINITY, sys_sched_getaffinity);
-    syscall_register(SYS_GETUID, sys_root);
-    syscall_register(SYS_GETGID, sys_root);
-    syscall_register(SYS_GETEUID, sys_root);
-    syscall_register(SYS_GETEGID, sys_root);
-    syscall_register(SYS_RT_SIGACTION, sys_ok);
-    syscall_register(SYS_RT_SIGPROCMASK, sys_ok);
-    syscall_register(SYS_NANOSLEEP, sys_nanosleep);
-    syscall_register(SYS_EXIT, sys_exit);
-    syscall_register(SYS_EXIT_GROUP, sys_exit);
-    syscall_register(SYS_OPENAT, sys_openat);
-    syscall_register(SYS_NEWFSTATAT, sys_newfstatat);
-    syscall_register(SYS_STAT, sys_stat);
-    syscall_register(SYS_LSTAT, sys_lstat);
-    syscall_register(SYS_CHDIR, sys_chdir);
-    syscall_register(SYS_FCHDIR, sys_fchdir);
-    syscall_register(SYS_DUP, sys_dup);
-    syscall_register(SYS_DUP2, sys_dup2);
-    syscall_register(SYS_DUP3, sys_dup2);
-    syscall_register(SYS_FTRUNCATE, sys_ftruncate);
-    syscall_register(SYS_UMASK, sys_umask);
-    syscall_register(SYS_GETTIMEOFDAY, sys_gettimeofday);
-    syscall_register(SYS_TIME, sys_time);
-    syscall_register(SYS_GETPPID, sys_root);
-    syscall_register(SYS_GETPGRP, sys_getpgrp);
-    syscall_register(SYS_GETPGID, sys_getpgrp);
-    syscall_register(SYS_SETPGID, sys_ok);
-    syscall_register(SYS_SETSID, sys_getpgrp);
-    syscall_register(SYS_READLINK, sys_readlink);
-    syscall_register(SYS_SIGALTSTACK, sys_ok);
-    syscall_register(SYS_GETRESUID, sys_getresuid);
-    syscall_register(SYS_GETRESGID, sys_getresuid);
-    syscall_register(SYS_SELECT, sys_select);
-    syscall_register(SYS_PSELECT6, sys_pselect6);
-    syscall_register(SYS_FORK, sys_fork);
-    syscall_register(SYS_VFORK, sys_fork);
-    syscall_register(SYS_CLONE, sys_clone);
-    syscall_register(SYS_RT_SIGTIMEDWAIT, sys_rt_sigtimedwait);
-    syscall_register(SYS_TIMER_CREATE, sys_timer_create);
-    syscall_register(SYS_TIMER_SETTIME, sys_timer_settime);
-    syscall_register(SYS_TIMER_GETTIME, sys_timer_gettime);
-    syscall_register(SYS_TIMER_GETOVERRUN, sys_ok);
-    syscall_register(SYS_TIMER_DELETE, sys_ok);
-    syscall_register(SYS_EXECVE, sys_execve);
-    syscall_register(SYS_WAIT4, sys_wait4);
-    syscall_register(SYS_PIPE, sys_pipe);
-    syscall_register(SYS_PIPE2, sys_pipe2);
-    /* The calls a libc makes for the plainest commands there are: rm is
-       unlinkat, mkdir is mkdirat, mv is renameat2. */
-    syscall_register(SYS_UNLINKAT, sys_unlinkat);
-    syscall_register(SYS_MKDIRAT, sys_mkdirat);
-    syscall_register(SYS_RENAMEAT, sys_renameat);
-    syscall_register(SYS_RENAMEAT2, sys_renameat);
-    syscall_register(SYS_LINKAT, sys_no_links);
-    syscall_register(SYS_SYMLINKAT, sys_symlinkat);
-    syscall_register(SYS_LINK, sys_no_links);
-    syscall_register(SYS_SYMLINK, sys_symlink);
-    syscall_register(SYS_MKNODAT, sys_no_links);
-    syscall_register(SYS_TRUNCATE, sys_truncate);
-    syscall_register(SYS_READV, sys_readv);
-    syscall_register(SYS_PWRITE64, sys_pwrite64);
-    syscall_register(SYS_POLL, sys_poll);
-    syscall_register(SYS_PPOLL, sys_ppoll);
-    syscall_register(SYS_FSTATFS, sys_fstatfs);
-    syscall_register(SYS_GETRLIMIT, sys_getrlimit);
-    syscall_register(SYS_SETRLIMIT, sys_ok);
-    syscall_register(SYS_FLOCK, sys_ok);
-    syscall_register(SYS_FALLOCATE, sys_ok);
-    syscall_register(SYS_MSYNC, sys_ok);
-    syscall_register(SYS_SYNCFS, sys_ok);
-    syscall_register(SYS_GETCPU, sys_zeroed);
-    syscall_register(SYS_GETGROUPS, sys_root);
-    syscall_register(SYS_SCHED_GETSCHEDULER, sys_root);
-    syscall_register(SYS_SCHED_SETSCHEDULER, sys_ok);
-    syscall_register(SYS_SCHED_GETPARAM, sys_zeroed);
-    syscall_register(SYS_GETPRIORITY, sys_root);
-    syscall_register(SYS_SETPRIORITY, sys_ok);
-}
-
-int syscall_register(uint64_t number, syscall_fn fn) {
-    unsigned slot = registered;
-
-    if (registered == SYSCALL_SLOTS) {
-        dbg("syscall %u: no room to register it\n", number);
-    }
-
-    for (unsigned i = 0; i < registered; i++) {
-        if (numbers[i] == number) {
-            slot = i;               /* already there: replaced */
-            break;
+    for (unsigned i = 0; i < SYSCALLS; i++) {
+        if (numbers[i] < LOW_NUMBERS) {
+            low[numbers[i]] = (uint8_t)(i + 1);
         }
     }
-    if (slot == SYSCALL_SLOTS || number > 0xFFFF) {
-        return -1;
-    }
-    numbers[slot] = (uint16_t)number;
-    handlers[slot] = fn;
-    if (slot == registered) {
-        registered++;
-    }
-    if (number < LOW_NUMBERS) {
-        low[number] = (uint8_t)(slot + 1);
-    }
-    return 0;
 }
 
 /* The handler for a number, or NULL. */
@@ -2924,7 +3562,7 @@ static syscall_fn handler_for(uint64_t number) {
     if (number < LOW_NUMBERS) {
         return low[number] != 0 ? handlers[low[number] - 1] : NULL;
     }
-    for (unsigned i = 0; i < registered; i++) {
+    for (unsigned i = 0; i < SYSCALLS; i++) {
         if (numbers[i] == number) {
             return handlers[i];
         }
@@ -2936,7 +3574,7 @@ static syscall_fn handler_for(uint64_t number) {
    including the numbers this kernel has no handler for. */
 uint64_t syscall_dispatch(uint64_t a, uint64_t b, uint64_t c,
                           uint64_t d, uint64_t e, uint64_t f, uint64_t number) {
-    struct log_entry *entry = log_begin(number, a, b, c);
+    void *entry = tracer != NULL ? tracer->begin((uint32_t)number, a, b, c) : NULL;
     uint64_t result = ERR(ENOSYS);
     arg[0] = a;
     arg[1] = b;
@@ -2947,6 +3585,10 @@ uint64_t syscall_dispatch(uint64_t a, uint64_t b, uint64_t c,
 
     syscall_fn handler = handler_for(number);
 
+    if (handler == NULL && net != NULL) {
+        handler = net->syscall(number);     /* the socket calls are the module's */
+    }
+
     if (handler != NULL) {
         struct kernel_mark mark = kernel_began();
 
@@ -2956,7 +3598,9 @@ uint64_t syscall_dispatch(uint64_t a, uint64_t b, uint64_t c,
 
     /* SYS_EXIT does not come back, and neither does a program killed
        mid-call, so those entries stay unfinished - which is worth seeing. */
-    log_end(entry, result);
+    if (entry != NULL && tracer != NULL) {
+        tracer->end(entry, result);
+    }
     return result;
 }
 
@@ -3031,7 +3675,7 @@ void page_fault(uint64_t addr, uint64_t rip) {
         return;
     }
     dbg("fault at %x from %x: killed\n", addr, rip);
-    user_exit(PROGRAM_KILLED);
+    process_exit(PROGRAM_KILLED);
 }
 
 /* ---- loading -----------------------------------------------------------
@@ -3337,21 +3981,6 @@ enum {
     AT_SECURE = 23, AT_RANDOM = 25, AT_EXECFN = 31,
 };
 
-/* The environment the first program starts with - the shell, since nothing
-   runs before it. Everything after that inherits what the shell passes to
-   execve, so this is only ever the shell's own.
-   Nothing in it says where libraries or terminfo are: they are where a
-   program off a Linux system already looks, /usr/lib and /usr/share. */
-static const char *const environment[] = {
-    "PATH=/proc:/usr/bin",
-    "TERM=linux",
-    "HOME=/root",
-    "TMPDIR=/tmp",
-    "LANG=C",
-};
-
-#define ENV_COUNT (sizeof environment / sizeof environment[0])
-
 /* Where build_stack keeps its working-out. Borrowed from the firmware rather
    than put on the kernel stack: it is a page and a half of it, and a program
    may start a program which starts a program - the kernel's own stack would
@@ -3388,11 +4017,6 @@ static uint64_t build_stack(unsigned argc, const char *const *argv,
 
     if (argc > EXEC_ARGS) {
         argc = EXEC_ARGS;           /* more than a command line can hold */
-    }
-    if (envc == 0) {
-        envv = environment;         /* the first program, with nothing to
-                                       inherit an environment from */
-        envc = ENV_COUNT;
     }
     if (envc > EXEC_ENV) {
         envc = EXEC_ENV;
@@ -3455,10 +4079,16 @@ static uint64_t build_stack(unsigned argc, const char *const *argv,
 }
 #undef aux
 
+static unsigned entered;            /* programs running, one inside another */
+
+bool program_running(void) {
+    return entered > 0;
+}
+
 int program_run(uint64_t entry, unsigned argc, const char *const *argv,
                 unsigned envc, const char *const *envv, bool fresh) {
     uint64_t rsp = build_stack(argc, argv, envc, envv);
-    char was[LOG_NAME] = "";
+    char was[TRACE_NAME] = "";
     const char *before;
 
     /* A program started from nothing gets a clean terminal and nothing open
@@ -3478,30 +4108,40 @@ int program_run(uint64_t entry, unsigned argc, const char *const *argv,
     }
     /* Its calls are recorded under its own name from here to its last, which
        is what gives it a file of its own in /log. */
-    before = log_program(argc > 0 ? argv[0] : "program");
+    before = tracer != NULL ? tracer->program(argc > 0 ? argv[0] : "program") : NULL;
     if (before != NULL) {
         strcpy(was, before);        /* the slot may be reused while it runs */
     }
 
+    entered++;
+    thread_enter();
     int code = user_enter(entry, rsp);
+    thread_leave();
+    entered--;
 
     /* Its name goes back to whatever started it, but what it did stays in
        the ring to be written out when the machine is next idle: a program
        that has just ended is the moment someone is waiting for the prompt,
        and a disk write here is a quarter of a second of that wait. */
-    log_program(was[0] != '\0' ? was : NULL);
+    if (tracer != NULL) {
+        tracer->program(was[0] != '\0' ? was : NULL);
+    }
 
     /* Every page it was lent goes back now rather than at the next program:
        an idle machine should be holding nothing on its behalf. */
     vm_reset();
+    if (fresh && net != NULL) {
+        net->close_all();           /* and every socket it left open */
+    }
     return code;
 }
 
 /* ---- one program starting another ----------------------------------------
  *
  * A shell runs a command by forking and then, in the child, replacing itself
- * with the program. There is no scheduler here and never will be, so the two
- * halves of that cannot run side by side - but they do not have to. What
+ * with the program. Programs are not scheduled side by side here - only a
+ * program's own threads are (thread.c) - so the two halves of that cannot
+ * run at once, but they do not have to. What
  * happens instead is that fork runs its child there and then, to the end, and
  * only gives the parent its answer once the child is finished.
  *
@@ -3567,9 +4207,7 @@ static uint64_t sys_pipe2(uint64_t out, uint64_t flags, uint64_t c) {
     if (!user_range(out, 8)) {
         return ERR(EFAULT);
     }
-    for (slot = 0; slot < PIPES && pipes[slot].data != NULL; slot++) {
-    }
-    if (slot == PIPES || (data = mem_alloc(PIPE_FIRST)) == NULL) {
+    if ((slot = pipe_slot()) == PIPES || (data = mem_alloc(PIPE_FIRST)) == NULL) {
         return ERR(ENFILE);
     }
     pipes[slot] = (struct pipe){ .data = data, .size = PIPE_FIRST, .refs = 2 };
@@ -3596,6 +4234,29 @@ static uint64_t sys_pipe(uint64_t out, uint64_t b, uint64_t c) {
     return sys_pipe2(out, 0, b + c - b - c);
 }
 
+/* A count one thread adds to and another waits on - what a program wakes
+   its own poll with. */
+static uint64_t sys_eventfd2(uint64_t count, uint64_t flags, uint64_t c) {
+    unsigned slot;
+    uint64_t fd;
+
+    (void)c;
+    if ((slot = pipe_slot()) == PIPES) {
+        return ERR(ENFILE);
+    }
+    fd = give_handle((struct handle){ .start = PIPE_MARK, .folder = slot + 1, .size = PIPE_EVENT,
+                                      .offset = (uint32_t)flags & (O_NONBLOCK | EFD_SEMAPHORE) });
+    if ((int64_t)fd >= 0) {
+        pipes[slot] = (struct pipe){ .refs = 1, .count = (uint32_t)count };
+    }
+    return fd;
+}
+
+static uint64_t sys_eventfd(uint64_t count, uint64_t b, uint64_t c) {
+    (void)b;
+    return sys_eventfd2(count, 0, c);
+}
+
 /* ---- what a child leaves behind ----------------------------------------- */
 
 #define CHILDREN 8
@@ -3603,11 +4264,12 @@ static uint64_t sys_pipe(uint64_t out, uint64_t b, uint64_t c) {
 static struct child {
     int pid, status;
     bool waited;
+    uint64_t user, sys;             /* its CPU time, children in, for wait4 */
 } children[CHILDREN];
 
 static int last_pid = 1;            /* the shell itself is 1 */
 
-static void child_done(int pid, int code) {
+static void child_done(int pid, int code, uint64_t user, uint64_t sys) {
     static unsigned next;
 
     /* Linux's wait status: the exit code in the second byte, or the signal
@@ -3615,6 +4277,7 @@ static void child_done(int pid, int code) {
     children[next] = (struct child){
         .pid = pid,
         .status = code == PROGRAM_KILLED ? 11 : (code & 0xFF) << 8,
+        .user = user, .sys = sys,
     };
     next = (next + 1) % CHILDREN;
 }
@@ -3631,6 +4294,18 @@ static uint64_t sys_wait4(uint64_t pid, uint64_t status, uint64_t options) {
             continue;
         }
         ch->waited = true;
+        if (arg[3] != 0) {          /* its rusage: the times, nothing else */
+            int64_t *usage = (int64_t *)arg[3];
+
+            if (!user_range(arg[3], 144)) {
+                return ERR(EFAULT);
+            }
+            memset(usage, 0, 144);
+            usage[0] = (int64_t)(ch->user / 1000000);
+            usage[1] = (int64_t)(ch->user % 1000000);
+            usage[2] = (int64_t)(ch->sys / 1000000);
+            usage[3] = (int64_t)(ch->sys % 1000000);
+        }
         if (status != 0) {
             if (!user_range(status, 4)) {
                 return ERR(EFAULT);
@@ -3695,15 +4370,6 @@ static void context_restore(struct saved *s) {
 
 /* ---- fork and execve ----------------------------------------------------- */
 
-/* The registers of the program that made the call, as syscall_entry left
-   them on the kernel stack. Only fork reads them, and only to start its
-   child from the same place with a different answer in RAX. */
-struct user_regs {
-    uint64_t rax, pad, r15, r14, r13, r12, rbp, rbx;
-    uint64_t r10, r9, r8, rdx, rsi, rdi;
-    uint64_t rflags, rip, rsp;
-};
-
 extern struct user_regs *user_frame;
 extern int user_resume(const struct user_regs *regs, uint64_t rax);
 
@@ -3731,8 +4397,7 @@ static uint64_t fork_on(uint64_t stack) {
        refused, and a shell reports that the way it reports any machine that
        cannot start a process. Guessing wrong the other way would be the
        kernel writing past the bottom of its own stack. */
-    if (nest >= NEST_DEPTH ||
-        (uintptr_t)&state - (uintptr_t)stack_bottom < STACK_MARGIN) {
+    if (nest >= NEST_DEPTH || thread_stack_left(&state) < STACK_MARGIN) {
         return ERR(EAGAIN);
     }
     /* The child's registers are borrowed rather than kept on the kernel
@@ -3745,6 +4410,8 @@ static uint64_t fork_on(uint64_t stack) {
     if (stack != 0) {
         child->rsp = stack;
     }
+    uint64_t user0 = now_running.children_user, sys0 = now_running.children_sys;
+
     if ((state = context_save()) == NULL) {
         mem_free(child);
         return ERR(ENOMEM);
@@ -3758,7 +4425,9 @@ static uint64_t fork_on(uint64_t stack) {
     }
     pid = ++last_pid;
     nest++;
+    thread_enter();
     code = user_resume(child, 0);   /* the child, from this very syscall */
+    thread_leave();
     nest--;
     mem_free(child);
 
@@ -3767,17 +4436,13 @@ static uint64_t fork_on(uint64_t stack) {
     vm_unwind(was_level);
     vm_undo_end(true);
     context_restore(state);
-    child_done(pid, code);
+    child_done(pid, code, now_running.children_user - user0, now_running.children_sys - sys0);
     return (uint64_t)pid;
 }
 
 /* glibc's fork is a clone, and so is anything else that starts a process -
-   or a thread. There is no scheduler, so a thread is run the way a forked
-   child is: there and then, on its own stack and in the same memory, until
-   it ends, and pthread_join finds it finished. One that sits down to wait for
-   a signal for ever - glibc's timer helper does - is left parked there
-   instead, and never runs again; its parent is told it started, which it
-   did. */
+   or a thread. A thread gets a kernel stack of its own and runs whenever the
+   ones beside it wait (thread.c); the call returns to its parent first. */
 #define CLONE_VM             0x00000100
 #define CLONE_VFORK          0x00004000     /* a fork that shares until execve */
 #define CLONE_THREAD         0x00010000
@@ -3785,54 +4450,27 @@ static uint64_t fork_on(uint64_t stack) {
 #define CLONE_PARENT_SETTID  0x00100000
 #define CLONE_CHILD_CLEARTID 0x00200000
 
-static unsigned threads;        /* threads being run inside their clone */
-static bool     parking;        /* the one running is waiting for ever */
-
-static uint64_t start_thread(uint64_t flags, uint64_t stack, uint64_t parent_tid) {
-    uint64_t child_tid = arg[3], tls = arg[4];
-    uint64_t fs = rdmsr(MSR_FS_BASE);
-    struct user_regs *regs;
-    bool parked;
+static uint64_t start_thread(uint64_t flags, uint64_t stack, uint64_t parent_tid,
+                             uint64_t child_tid, uint64_t tls) {
     int tid;
 
-    if (nest >= NEST_DEPTH ||
-        (uintptr_t)&regs - (uintptr_t)stack_bottom < STACK_MARGIN) {
-        return ERR(EAGAIN);
-    }
     if (((flags & CLONE_PARENT_SETTID) && !user_range(parent_tid, 4)) ||
         ((flags & CLONE_CHILD_CLEARTID) && !user_range(child_tid, 4))) {
         return ERR(EFAULT);
     }
-    if ((regs = mem_alloc(sizeof *regs)) == NULL) {
-        return ERR(ENOMEM);
+    tid = thread_create(user_frame, stack, (flags & CLONE_SETTLS) ? tls : rdmsr(MSR_FS_BASE),
+                        (flags & CLONE_CHILD_CLEARTID) ? child_tid : 0);
+    if (tid < 0) {
+        return ERR(-tid);
     }
-    *regs = *user_frame;            /* from this syscall, on its own stack */
-    regs->rsp = stack;
-    tid = ++last_pid;
     if (flags & CLONE_PARENT_SETTID) {
         *(int32_t *)parent_tid = tid;
-    }
-    if (flags & CLONE_SETTLS) {
-        wrmsr(MSR_FS_BASE, tls);
-    }
-    nest++;
-    threads++;
-    user_resume(regs, 0);
-    threads--;
-    nest--;
-    parked = parking;
-    parking = false;
-    mem_free(regs);
-    wrmsr(MSR_FS_BASE, fs);
-
-    /* Ended, so whoever joins it is told; a parked one is still there. */
-    if ((flags & CLONE_CHILD_CLEARTID) && !parked) {
-        *(int32_t *)child_tid = 0;
     }
     return (uint64_t)tid;
 }
 
-static uint64_t sys_clone(uint64_t flags, uint64_t stack, uint64_t parent_tid) {
+static uint64_t clone_with(uint64_t flags, uint64_t stack, uint64_t parent_tid,
+                           uint64_t child_tid, uint64_t tls) {
     /* vfork, and posix_spawn built on it, share memory only until the child
        starts a program - which a fork, run to the end and then undone, is
        the same as from where the parent stands. */
@@ -3840,24 +4478,47 @@ static uint64_t sys_clone(uint64_t flags, uint64_t stack, uint64_t parent_tid) {
         return fork_on(stack);
     }
     if (flags & (CLONE_VM | CLONE_THREAD)) {
-        return start_thread(flags, stack, parent_tid);
+        return start_thread(flags, stack, parent_tid, child_tid, tls);
     }
     return sys_fork(0, 0, 0);
 }
 
-/* Waiting for a signal. Nothing can send one, so a thread doing it is
-   parked for good; the program itself is told the wait timed out. */
+static uint64_t sys_clone(uint64_t flags, uint64_t stack, uint64_t parent_tid) {
+    return clone_with(flags, stack, parent_tid, arg[3], arg[4]);
+}
+
+/* The same with its arguments in a structure; the stack is given as where
+   it starts and how big it is. */
+static uint64_t sys_clone3(uint64_t args, uint64_t size, uint64_t c) {
+    const uint64_t *a = (const uint64_t *)args;
+
+    (void)c;
+    if (size < 64 || !user_range(args, 64)) {
+        return ERR(EINVAL);
+    }
+    /* flags, pidfd, child_tid, parent_tid, exit_signal, stack, stack_size, tls */
+    return clone_with(a[0], a[5] != 0 ? a[5] + a[6] : 0, a[3], a[2], a[7]);
+}
+
+/* Waiting for a signal. Nothing can send one, so the wait lasts until its
+   timeout - or for ever, in a thread, which the others run beside; alone,
+   the program is told it timed out rather than hanging. */
 static uint64_t sys_rt_sigtimedwait(uint64_t set, uint64_t info, uint64_t timeout) {
     (void)set;
     (void)info;
-    (void)timeout;
-    if (threads > 0) {
-        parking = true;
-        user_exit(0);
+    if (thread_alone()) {
+        return ERR(EAGAIN);
+    }
+    if (timeout != 0 && !user_range(timeout, 16)) {
+        return ERR(EFAULT);
+    }
+    uint64_t until = timeout != 0 ? efi_uptime_ms() + timespec_ms(timeout) : 0;
+
+    while (until == 0 || efi_uptime_ms() < until) {
+        thread_yield();
     }
     return ERR(EAGAIN);
 }
-
 /* ---- timers ---------------------------------------------------------------
  *
  * Nothing can interrupt a running program to say its time is up, so a timer
@@ -4007,7 +4668,8 @@ static bool shebang(const struct fs_file *file, char *out, size_t max,
    with a clean terminal and the machine's environment. A script that begins
    with "#!" is handed to the program it names, as execve would. Returns its
    exit code, or a negative FS_E* or PROGRAM_E* code if it could not start. */
-int program_start(const char *path, unsigned argc, const char *const *argv) {
+int program_start(const char *path, unsigned argc, const char *const *argv,
+                  unsigned envc, const char *const *envv) {
     struct {
         char        line[FS_NAME_LEN * 2];
         const char *words[EXEC_ARGS + 3];
@@ -4043,7 +4705,7 @@ int program_start(const char *path, unsigned argc, const char *const *argv) {
         err = program_load(&file, &entry);
     }
     if (err == 0) {
-        err = program_run(entry, argc, argv, 0, NULL, true);
+        err = program_run(entry, argc, argv, envc, envv, true);
     }
     mem_free(w);
     return err;
@@ -4093,7 +4755,7 @@ static uint64_t sys_execve(uint64_t path, uint64_t argv, uint64_t envp) {
             mem_free(taken);
         }
         mem_free(held);
-        user_exit(0);
+        process_exit(0);
     }
     if (fs_stat(held->name, &file) != 0 || file.size == 0) {
         mem_free(held);
@@ -4144,5 +4806,5 @@ static uint64_t sys_execve(uint64_t path, uint64_t argv, uint64_t envp) {
     }
     vm_pop();
     mem_free(held);
-    user_exit(code);
+    process_exit(code);
 }

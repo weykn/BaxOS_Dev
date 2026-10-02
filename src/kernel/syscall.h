@@ -52,12 +52,6 @@
    page table then describes both, which for a program as small as the
    shell is a quarter of what it costs. */
 
-/* Handlers that can be registered at once. There is no warning when this is
-   too small - the registrations past it simply do not happen, and the calls
-   they were for answer ENOSYS - so it is kept well clear of the number
-   syscall_init actually makes. */
-#define SYSCALL_SLOTS 144
-
 /* Linux's numbers, and Linux's arguments. Only the handful the machine can
    actually answer are here: there is one process, no devices but the screen
    and the keyboard, and files are read-only to a program. */
@@ -96,7 +90,7 @@ enum {
     SYS_FCHOWN     = 93,
     SYS_LCHOWN     = 94,
     SYS_FCHOWNAT   = 260,
-    SYS_FSYNC      = 74,    /* a write is on the disk before it returns */
+    SYS_FSYNC      = 74,    /* the drive made to keep what was written */
     SYS_FDATASYNC  = 75,
     SYS_SYNC       = 162,
     SYS_FADVISE64  = 221,
@@ -104,7 +98,7 @@ enum {
     SYS_RT_SIGSUSPEND = 130,
     SYS_KILL       = 62,    /* the only process there is, is the caller */
     SYS_TGKILL     = 234,
-    SYS_GETTID     = 186,   /* which is the process, there being one thread */
+    SYS_GETTID     = 186,   /* the thread's; the process's for its first */
     SYS_RSEQ       = 334,
     SYS_UNAME      = 63,    /* (struct utsname *) */
     SYS_GETCWD     = 79,    /* (buf, size): the working directory, with its NUL */
@@ -121,7 +115,7 @@ enum {
     SYS_GETGID     = 104,
     SYS_GETEUID    = 107,
     SYS_GETEGID    = 108,
-    SYS_FUTEX      = 202,   /* nothing waits: there is one thread */
+    SYS_FUTEX      = 202,   /* a thread waiting on a word (thread.c) */
     SYS_SCHED_GETAFFINITY = 204,
     SYS_STATX      = 332,
     SYS_FACCESSAT  = 269,
@@ -172,6 +166,7 @@ enum {
     SYS_GETRANDOM  = 318,
     SYS_READLINKAT = 267,
     SYS_CLOCK_GETTIME   = 228,  /* (clock, struct timespec *) */
+    SYS_CLOCK_GETRES    = 229,  /* (clock, struct timespec *) */
     SYS_EXIT       = 60,    /* (code): ends the program */
     SYS_EXIT_GROUP = 231,   /* (code): what C's exit() compiles to */
     SYS_OPENAT     = 257,   /* (dirfd, path, flags, mode) */
@@ -201,6 +196,7 @@ enum {
        see syscall.c, which is where that is made to work. */
     SYS_FORK       = 57,
     SYS_VFORK      = 58,
+    SYS_CLONE3     = 435,   /* (struct clone_args *, size) */
     SYS_CLONE      = 56,    /* (flags, stack, ...): glibc's fork is one */
     SYS_RT_SIGTIMEDWAIT = 128,  /* (set, info, timeout, size) */
     SYS_TIMER_CREATE    = 222,  /* (clock, sigevent *, timer_t *) */
@@ -212,6 +208,34 @@ enum {
     SYS_WAIT4      = 61,    /* (pid, status *, options, rusage *) */
     SYS_PIPE       = 22,    /* (int fds[2]) */
     SYS_PIPE2      = 293,   /* (int fds[2], flags) */
+    SYS_EVENTFD    = 284,   /* (count) */
+    SYS_EVENTFD2   = 290,   /* (count, flags): a count to wake a poll with */
+
+    /* IPv4 sockets: TCP, UDP and ICMP echo, once the network module is in. */
+    SYS_SOCKET     = 41,    /* (domain, type, protocol) */
+    SYS_CONNECT    = 42,
+    SYS_SENDTO     = 44,
+    SYS_RECVFROM   = 45,
+    SYS_SENDMSG    = 46,
+    SYS_RECVMSG    = 47,
+    SYS_SHUTDOWN   = 48,
+    SYS_ACCEPT     = 43,
+    SYS_LISTEN     = 50,
+    SYS_ACCEPT4    = 288,
+    SYS_BIND       = 49,
+    SYS_GETSOCKNAME = 51,
+    SYS_GETPEERNAME = 52,
+    SYS_SETSOCKOPT = 54,
+    SYS_GETSOCKOPT = 55,
+    SYS_SENDMMSG   = 307,
+    SYS_CAPGET     = 125,   /* root holds every capability */
+    SYS_CAPSET     = 126,
+    SYS_PRCTL      = 157,
+    SYS_SETUID     = 105,   /* ...and stays root */
+    SYS_SETGID     = 106,
+    SYS_SETGROUPS  = 116,
+    SYS_SETRESUID  = 117,
+    SYS_SETRESGID  = 119,
 };
 
 /* Open flags, as Linux numbers them. */
@@ -222,6 +246,7 @@ enum {
 #define O_CREAT   0x40
 #define O_TRUNC   0x200
 #define O_APPEND  0x400
+#define O_NONBLOCK 0x800
 #define O_NOFOLLOW 0x20000  /* a link at the end of the path is ELOOP */
 /* A file with no name, made in the folder the path names: what a program
    that wants a scratch buffer of its own asks for. */
@@ -229,7 +254,7 @@ enum {
 
 /* Descriptors a program may have at once, 0, 1 and 2 - the console -
    counted in. */
-#define PROGRAM_FILES 16
+#define PROGRAM_FILES 32
 
 /* Arguments and environment variables a program can be given, the name it
    was called by counted in. The lists are copied out of the program starting
@@ -243,15 +268,39 @@ enum {
 
 typedef uint64_t (*syscall_fn)(uint64_t a, uint64_t b, uint64_t c);
 
-/* Enables the syscall instruction and registers the built-in syscalls. */
-void syscall_init(void);
+/* An open descriptor. The network module keeps its sockets' too, which is
+   why this is here: a socket is a descriptor like any other, but the calls
+   that make and use one are the module's (net.h). */
+struct handle {
+    uint32_t used;          /* 0 in a free slot; a folder and an empty file
+                               both have no first sector to go by */
+    uint32_t writer;        /* which open-for-writing name, one-based */
+    uint32_t start;         /* first sector, or one of the marks */
+    uint32_t size;
+    uint32_t offset;        /* where we are in it; in a folder, how far through the index */
+    uint32_t folder;        /* the folder's own table entry, one-based */
+};
 
-/* Makes fn the handler for syscall number. The handlers are a short table
-   rather than a slot per number, so that a call as high as SYS_EXIT costs
-   nothing to leave room for; a byte per number below 256 finds the slot
-   without walking it. Returns 0, or -1 if the table is full or the number
-   is past what one holds. Unregistered numbers return -1 to the program. */
-int syscall_register(uint64_t number, syscall_fn fn);
+#define SOCK_MARK 0xFFFFFFF8u   /* a socket: the network module's number in
+                                   folder; O_NONBLOCK and the type (<< 16) in
+                                   offset; size, how long a read waits in ms,
+                                   0 for ever */
+
+/* What a syscall handler outside syscall.c needs: the descriptor fd, or
+   NULL; the lowest free one, made to hold h, or -EMFILE; whether a program's
+   pointer and size stay in its memory; the arguments past the third; and
+   waiting - Ctrl-C ending the program, and the wait counted idle. */
+struct handle *handle_of(uint64_t fd);
+uint64_t give_handle(struct handle h);
+bool     user_range(uint64_t addr, uint64_t size);
+uint64_t *syscall_args(void);
+void     interrupt_check(void);
+uint64_t wait_began(void);
+void     wait_ended(uint64_t began);
+
+/* Enables the syscall instruction. The calls answered are a fixed table;
+   a number not in it answers ENOSYS. */
+void syscall_init(void);
 
 /* Loads a program file into memory by its program headers and stores its
    entry point in *entry. Returns 0, FS_EIO, FS_ENOSPC if RAM runs out, or
@@ -261,12 +310,17 @@ int program_load(const struct fs_file *file, uint64_t *entry);
 /* Loads and runs the program at path, following a "#!" line - what the
    shell does. Returns its exit code, or a negative code if it could not be
    started. */
-int program_start(const char *path, unsigned argc, const char *const *argv);
+int program_start(const char *path, unsigned argc, const char *const *argv,
+                  unsigned envc, const char *const *envv);
 
 /* Runs a loaded program until it exits, and returns its exit code. envc of 0
    gives it the machine's own environment, which is what the first program
    gets; fresh says to hand it a clean terminal and nothing open but the
    console, which is what everything but an execve wants. */
+/* Whether a program is running: what a kernel command called from one
+   finds, rather than one the kernel's own shell ran. */
+bool program_running(void);
+
 int program_run(uint64_t entry, unsigned argc, const char *const *argv,
                 unsigned envc, const char *const *envv, bool fresh);
 

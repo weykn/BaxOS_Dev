@@ -20,7 +20,7 @@ plus `edk2-ovmf` for `make run`.
 |              |                                                                |
 | ------------ | -------------------------------------------------------------- |
 | **Boot**     | A UEFI loader that carries the kernel inside itself            |
-| **Kernel**   | Ring 0: screen, keyboard, filesystem, Linux's syscall table    |
+| **Kernel**   | Ring 0: screen, filesystem, Linux's syscall table, modules     |
 | **Programs** | ELF, static or dynamically linked, straight off a Linux system |
 | **Shell**    | `tsh`, a small shell built into the kernel                     |
 | **Layout**   | `/etc`, `/usr`, `/var` and the rest, with real symbolic links  |
@@ -37,17 +37,20 @@ can: the screen and keyboard as one plain terminal, a flat filesystem of
 contiguous files, and a syscall table that uses Linux's numbers and
 arguments.
 
-Once the boot script has set up the screen, the kernel lets the firmware go
-the way any operating system does, and everything the firmware was holding
-becomes free memory. That is about 36 MB on QEMU: `mem` shows around 6 MB in
-use after boot, where it used to show 43. From then on the kernel drives the
-IDE disk and the PS/2 keyboard itself, and the screen stays in the mode it
-booted in. A machine with neither, such as one with a USB keyboard or an NVMe
+Once the boot script has set up the screen, its `modman takeover` line lets
+the firmware go the way any operating system does - the kernel never does it
+by itself - and everything the firmware was holding
+becomes free memory, its page tables and ACPI's tables included: the kernel
+moves onto tables of its own, 12 KB of them. That is about 36 MB on QEMU:
+`mem` shows around 6 MB in use after boot, where it used to show 43, and
+nearly all of that is what the firmware keeps for good. From then on the kernel drives the
+IDE disk and the PS/2 keyboard itself, through the `storage/ide` and
+`input/ps2` modules, and the screen stays in the mode it booted in. A machine with neither, such as one with a USB keyboard or an NVMe
 disk, keeps the firmware and its drivers, as before.
 
 **Everything else is a program off the disk.** Each program gets a region of
 its own: half a terabyte of address space, hung off a spare slot of the
-firmware's page tables and backed a page at a time as it is touched. The few
+page tables and backed a page at a time as it is touched. The few
 commands the kernel provides itself are files under `/proc`, so `mem` and
 `/proc/mem` are the same command, because `/proc` is on `PATH`.
 
@@ -55,10 +58,12 @@ commands the kernel provides itself are files under `/proc`, so `mem` and
 
 `tsh` (`/proc/tsh`, in `src/kernel/shell.c`) is the shell the machine
 starts. It reads a line, splits it into words on blanks, and runs the first
-word - a kernel command from `/proc`, or a program from `/usr/bin` - with the
-rest as its arguments. `cd`, `exit` and `help` are built in. It is part of
-the kernel, so it costs no memory of a program's; another shell, such as
-bash, is a program on the disk like any other.
+word - found through `PATH`, a kernel command in `/proc` or a program in
+`/usr/bin` - with the rest as its arguments. `cd`, `export`, `exit` and
+`help` are built in. `tsh` on its own starts another tsh, until `exit`;
+`tsh <file>` runs a script, lines of the same one after another. It is part
+of the kernel, so it costs no memory of a program's; another shell,
+such as bash, is a program on the disk like any other.
 
 Editing the line is the terminal's job, so every program that reads a line
 gets it too: the arrows move through the line, Home, End and Delete do what
@@ -84,6 +89,14 @@ A pipe is therefore a buffer rather than a channel: the first program fills
 it and finishes, then the second reads it. A writer that never finishes
 never hands its pipe over.
 
+### Threads
+
+A program's threads do run side by side. Each has its own kernel stack, and
+whenever one waits in the kernel (a futex, `poll`, a socket, `sleep`, a key)
+the next one runs. Nothing interrupts a thread that spins in its own code
+without a syscall. `futex`, `clone3`, `eventfd` and `gettid` are there, so
+glibc's threads work; curl resolves names on one.
+
 ### Starting a program quickly
 
 On a machine like this, two things make a program slow to start, and neither
@@ -96,13 +109,81 @@ So a file mapping is a promise rather than a copy: `mmap`, and the program
 loader itself, record where the memory is and what belongs there, and nothing
 is read until the program touches it.
 
-The rest is the disk cache, which stays off until `cache on` asks for it,
-because megabytes are not something a kernel should spend without being
-asked. `cache 3M` sets its size, three megabytes being what it has unless
-told otherwise, and `cache off` turns it off again. With the cache on, the
-loader and the C library are read once, and
-every command after that starts without touching the disk: about two
-milliseconds, against seventeen without it and a hundred before any of this.
+The rest is the disk cache, the `storage/cache` module, which works like
+Linux's page cache: every disk read goes through it, in 64 KiB lines, and
+what it read stays. With `cache auto` it grows into memory nobody else is
+using, less a reserve, and the moment anything else wants that memory it
+gives the lines used longest ago back - so `mem` shows it apart, as free
+memory lent out. `cache 64M` caps it instead, and `cache off` empties it.
+`cache add <file>` and `cache rm <file>` keep the list of files it reads in
+whenever it starts, which `/etc/tuxlet/cache` fills with the loader and the
+C library. A cached `curl --version` starts in ten milliseconds.
+
+The disk itself is read by bus-master DMA where the IDE controller has it,
+64 KiB a command, and by programmed I/O where it does not. Writes are on the
+disk when the call returns; the flush that makes the drive keep them waits,
+as on Linux, for the machine to go idle, for `sync` or `fsync`, or for the
+power to go.
+
+### Modules
+
+Parts of the kernel that not every machine needs live on the disk as
+modules, as `<category>/<name>.kmod` under the folders of `MODPATH` -
+`/usr/lib/modules`, as `/etc/tuxlet/env` sets it - and cost nothing until
+they are loaded. The format is Tuxlet's own: nothing like Linux's
+`.ko`, and neither kind loads on the other's kernel. Every module on the
+disk is there to be had, and `modman` turns them on and off:
+
+```sh
+modman                          # what there is, and what is enabled
+modman enable network/stack     # load it now, and at every boot
+modman disable network/stack    # unload it, and not at boot
+modman auto network             # enable every one of them that works here
+modman takeover                 # let the firmware go; the screen mode is fixed after
+```
+
+| Module              | What it is                                   | By default |
+| ------------------- | -------------------------------------------- | ---------- |
+| `storage/ide`       | the IDE disk driver (DMA, or PIO)            | on         |
+| `storage/cache`     | the disk cache, and `cache`                  | on         |
+| `input/ps2`         | the PS/2 keyboard driver                     | on         |
+| `display/wallpaper` | the picture behind the text, and `set-bg`    | off        |
+| `debug/trace`       | every syscall, to `/var/log`, and `log`      | off        |
+| `network/stack`     | IPv4, TCP, UDP, ICMP, DHCP, and `net`        | off        |
+| `network/e1000`, `network/rtl8139`, `network/virtio` | network cards | off  |
+
+`/etc/tuxlet/modules` is a script like the rest of `/etc/tuxlet`, a
+`modman enable` line a module, and the boot script runs it first. The disk
+driver takes the disk over from the firmware the moment it loads, which
+keeps the rest of the boot fast. `modman takeover` lets the firmware go only
+once a disk module and a keyboard module have registered, and says why not
+otherwise; the firmware's drivers are kept until then. A module the kernel still depends on,
+such as the disk driver after that, refuses to unload.
+
+A module is an ELF shared object, loaded anywhere and linked by name
+against what the kernel exports (`src/kernel/module.c`). Modules that work
+together meet in a slot the kernel keeps rather than calling each other: a
+card driver registers its card, the network stack uses whatever card is
+there, and either loads and runs without the other. They are built from
+`src/modules`, a file or a folder each.
+
+### The network
+
+`modman auto network` brings it up: it enables `network/stack` and the
+driver for whichever card the machine has - or enable them by name. DHCP finds an address the first time the
+machine is idle at the prompt, or at first use if that comes sooner, which is
+also when the card is started, and the name server goes in
+`/etc/resolv.conf`. Programs reach it through Linux's socket calls, so
+`ping`, name lookups, and TCP clients and servers work as they do on Linux.
+`net` shows the card and its address.
+
+The module also answers netlink (links, addresses, routes and neighbours,
+and the socket list), the interface ioctls, raw sockets, ICMP errors on the
+error queue (`IP_RECVERR`), and `/proc/net`'s files. The socket syscalls
+themselves are the module's: with it off, `socket` answers ENOSYS, as it
+does on a Linux built without networking. The disk has `ip`, `ss`,
+`ifconfig`, `route`, `arp`, `netstat`, `ping`, `traceroute`, `tracepath`,
+`curl`, `wget`, `nc`, `telnet`, `ftp`, `whois`, `getent` and `hostname`.
 
 ## On the disk
 
@@ -132,7 +213,7 @@ that file.
 └── var/
     ├── cache/
     ├── lib/            state a program keeps between runs
-    └── log/            a file of syscalls per program, written while idle
+    └── log/            a file of syscalls per program, with debug/trace
 ```
 
 `/dev`, `/proc` and `/sys` are empty folders on the disk. What appears in
@@ -146,11 +227,18 @@ from 4 MiB up, so a machine needs a little more RAM than that free down
 there to compile.
 
 **Boot.** Tuxlet OS's own settings live in `/etc/tuxlet/`, apart from the
-ones every Linux system has. `/etc/tuxlet/boot` describes the machine: the
-screen, the text size, the wallpaper and the disk cache, each from a file of
-its own beside it - `/etc/tuxlet/cache` holds the cache's size and whether it
-is on. The kernel runs it itself before there is a shell.
-`/etc/tuxlet/shell` then names the shell to start, which is `/proc/tsh`.
+ones every Linux system has, and every one of them is a tsh script.
+`/etc/tuxlet/boot` describes the machine: the environment, the modules, the
+screen, the text size, the wallpaper and the disk cache, each a script of
+its own beside it. It runs in `/etc/tuxlet`, so it calls them as
+`tsh cache` - `/etc/tuxlet/cache` holds the cache's mode (`auto`, a size, or
+`off`) and which files it reads in from the start. `/etc/tuxlet/env` exports
+`PATH`, `MODPATH`, `HOME` and the rest: where tsh looks for commands and
+modman for modules, and what every program tsh starts is given. The kernel
+has no paths of its own; libraries are found by the loader a program names,
+as on Linux, `LD_LIBRARY_PATH` included. The kernel runs it itself before there
+is a shell. `/etc/tuxlet/shell` is the script run next, and what it runs is
+the shell: `tsh`, or `bash`. It is run again whenever that shell exits.
 
 **Settings.** A program keeps its settings where Linux software expects, in
 dotfiles in the home folder: a file such as `~/.vimrc`, or a folder such as

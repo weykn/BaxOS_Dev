@@ -105,7 +105,9 @@ static struct level {
 #define OWNED     0x200             /* an entry whose page is at its own address */
 
 static uint64_t *low_pd;            /* the firmware's directory for it */
-static uint64_t *low_orig;          /* what that said before anything changed it */
+static uint64_t *low_orig;          /* what that said before anything changed it -
+                                       none on the kernel's own tables, which
+                                       say two megabytes one to one */
 static uint64_t  low_fixed;         /* pages bought for those two, for good */
 
 static unsigned depth;          /* levels[depth] is the one in use */
@@ -257,6 +259,12 @@ static bool slot_take(struct level *level) {
     return false;
 }
 
+/* What the directory says for the two megabytes at i when no program has
+   them. */
+static uint64_t low_plain(unsigned i) {
+    return low_orig != NULL ? low_orig[i] : ((uint64_t)i << 21) | PRESENT | WRITE | BIG;
+}
+
 /* Finds the firmware's page directory for the first gigabyte, splitting a
    one-gigabyte page into two-megabyte ones if that is how it was mapped, and
    keeps a copy of it to put back from. Once; false if it cannot be had. */
@@ -267,8 +275,19 @@ static bool low_setup(void) {
     if (low_pd != NULL) {
         return true;
     }
-    if (!(top[0] & PRESENT) || !((pdpt = table_at(top[0]))[0] & PRESENT) ||
-        (low_orig = (uint64_t *)table_page()) == NULL) {
+    if (!(top[0] & PRESENT) || !((pdpt = table_at(top[0]))[0] & PRESENT)) {
+        return false;
+    }
+    if (mem_ours()) {
+        cr0 = write_protect_off();
+        top[0] |= USER;
+        pdpt[0] |= USER;
+        low_pd = table_at(pdpt[0]);
+        write_protect_back(cr0);
+        flush_tlb();
+        return true;
+    }
+    if ((low_orig = (uint64_t *)table_page()) == NULL) {
         return false;
     }
     low_fixed = VM_PAGE;
@@ -308,7 +327,7 @@ static void low_apply(struct level *level, bool on) {
     for (uint64_t i = level->low_start >> 21; i <= (level->low_end - 1) >> 21; i++) {
         uint64_t table = level->low_tables[i];
 
-        low_pd[i] = on && table != 0 ? table | PRESENT | WRITE | USER : low_orig[i];
+        low_pd[i] = on && table != 0 ? table | PRESENT | WRITE | USER : low_plain(i);
     }
     write_protect_back(cr0);
     flush_tlb();
@@ -344,6 +363,32 @@ bool vm_low(uint64_t start, uint64_t end) {
     level->low_start = start;
     level->low_end = end;
     return true;
+}
+
+void vm_move(uint64_t *top, uint64_t *pd) {
+    uint64_t *old = pml4();
+
+    for (unsigned i = 0; i < LEVELS; i++) {
+        if (levels[i].base != 0) {
+            top[levels[i].slot] = old[levels[i].slot];
+        }
+    }
+    if (low_pd == NULL) {
+        return;
+    }
+    /* The directory is all two-megabyte pages, which is what is put back from
+       now on; whatever a program has in place of one stays. */
+    for (unsigned i = 0; i < ENTRIES; i++) {
+        uint64_t plain = pd[i];
+
+        if (low_pd[i] != low_orig[i]) {
+            pd[i] = low_pd[i];
+        }
+        low_orig[i] = plain;
+    }
+    low_pd = pd;
+    top[0] |= USER;
+    table_at(top[0])[0] |= USER;
 }
 
 void vm_firmware_view(bool on) {
