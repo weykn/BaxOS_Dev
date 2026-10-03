@@ -9,3 +9,6 @@ build/
 # Screenshots and logs from driving a booted machine.
 *.ppm
 *.log
+
+# What goes on the disk as-is.
+src/disk/

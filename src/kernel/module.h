@@ -30,7 +30,7 @@ MODULE_EXPORT int  module_exit(void);
 /* RAM the loaded modules' own images take, in bytes. */
 uint32_t module_memory(void);
 
-/* /proc/modman: every module on the disk is there to be had; enable loads
+/* /ctl/modman: every module on the disk is there to be had; enable loads
    one and disable unloads it, nothing saved - what loads at boot is
    whatever the boot script enables; auto enables every
    module of a category that starts on this machine, and takeover lets the

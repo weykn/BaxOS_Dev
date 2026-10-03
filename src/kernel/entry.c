@@ -9,10 +9,10 @@
 #include "vga.h"
 
 /* The folders the kernel goes to, made at boot if the disk lacks them -
-   parents first. /proc and /dev are the kernel's own; only cd and ls need
-   them on the disk. */
+   parents first. /ctl and /dev are the kernel's own; only cd and ls need
+   them on the disk. /proc is Linux's, for the /proc/net files programs read. */
 static const char *const folders[] = {
-    "/proc", "/dev", "/etc", "/etc/tuxlet", "/usr", "/usr/lib", "/usr/lib/modules",
+    "/ctl", "/proc", "/dev", "/etc", "/etc/tuxlet", "/usr", "/usr/lib", "/usr/lib/modules",
     "/var", "/var/log", "/root", "/tmp",
 };
 

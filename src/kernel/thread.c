@@ -21,6 +21,7 @@ struct thread {
     bool     exiting;               /* the process is ending: the leader does it */
     int      exit_code;
     uint64_t futex;                 /* where it waits, 0 if nowhere */
+    uint64_t sigmask;               /* the signals it has blocked: each thread its own */
     uint64_t clear_tid;
     /* What belongs to whoever is running, put aside while it is not. */
     uint64_t fs_base, kernel_rsp, args[6];
@@ -114,6 +115,10 @@ void thread_yield(void) {
     }
 }
 
+uint64_t *thread_sigmask(void) {
+    return &current->sigmask;
+}
+
 bool thread_alone(void) {
     return next_one() == NULL;
 }
@@ -158,6 +163,7 @@ int thread_create(const struct user_regs *regs, uint64_t rsp, uint64_t fs, uint6
 
     *t = (struct thread){
         .bottom = (uint8_t *)(t + 1), .level = level, .tid = next_tid++,
+        .sigmask = current->sigmask,    /* as the thread starting it has them */
         .clear_tid = clear_tid, .fs_base = fs, .kernel_rsp = *kernel_rsp(),
         .regs = *regs,
     };

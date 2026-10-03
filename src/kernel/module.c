@@ -615,9 +615,13 @@ void module_command(char *args) {
         return;
     }
     if (off) {
+        char path[FS_NAME_LEN];
         int slot = slot_of(name);
 
-        if (slot >= 0 && !unload(slot)) {
+        if (slot < 0) {
+            kprintf("modman: %s: %s\n", name,
+                    module_file(name, path, sizeof path) ? "not loaded" : "no such module");
+        } else if (!unload(slot)) {
             kprintf("modman: %s: %s\n", name, why);
         }
     }

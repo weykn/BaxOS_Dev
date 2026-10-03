@@ -626,6 +626,97 @@ void vga_clear(void) {
 #define PARAMS 4
 
 static enum { PLAIN, AFTER_ESC, IN_CSI, CHARSET, IN_OSC } escape;
+
+/* ---- what a byte draws ------------------------------------------------------
+ *
+ * Text arrives as UTF-8, as it does on Linux's console, and the font is
+ * code page 437: a character is drawn as the glyph of the same shape, or as
+ * a question mark where the font has none. A program drawing lines the
+ * VT100's way - "ESC ( 0" or SO, then letters - gets the same glyphs. */
+
+static bool     charset_g1;         /* the escape just seen names G1, not G0 */
+static bool     graphics[2];        /* G0 and G1: the VT100's line drawing set */
+static bool     shifted;            /* SO: G1 is the one in use */
+static uint32_t utf8;               /* a character being gathered */
+static unsigned utf8_left;          /* its bytes still to come */
+
+/* Code page 437's upper half, as the Unicode each glyph is. */
+static const uint16_t cp437[128] = {
+    0x00C7, 0x00FC, 0x00E9, 0x00E2, 0x00E4, 0x00E0, 0x00E5, 0x00E7,
+    0x00EA, 0x00EB, 0x00E8, 0x00EF, 0x00EE, 0x00EC, 0x00C4, 0x00C5,
+    0x00C9, 0x00E6, 0x00C6, 0x00F4, 0x00F6, 0x00F2, 0x00FB, 0x00F9,
+    0x00FF, 0x00D6, 0x00DC, 0x00A2, 0x00A3, 0x00A5, 0x20A7, 0x0192,
+    0x00E1, 0x00ED, 0x00F3, 0x00FA, 0x00F1, 0x00D1, 0x00AA, 0x00BA,
+    0x00BF, 0x2310, 0x00AC, 0x00BD, 0x00BC, 0x00A1, 0x00AB, 0x00BB,
+    0x2591, 0x2592, 0x2593, 0x2502, 0x2524, 0x2561, 0x2562, 0x2556,
+    0x2555, 0x2563, 0x2551, 0x2557, 0x255D, 0x255C, 0x255B, 0x2510,
+    0x2514, 0x2534, 0x252C, 0x251C, 0x2500, 0x253C, 0x255E, 0x255F,
+    0x255A, 0x2554, 0x2569, 0x2566, 0x2560, 0x2550, 0x256C, 0x2567,
+    0x2568, 0x2564, 0x2565, 0x2559, 0x2558, 0x2552, 0x2553, 0x256B,
+    0x256A, 0x2518, 0x250C, 0x2588, 0x2584, 0x258C, 0x2590, 0x2580,
+    0x03B1, 0x00DF, 0x0393, 0x03C0, 0x03A3, 0x03C3, 0x00B5, 0x03C4,
+    0x03A6, 0x0398, 0x03A9, 0x03B4, 0x221E, 0x03C6, 0x03B5, 0x2229,
+    0x2261, 0x00B1, 0x2265, 0x2264, 0x2320, 0x2321, 0x00F7, 0x2248,
+    0x00B0, 0x2219, 0x00B7, 0x221A, 0x207F, 0x00B2, 0x25A0, 0x00A0,
+};
+
+/* Characters drawn with a glyph meant for another: the rounded and heavy
+   lines as plain ones, arrows and bullets from the font's low codes. */
+static const struct { uint16_t from; uint8_t to; } alike[] = {
+    { 0x256D, 0xDA }, { 0x256E, 0xBF }, { 0x256F, 0xD9 }, { 0x2570, 0xC0 },
+    { 0x2501, 0xC4 }, { 0x2503, 0xB3 }, { 0x2022, 0x07 }, { 0x25CF, 0x07 },
+    { 0x2190, 0x1B }, { 0x2191, 0x18 }, { 0x2192, 0x1A }, { 0x2193, 0x19 },
+    { 0x25B6, 0x10 }, { 0x25C0, 0x11 }, { 0x2666, 0x04 }, { 0x25C6, 0x04 },
+    { 0x2026, 0xFA }, { 0x2713, 0xFB },
+};
+
+/* The VT100's line drawing set, '_' to '~', as code page 437. */
+static const uint8_t vt100_lines[32] = {
+    ' ', 0x04, 0xB1, '?', '?', '?', '?', 0xF8, 0xF1, 0xB0, 0xCE, 0xD9, 0xBF, 0xDA,
+    0xC0, 0xC5, '-', '-', 0xC4, '-', '_', 0xC3, 0xB4, 0xC1, 0xC2, 0xB3, 0xF3, 0xF2,
+    0xE3, 0xD8, 0x9C, 0xFE,
+};
+
+static uint8_t glyph_for(uint32_t u) {
+    if (u < 0x80) {
+        return (uint8_t)u;
+    }
+    for (unsigned i = 0; i < 128; i++) {
+        if (cp437[i] == u) {
+            return (uint8_t)(0x80 + i);
+        }
+    }
+    for (unsigned i = 0; i < sizeof alike / sizeof alike[0]; i++) {
+        if (alike[i].from == u) {
+            return alike[i].to;
+        }
+    }
+    return '?';
+}
+
+void vga_text_reset(void) {
+    graphics[0] = graphics[1] = shifted = false;
+    utf8_left = 0;
+}
+
+/* The glyph a byte of text draws, or 0 while a character is still being
+   gathered. */
+static uint8_t glyph(uint8_t c) {
+    if (c < 0x80) {
+        utf8_left = 0;
+        return graphics[shifted] && c >= '_' && c <= '~' ? vt100_lines[c - '_'] : c;
+    }
+    if (c >= 0xC0) {                /* the first of a character's bytes */
+        utf8_left = c >= 0xF0 ? 3 : c >= 0xE0 ? 2 : 1;
+        utf8 = c & (0x3Fu >> utf8_left);
+        return 0;
+    }
+    if (utf8_left == 0) {
+        return '?';                 /* a stray continuation */
+    }
+    utf8 = utf8 << 6 | (c & 0x3F);
+    return --utf8_left > 0 ? 0 : glyph_for(utf8);
+}
 static unsigned osc_left;       /* of a palette entry: "P" and seven digits */
 static size_t   saved_cursor;
 static uint8_t  saved_pen;
@@ -870,6 +961,7 @@ static bool escaped(char c) {
            straight after the escape. One this does not know is dropped. */
         escape = c == '[' ? IN_CSI : c == '(' || c == ')' ? CHARSET
                : c == ']' ? IN_OSC : PLAIN;
+        charset_g1 = c == ')';
         params[0] = param_count = 0;
         private = false;
         osc_left = 0;
@@ -893,6 +985,7 @@ static bool escaped(char c) {
             line_feed();
             wrap_pending = false;
         } else if (c == 'c') {
+            vga_text_reset();
             pen = color = VGA_ATTR(VGA_LIGHTGRAY, VGA_BLACK);
             reversed = inserting = false;
             cursor_shown = true;
@@ -903,7 +996,9 @@ static bool escaped(char c) {
         return true;
     }
     if (escape == CHARSET) {
-        escape = PLAIN;             /* the set it names: there is only the one */
+        escape = PLAIN;             /* '0' is the line drawing set; 'B', or
+                                       anything else, plain text */
+        graphics[charset_g1] = c == '0';
         return true;
     }
     if (escape == IN_OSC) {
@@ -1084,6 +1179,8 @@ void vga_putc(char c) {
 
         cursor = (cursor / 8 + 1) * 8 < end ? (cursor / 8 + 1) * 8 : end;
         wrap_pending = false;
+    } else if (c == 0x0E || c == 0x0F) {
+        shifted = c == 0x0E;        /* SO and SI: G1 in use, and G0 again */
     } else if ((unsigned char)c < 0x20 || c == 0x7F) {
         /* A control character this screen has no answer for - the bell most
            of all, which a line editor rings whenever an edit does nothing, a
@@ -1100,10 +1197,16 @@ void vga_putc(char c) {
             line_feed();
             wrap_pending = false;
         }
+        uint8_t g = glyph((uint8_t)c);
+
+        if (g == 0) {
+            cursor_draw(true);
+            return;                 /* more of the character to come */
+        }
         if (inserting) {
             shift_line(true, 1);
         }
-        put(cursor, cell(c));
+        put(cursor, cell((char)g));
         if (cursor % width == width - 1) {
             wrap_pending = true;
         } else {

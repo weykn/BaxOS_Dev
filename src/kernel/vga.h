@@ -112,6 +112,10 @@ void vga_set_color(enum vga_color fg, enum vga_color bg);
 /* Whether "\n" also goes back to the start of the line - off when a program
    turns off ONLCR, and sends its own "\r". */
 void vga_set_crlf(bool on);
+
+/* Plain text again: the line drawing sets off, a half-sent character gone -
+   what one program left for the next. */
+void vga_text_reset(void);
 void vga_putc(char c);
 void vga_puts(const char *s);
 

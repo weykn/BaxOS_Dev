@@ -1067,6 +1067,24 @@ int fs_mkdir(const char *path) {
     return done(err);
 }
 
+int fs_set_mode(const char *path, unsigned mode) {
+    struct slot *entry;
+
+    if (resolve(path, true) == NULL) {
+        return resolve_err;
+    }
+    if ((entry = find(full)) == NULL && dir_name(path, true) != NULL) {
+        entry = find(full);
+    }
+    if (entry == NULL) {
+        return FS_ENOENT;
+    }
+    if (entry->size != 0) {
+        return FS_EINVAL;           /* its start is where it is */
+    }
+    return done(write_entry(entry->index, NULL, FS_MODE | (mode & 0177777), 0));
+}
+
 int fs_chdir(const char *path) {
     size_t n;
 
@@ -1217,6 +1235,19 @@ int fs_folder_at(const char *path, unsigned *index) {
 /* Gives a file a different name, which is all that moving one is here: the
    sectors stay where they are and only the table changes. A folder is not
    moved, since every path inside it would have to change with it. */
+int fs_entry(const char *path, bool follow, unsigned *index) {
+    if (resolve(path, follow) == NULL) {
+        return resolve_err;
+    }
+    struct slot *found = find(full);
+
+    if (found == NULL) {
+        return FS_ENOENT;
+    }
+    *index = found->index + 1;
+    return 0;
+}
+
 int fs_rename(const char *from, const char *to) {
     char was[FS_NAME_LEN];
     const char *name = resolve(from, false);
@@ -1236,20 +1267,30 @@ int fs_rename(const char *from, const char *to) {
     if (name_cmp(was, name) == 0) {
         return 0;                   /* already where it is being put */
     }
-    if (find(name) != NULL) {
-        return FS_EEXIST;
+    char dest[FS_NAME_LEN];
+    struct slot *there;
+
+    memcpy(dest, name, strlen(name) + 1);
+    if ((there = find(dest)) != NULL) {
+        /* A file already there goes: that is how a program replaces one in
+           a single step, writing the new one aside and renaming it over. */
+        int err = drop_entry(there->index, dest);
+
+        if (err != 0) {
+            return done(err);
+        }
     }
-    if (!parent_exists(full)) {
+    if (!parent_exists(dest)) {
         return FS_ENOENT;
     }
     struct slot file = *find(was);
     int err = index_remove(was, file.index);
 
     if (err == 0) {
-        err = write_entry(file.index, full, file.start, file.size);
+        err = write_entry(file.index, dest, file.start, file.size);
     }
     if (err == 0) {
-        err = index_add(full, file.index);
+        err = index_add(dest, file.index);
     }
     return done(err);
 }

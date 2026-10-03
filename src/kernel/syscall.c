@@ -41,6 +41,7 @@ static uint64_t write_protect(bool on);
 #define EACCES 13
 #define EEXIST 17
 #define EAGAIN 11
+#define EINTR  4
 #define EMFILE 24
 #define ENOTTY 25
 #define EINVAL 22
@@ -54,10 +55,20 @@ static uint64_t write_protect(bool on);
 #define ENOTEMPTY 39
 #define ENFILE 23
 #define EPIPE  32
+#define ESPIPE 29
+
+#define S_IFMT  0170000             /* a file's type, in its mode */
+#define S_IFIFO 0010000
+#define S_IFCHR 0020000
+#define S_IFDIR 0040000
+#define S_IFREG 0100000
+#define S_IFLNK 0120000
+#define S_IFSOCK 0140000
 #define ELOOP  40
 #define EPROTONOSUPPORT 93
 #define ESOCKTNOSUPPORT 94
 #define EAFNOSUPPORT    97
+#define EOPNOTSUPP      95
 #define ENOTSOCK        88
 
 /* The arguments of the call being handled, all six of them. Handlers take
@@ -82,10 +93,14 @@ static uint64_t sys_timer_create(uint64_t clock, uint64_t event, uint64_t id);
 static uint64_t sys_timer_settime(uint64_t id, uint64_t flags, uint64_t spec);
 static uint64_t sys_timer_gettime(uint64_t id, uint64_t spec, uint64_t c);
 static uint64_t sys_wait4(uint64_t pid, uint64_t status, uint64_t options);
+static bool held_run(bool all);
+static bool held_waiting(int pid);
+static void held_drop(void);
 static uint64_t sys_pipe(uint64_t out, uint64_t b, uint64_t c);
 static uint64_t sys_pipe2(uint64_t out, uint64_t flags, uint64_t c);
 static uint64_t sys_eventfd(uint64_t count, uint64_t b, uint64_t c);
 static uint64_t sys_eventfd2(uint64_t count, uint64_t flags, uint64_t c);
+static uint64_t sys_socketpair(uint64_t domain, uint64_t type, uint64_t c);
 static uint64_t sys_getrandom(uint64_t buf, uint64_t length, uint64_t flags);
 static bool fits(uint64_t addr, uint64_t size);
 static bool claim(uint64_t addr, uint64_t size);
@@ -296,7 +311,7 @@ static void handles_reset(void) {
  * grows as it is written to, since the program filling it has to finish
  * before the one draining it starts and there is no way to push back. */
 
-#define PIPES      8
+#define PIPES      16               /* pipes, eventfds and socketpair ends open at once */
 #define PIPE_FIRST 8192
 #define PIPE_MAX   (1024 * 1024)
 
@@ -306,6 +321,9 @@ static void handles_reset(void) {
 #define PIPE_WRITE 1
 #define PIPE_EVENT 2
 #define PIPE_FILE  3                /* a /proc/net file: the text, read once */
+#define PIPE_PAIR  4                /* an AF_UNIX socketpair end: it reads its
+                                       own pipe and writes the other's, whose
+                                       slot is in offset from bit 16 */
 #define PIPE_TEXT  8192             /* the most of one */
 #define EFD_SEMAPHORE 1
 
@@ -313,7 +331,8 @@ static struct pipe {
     char    *data;
     uint32_t size, len, read_at;
     unsigned refs;                  /* descriptors on either end */
-    uint64_t count;                 /* an eventfd's */
+    uint64_t count;                 /* an eventfd's; a pipe's, the write ends open on it */
+    uint32_t fifo;                  /* a FIFO's: the number of the file it is */
 } pipes[PIPES];
 
 static struct pipe *pipe_of(const struct handle *h) {
@@ -329,6 +348,58 @@ static void pipe_drop(struct pipe *p) {
         }
         *p = (struct pipe){ 0 };
     }
+}
+
+/* The pipe a socketpair end writes to, or NULL for anything else. */
+static struct pipe *pair_out(const struct handle *h) {
+    uint32_t slot = h != NULL && h->start == PIPE_MARK && h->size == PIPE_PAIR ? h->offset >> 16 : 0;
+
+    return slot > 0 && slot <= PIPES && pipes[slot - 1].refs > 0 ? &pipes[slot - 1] : NULL;
+}
+
+/* The pipe a handle writes to - a write end's, or a pair end's other one -
+   or NULL. */
+static struct pipe *written(const struct handle *h) {
+    return h->size == PIPE_WRITE ? pipe_of(h) : pair_out(h);
+}
+
+/* One descriptor more, or fewer, on a pipe handle: both of a pair's pipes,
+   and the count of write ends on the one it writes to. */
+static void pipe_hold(const struct handle *h) {
+    struct pipe *p = pipe_of(h), *out = pair_out(h), *w = written(h);
+
+    if (p != NULL) {
+        p->refs++;
+    }
+    if (out != NULL) {
+        out->refs++;
+    }
+    if (w != NULL) {
+        w->count++;
+    }
+}
+
+static void pipe_release(const struct handle *h) {
+    struct pipe *w = written(h);
+
+    if (w != NULL && w->count > 0) {
+        w->count--;                 /* at 0 the other end reads its end */
+    }
+    pipe_drop(pair_out(h));
+    pipe_drop(pipe_of(h));
+}
+
+/* Whether a pipe's read end, or a pair end, has something to read - or
+   nothing can be written to it any more, which is its end. An empty one
+   with a write end still open is not ready, as on Linux: a program waiting
+   on a pipe its own signal handler writes to is waiting for that. */
+static bool readable(const struct handle *h) {
+    struct pipe *p = pipe_of(h);
+
+    if (h->size != PIPE_PAIR && h->size != PIPE_READ) {
+        return false;               /* an eventfd's count is not this */
+    }
+    return p == NULL || p->len > p->read_at || p->count == 0;
 }
 
 
@@ -402,9 +473,9 @@ static void pipes_hold(int by) {
             continue;
         }
         if (by > 0) {
-            p->refs++;
+            pipe_hold(&handles[fd]);
         } else {
-            pipe_drop(p);
+            pipe_release(&handles[fd]);
         }
     }
 }
@@ -450,6 +521,9 @@ static uint64_t pipe_read(struct pipe *p, char *to, uint64_t count) {
     }
     memcpy(to, p->data + p->read_at, (size_t)count);
     p->read_at += (uint32_t)count;
+    if (p->read_at == p->len) {
+        p->read_at = p->len = 0;    /* all read: a pair is written to again */
+    }
     return count;
 }
 
@@ -465,7 +539,9 @@ static uint64_t event_read(struct handle *h, struct pipe *p, uint64_t buf, uint6
         if ((h->offset & O_NONBLOCK) != 0 || thread_alone()) {
             return ERR(EAGAIN);
         }
-        interrupt_check();
+        if (interrupt_check()) {
+            return ERR(EINTR);
+        }
         thread_yield();
     }
     uint64_t took = (h->offset & EFD_SEMAPHORE) != 0 ? 1 : p->count;
@@ -515,6 +591,10 @@ static uint64_t write_to(struct handle *h, uint64_t text, uint64_t length) {
             }
             p->count += *(const uint64_t *)text;
             return 8;
+        }
+        if (h->size == PIPE_PAIR) {
+            p = pair_out(h);
+            return p == NULL ? ERR(EPIPE) : pipe_write(p, (const char *)text, length);
         }
         return p == NULL || h->size != PIPE_WRITE ? ERR(EBADF)
                                                   : pipe_write(p, (const char *)text, length);
@@ -584,15 +664,276 @@ void wait_ended(uint64_t began) {
     now_running.idle += efi_uptime_us() - began;
 }
 
-/* Ctrl-C, while a program waits on the network: there are no signals to
-   deliver, so it ends the program as SIGINT's default would. Only a wait
-   that could last for ever checks, so a program reading keys is left its
-   Ctrl-C. */
-void interrupt_check(void) {
-    if (console_interrupted()) {
-        vga_puts("^C\n");
-        process_exit(130);
+/* ---- Ctrl-C and Ctrl-\\ ---------------------------------------------------
+ *
+ * The keyboard's SIGINT and SIGQUIT, the only signals anything here sends.
+ * Left to their default, each ends the program, as on Linux. A program that
+ * ignores one hears nothing of it. One with a handler for SIGINT - a shell,
+ * an editor, a pager - has the call it is waiting in end with EINTR, and on
+ * the way back out of the syscall its handler runs, on its own stack, in a
+ * frame laid out as Linux lays one out; rt_sigreturn puts it back. Nothing
+ * preempts a program, so one is told at its next syscall, and checked every
+ * so often between waits as well as in them. */
+
+#define SIGINT       2
+#define SIGQUIT      3
+#define SIGCHLD      17
+#define SIG_DFL      0
+#define SIG_IGN      1
+#define SA_RESTORER  0x04000000
+#define SA_RESETHAND 0x80000000u
+#define SA_NODEFER   0x40000000u
+
+struct sig_action {                 /* rt_sigaction's, the kernel's own layout */
+    uint64_t handler, flags, restorer, mask;
+};
+
+extern struct user_regs *user_frame;    /* the program's registers, in syscall_entry.asm */
+
+/* The running program's actions for the signals anything here sends:
+   SIGINT and SIGQUIT from the keyboard, SIGCHLD when a child it started
+   ends - which a shell running its children through posix_spawn waits on. */
+static struct sig_action on_signal[3];
+static unsigned pending;                /* 1 << each to be handled on the way out */
+#define blocked (*thread_sigmask())     /* rt_sigprocmask's set, bit sig - 1: per thread */
+static uint64_t child_pid, child_code;  /* what SIGCHLD's siginfo says */
+
+static struct sig_action *action_for(uint64_t sig) {
+    return sig == SIGINT ? &on_signal[0] : sig == SIGQUIT ? &on_signal[1]
+         : sig == SIGCHLD ? &on_signal[2] : NULL;
+}
+
+/* A handler to run, not the default or ignoring. */
+static bool handled(uint64_t sig) {
+    const struct sig_action *a = action_for(sig);
+
+    return a != NULL && a->handler > SIG_IGN && (a->flags & SA_RESTORER) != 0;
+}
+
+/* The signal to handle now, if one is waiting and not blocked: SIGINT
+   before SIGCHLD. */
+static uint64_t deliverable(void) {
+    for (uint64_t sig = SIGINT; sig != 0; sig = sig == SIGINT ? SIGCHLD : 0) {
+        if ((pending & 1u << sig) != 0 && (blocked & 1ull << (sig - 1)) == 0) {
+            return sig;
+        }
     }
+    return 0;
+}
+
+/* What the program does with a signal just typed; true if a signal is
+   waiting to be handled by this thread, which is the moment for a wait to
+   end with EINTR. */
+bool interrupt_check(void) {
+    int sig = program_running() ? console_signal() : 0;
+
+    if (sig == CONSOLE_FORCE) {
+        vga_puts("^C\n");
+        process_exit(128 + SIGINT);
+    }
+    if (sig != 0) {
+        if (action_for((uint64_t)sig)->handler == SIG_DFL) {
+            vga_puts(sig == SIGINT ? "^C\n" : "^\\\n");
+            process_exit(128 + sig);
+        }
+        /* A handler for SIGQUIT is never run: the signal is let go, as an
+           ignored one is. */
+        pending |= sig == SIGINT && handled(SIGINT) ? 1u << SIGINT : 0;
+    }
+    return deliverable() != 0;
+}
+
+/* A signal a program sends: to itself - getpid's 1, its group, everyone -
+   since by the time it can send one, any child it started has finished. A
+   readline handing Ctrl-C on to its shell sends SIGINT this way, and
+   abort() SIGABRT. Others are let go, as ignored ones are. */
+#define SIGABRT 6
+#define SIGKILL 9
+#define ESRCH   3
+
+static uint64_t signal_self(uint64_t sig) {
+    if (sig == SIGINT || sig == SIGQUIT) {
+        if (action_for(sig)->handler == SIG_DFL) {
+            process_exit(128 + (int)sig);
+        }
+        pending |= sig == SIGINT && handled(SIGINT) ? 1u << SIGINT : 0;
+    } else if (sig == SIGCHLD) {
+        pending |= handled(SIGCHLD) ? 1u << SIGCHLD : 0;
+    } else if (sig == SIGABRT || sig == SIGKILL) {
+        process_exit(128 + (int)sig);
+    }
+    return 0;
+}
+
+static uint64_t sys_kill(uint64_t pid, uint64_t sig, uint64_t c) {
+    (void)c;
+    return (int64_t)pid <= 1 ? signal_self(sig) : ERR(ESRCH);
+}
+
+static uint64_t sys_tgkill(uint64_t tgid, uint64_t tid, uint64_t sig) {
+    (void)tgid;
+    (void)tid;
+    return signal_self(sig);
+}
+
+/* Blocked signals wait in pending until they are let through. SIGKILL and
+   SIGSTOP cannot be blocked. */
+static uint64_t sys_rt_sigprocmask(uint64_t how, uint64_t set, uint64_t old) {
+    const uint64_t always = 1ull << (9 - 1) | 1ull << (19 - 1);
+
+    if ((set != 0 && !user_range(set, 8)) || (old != 0 && !user_range(old, 8))) {
+        return ERR(EFAULT);
+    }
+    if (set != 0 && how > 2) {
+        return ERR(EINVAL);
+    }
+    if (old != 0) {
+        *(uint64_t *)old = blocked;
+    }
+    if (set != 0) {
+        uint64_t s = *(const uint64_t *)set & ~always;
+
+        blocked = how == 0 ? blocked | s : how == 1 ? blocked & ~s : s;    /* BLOCK, UNBLOCK, SETMASK */
+    }
+    return 0;
+}
+
+static uint64_t sys_rt_sigaction(uint64_t sig, uint64_t act, uint64_t old) {
+    struct sig_action *a = action_for(sig);
+
+    if ((act != 0 && !user_range(act, sizeof *a)) || (old != 0 && !user_range(old, sizeof *a))) {
+        return ERR(EFAULT);
+    }
+    if (old != 0) {
+        memset((void *)old, 0, sizeof *a);          /* the rest are left at their default */
+        if (a != NULL) {
+            memcpy((void *)old, a, sizeof *a);
+        }
+    }
+    if (act != 0 && a != NULL) {
+        memcpy(a, (const void *)act, sizeof *a);
+    }
+    return 0;
+}
+
+/* The frame a handler is called with, as Linux builds it: where to return
+   to - the program's restorer, which calls rt_sigreturn - then the
+   ucontext, its registers in sigcontext's order, then the siginfo. */
+struct sig_frame {
+    uint64_t restorer;
+    struct {
+        uint64_t flags, link, ss_sp;
+        uint32_t ss_flags, pad;
+        uint64_t ss_size;
+        uint64_t gregs[23];         /* r8-r15, rdi, rsi, rbp, rbx, rdx, rax, rcx,
+                                       rsp, rip, eflags, segments, err, trapno,
+                                       oldmask, cr2 */
+        uint64_t fpstate, reserved[8];
+        uint64_t sigmask;
+    } uc;
+    struct {
+        int32_t signo, errnum, code, pad;
+        uint8_t rest[112];
+    } info;
+};
+
+enum { G_R8, G_R9, G_R10, G_R11, G_R12, G_R13, G_R14, G_R15, G_RDI, G_RSI, G_RBP,
+       G_RBX, G_RDX, G_RAX, G_RCX, G_RSP, G_RIP, G_EFLAGS };
+
+/* Sends the program into the handler for a signal waiting, from this
+   syscall, which would have answered result: SIGINT first, then SIGCHLD,
+   one a call. */
+static uint64_t signal_deliver(uint64_t result) {
+    struct user_regs *f = user_frame;
+    uint64_t sig = deliverable();
+    struct sig_action *a = action_for(sig);
+    uint64_t at = ((f->rsp - 128 - sizeof(struct sig_frame)) & ~15ull) - 8;   /* past
+                                       the red zone; as a call leaves it */
+    struct sig_frame *frame = (struct sig_frame *)at;
+
+    pending &= ~(1u << sig);
+    if (!user_range(at, sizeof *frame)) {
+        process_exit(128 + 11);     /* nowhere to put it: SIGSEGV, as Linux */
+    }
+    memset(frame, 0, sizeof *frame);
+    frame->restorer = a->restorer;
+    frame->uc.sigmask = blocked;    /* back as it was once the handler returns */
+    blocked |= a->mask | ((a->flags & SA_NODEFER) != 0 ? 0 : 1ull << (sig - 1));
+
+    uint64_t *g = frame->uc.gregs;
+
+    g[G_R8] = f->r8;
+    g[G_R9] = f->r9;
+    g[G_R10] = f->r10;
+    g[G_R11] = f->rflags;           /* what syscall left in R11 */
+    g[G_R12] = f->r12;
+    g[G_R13] = f->r13;
+    g[G_R14] = f->r14;
+    g[G_R15] = f->r15;
+    g[G_RDI] = f->rdi;
+    g[G_RSI] = f->rsi;
+    g[G_RBP] = f->rbp;
+    g[G_RBX] = f->rbx;
+    g[G_RDX] = f->rdx;
+    g[G_RAX] = result;
+    g[G_RCX] = f->rip;              /* and in RCX */
+    g[G_RSP] = f->rsp;
+    g[G_RIP] = f->rip;
+    g[G_EFLAGS] = f->rflags;
+    frame->info.signo = (int32_t)sig;
+    frame->info.code = 0x80;        /* SI_KERNEL */
+    if (sig == SIGCHLD) {
+        int32_t *child = (int32_t *)frame->info.rest;
+
+        frame->info.code = 1;       /* CLD_EXITED */
+        child[0] = (int32_t)child_pid;
+        child[2] = (int32_t)child_code;     /* past si_uid */
+    }
+
+    f->rdi = sig;
+    f->rsi = (uint64_t)&frame->info;
+    f->rdx = (uint64_t)&frame->uc;
+    f->rsp = at;
+    f->rip = a->handler;
+    if ((a->flags & SA_RESETHAND) != 0) {
+        *a = (struct sig_action){ 0 };
+    }
+    return 0;
+}
+
+/* The handler has returned, through its restorer: the registers the frame
+   holds are the program's again - what it was doing, or what the handler
+   chose instead. */
+static uint64_t sys_rt_sigreturn(uint64_t a, uint64_t b, uint64_t c) {
+    struct user_regs *f = user_frame;
+    struct sig_frame *frame = (struct sig_frame *)(f->rsp - 8);   /* past the
+                                       restorer the handler's ret took */
+    const uint64_t *g = frame->uc.gregs;
+    const uint64_t flags = 0xDD5;   /* CF, PF, AF, ZF, SF, DF and OF: all a
+                                       program may set */
+    (void)a;
+    (void)b;
+    (void)c;
+    if (!user_range((uint64_t)frame, sizeof *frame)) {
+        process_exit(128 + 11);     /* SIGSEGV, as Linux would */
+    }
+    f->r8 = g[G_R8];
+    f->r9 = g[G_R9];
+    f->r10 = g[G_R10];
+    f->r12 = g[G_R12];
+    f->r13 = g[G_R13];
+    f->r14 = g[G_R14];
+    f->r15 = g[G_R15];
+    f->rdi = g[G_RDI];
+    f->rsi = g[G_RSI];
+    f->rbp = g[G_RBP];
+    f->rbx = g[G_RBX];
+    f->rdx = g[G_RDX];
+    f->rsp = g[G_RSP];
+    f->rip = g[G_RIP];
+    f->rflags = (f->rflags & ~flags) | (g[G_EFLAGS] & flags);
+    blocked = frame->uc.sigmask & ~(1ull << (9 - 1) | 1ull << (19 - 1));
+    return g[G_RAX];
 }
 
 /* The same around the kernel working for a program: what it took is system
@@ -722,9 +1063,10 @@ static uint64_t wait_ready(uint64_t nfds, uint64_t readfds, uint64_t writefds,
             /* A pipe with nothing left in it is at its end, which is a read
                that returns nothing rather than a wait. */
             (void)p;
-            if (handles[fd].size == PIPE_EVENT) {
+            if (handles[fd].size == PIPE_EVENT || handles[fd].size == PIPE_PAIR ||
+                handles[fd].size == PIPE_READ) {
                 event_bits |= bit;  /* ready once something adds to it */
-                ready |= event_ready(&handles[fd]) ? bit : 0;
+                ready |= event_ready(&handles[fd]) || readable(&handles[fd]) ? bit : 0;
             } else {
                 ready |= bit;       /* what is in it, or its end */
             }
@@ -746,7 +1088,9 @@ static uint64_t wait_ready(uint64_t nfds, uint64_t readfds, uint64_t writefds,
             ready = console_bits;
         }
         for (uint64_t fd = 0; fd < nfds; fd++) {
-            if ((event_bits >> fd & 1) != 0 && event_ready(&handles[fd])) {
+            if ((event_bits >> fd & 1) != 0 &&
+                (event_ready(&handles[fd]) ||
+                 readable(&handles[fd]))) {
                 ready |= 1ull << fd;
             }
         }
@@ -769,8 +1113,9 @@ static uint64_t wait_ready(uint64_t nfds, uint64_t readfds, uint64_t writefds,
             (timeout != 0 && (int64_t)efi_uptime_ms() >= until)) {
             break;                  /* it waited as long as it was asked to */
         }
-        if (sock_bits != 0) {
-            interrupt_check();
+        if (interrupt_check()) {
+            wait_ended(began);
+            return ERR(EINTR);
         }
         thread_yield();
     }
@@ -855,6 +1200,10 @@ static uint64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count) {
         uint64_t got = console_read((char *)buf, count);
 
         wait_ended(began);
+        if (got == CONSOLE_SIGNAL) {
+            interrupt_check();              /* ends it, or its handler is next */
+            return ERR(EINTR);
+        }
         return got;
     }
     if (h->start == WRITE_MARK) {
@@ -879,6 +1228,27 @@ static uint64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count) {
 
         if (p != NULL && h->size == PIPE_EVENT) {
             return event_read(h, p, buf, count);
+        }
+        /* An empty one waits for whatever another thread writes. With no
+           other thread to write it, a pipe's read is at its end: the
+           program that filled it, run before this one, is done. */
+        while (p != NULL && (h->size == PIPE_PAIR || h->size == PIPE_READ) && !readable(h)) {
+            if ((h->offset & O_NONBLOCK) != 0 || (thread_alone() && h->size == PIPE_PAIR)) {
+                return ERR(EAGAIN);
+            }
+            if (held_run(true)) {
+                continue;           /* what it wrote may be what this wants */
+            }
+            if (thread_alone()) {
+                break;
+            }
+            if (interrupt_check()) {
+                return ERR(EINTR);
+            }
+            thread_yield();
+        }
+        if (p != NULL && h->size == PIPE_PAIR) {
+            return pipe_read(p, (char *)buf, count);
         }
         /* The end of what is there is the end of the input: whatever filled
            it has already finished by the time anything reads. */
@@ -922,6 +1292,47 @@ uint64_t give_handle(struct handle h) {
 /* Opens a file, or the folder of that name if there is no such file - which
    is what getdents64 needs a descriptor for. "." is a folder like any other
    here, since the filesystem resolves it. */
+static uint32_t file_ino(const char *name, bool follow);
+
+static bool is_fifo(const struct fs_file *file) {
+    return file->size == 0 && (file->start & FS_MODE) != 0 && (file->start & S_IFMT) == S_IFIFO;
+}
+
+/* A FIFO opened: the pipe it is, made by whoever opens it first. Read and
+   write both is one end that reads what it writes, as a socketpair end
+   would if its other end were itself. */
+static uint64_t fifo_open(uint32_t number, uint64_t flags) {
+    unsigned slot = 0, mode = flags & O_ACCMODE;
+    struct pipe *p;
+    uint64_t fd;
+
+    while (slot < PIPES && !(pipes[slot].refs > 0 && pipes[slot].fifo == number)) {
+        slot++;
+    }
+    if (slot == PIPES) {
+        void *data;
+
+        if ((slot = pipe_slot()) == PIPES || (data = mem_alloc(PIPE_FIRST)) == NULL) {
+            return ERR(ENFILE);
+        }
+        pipes[slot] = (struct pipe){ .data = data, .size = PIPE_FIRST, .fifo = number };
+    }
+    p = &pipes[slot];
+    struct handle h = {
+        .start = PIPE_MARK, .folder = slot + 1,
+        .size = mode == O_RDONLY ? PIPE_READ : mode == O_WRONLY ? PIPE_WRITE : PIPE_PAIR,
+        .offset = (uint32_t)(flags & O_NONBLOCK) | (mode == O_RDWR ? (slot + 1) << 16 : 0),
+    };
+
+    p->refs += mode == O_RDWR ? 2 : 1;
+    p->count += mode != O_RDONLY;
+    fd = give_handle(h);
+    if ((int64_t)fd < 0) {
+        pipe_release(&h);
+    }
+    return fd;
+}
+
 static uint64_t open_name(const char *name, uint64_t flags) {
     struct fs_file file;
     unsigned folder;
@@ -940,6 +1351,9 @@ static uint64_t open_name(const char *name, uint64_t flags) {
             return give_handle((struct handle){ .start = CONSOLE_MARK });
         }
         return give_handle((struct handle){ .start = DEV_MARK, .folder = which });
+    }
+    if (fs_stat(name, &file) == 0 && is_fifo(&file)) {
+        return fifo_open(file_ino(name, true), flags);
     }
     if ((flags & O_ACCMODE) != O_RDONLY) {
         /* Open for writing. The name is kept, because that is what a write
@@ -1011,7 +1425,11 @@ static uint64_t open_name(const char *name, uint64_t flags) {
         return give_handle((struct handle){ .start = FOLDER_MARK, .folder = folder });
     }
     if (fs_stat(name, &file) == 0) {
-        return give_handle((struct handle){ .start = file.start, .size = file.size });
+        unsigned index = 0;
+
+        fs_entry(name, true, &index);
+        return give_handle((struct handle){ .start = file.start, .size = file.size,
+                                            .folder = index });
     }
     return ERR(ENOENT);
 }
@@ -1082,7 +1500,7 @@ static uint64_t sys_close(uint64_t fd, uint64_t b, uint64_t c) {
     }
     h->used = 0;
     if (h->start == PIPE_MARK) {
-        pipe_drop(pipe_of(h));
+        pipe_release(h);
         return 0;
     }
     if (h->start == SOCK_MARK) {
@@ -1115,15 +1533,11 @@ static uint64_t dup_to(uint64_t fd, uint64_t to) {
         return ERR(EBADF);
     }
     if (to != fd) {
-        struct pipe *p = pipe_of(h);
-
         if (handles[to].used != 0) {
             sys_close(to, 0, 0);
         }
         handles[to] = *h;
-        if (p != NULL) {
-            p->refs++;
-        }
+        pipe_hold(h);
         if (h->start == SOCK_MARK && net != NULL) {
             net->hold((int)h->folder);
         }
@@ -1133,7 +1547,6 @@ static uint64_t dup_to(uint64_t fd, uint64_t to) {
 
 static uint64_t sys_dup(uint64_t fd, uint64_t b, uint64_t c) {
     struct handle *h = handle_of(fd);
-    struct pipe *p = pipe_of(h);
     uint64_t made;
 
     (void)b;
@@ -1142,8 +1555,8 @@ static uint64_t sys_dup(uint64_t fd, uint64_t b, uint64_t c) {
         return ERR(EBADF);
     }
     made = give_handle(*h);
-    if ((int64_t)made >= 0 && p != NULL) {
-        p->refs++;
+    if ((int64_t)made >= 0) {
+        pipe_hold(h);
     }
     if ((int64_t)made >= 0 && h->start == SOCK_MARK && net != NULL) {
         net->hold((int)h->folder);
@@ -1161,6 +1574,11 @@ static uint64_t sys_lseek(uint64_t fd, uint64_t offset, uint64_t whence) {
 
     if (h == NULL || whence > 2) {
         return ERR(h == NULL ? EBADF : EINVAL);
+    }
+    /* The terminal, a pipe and a socket are streams, as on Linux - and a
+       pipe's offset holds its flags, not a place in it. */
+    if (h->start == CONSOLE_MARK || h->start == PIPE_MARK || h->start == SOCK_MARK) {
+        return ERR(ESPIPE);
     }
     /* SEEK_SET, SEEK_CUR, SEEK_END, and the offset is signed. */
     int64_t base = whence == 0 ? 0 : whence == 1 ? (int64_t)h->offset : (int64_t)h->size;
@@ -1596,26 +2014,31 @@ static uint64_t sys_unlinkat(uint64_t dirfd, uint64_t path, uint64_t flags) {
     return fs_errno(fs_remove(name));
 }
 
-static uint64_t sys_mkdir(uint64_t path, uint64_t mode, uint64_t c) {
-    const char *name = user_string(path);
+/* A folder made with other than the usual 0755, once umask's 022 is taken
+   off, keeps its mode: fish will not use a runtime folder anyone else can
+   read. */
+static uint64_t make_folder(const char *name, uint64_t mode) {
+    int err;
 
-    (void)mode;
-    (void)c;
     if (name == NULL) {
         return ERR(EFAULT);
     }
-    return fs_errno(fs_mkdir(name));
+    err = fs_mkdir(name);
+    if (err == 0 && (mode & 07755) != 0755) {
+        err = fs_set_mode(name, (unsigned)(S_IFDIR | (mode & 07755)));
+    }
+    return fs_errno(err);
+}
+
+static uint64_t sys_mkdir(uint64_t path, uint64_t mode, uint64_t c) {
+    (void)c;
+    return make_folder(user_string(path), mode);
 }
 
 static uint64_t sys_mkdirat(uint64_t dirfd, uint64_t path, uint64_t mode) {
     char joined[FS_NAME_LEN];
-    const char *name = at_path(dirfd, user_string(path), joined, sizeof joined);
 
-    (void)mode;
-    if (name == NULL) {
-        return ERR(EFAULT);
-    }
-    return fs_errno(fs_mkdir(name));
+    return make_folder(at_path(dirfd, user_string(path), joined, sizeof joined), mode);
 }
 
 static uint64_t sys_rename(uint64_t from, uint64_t to, uint64_t c) {
@@ -1923,7 +2346,10 @@ static uint64_t futex_wait(uint64_t address, uint64_t op, uint32_t value, uint64
             thread_sleep_on(0);
             return ERR(ETIMEDOUT);
         }
-        interrupt_check();
+        if (interrupt_check()) {
+            thread_sleep_on(0);
+            return ERR(EINTR);
+        }
         thread_yield();
     }
     return 0;
@@ -2046,12 +2472,6 @@ static uint64_t sys_umask(uint64_t mask, uint64_t b, uint64_t c) {
     return 022;
 }
 
-#define S_IFIFO 0010000
-#define S_IFCHR 0020000
-#define S_IFDIR 0040000
-#define S_IFREG 0100000
-#define S_IFLNK 0120000
-#define S_IFSOCK 0140000
 
 /* Descriptors have no flags worth keeping here: a program setting
    close-on-exec is told it worked, and one asking gets nothing back. The
@@ -2082,7 +2502,7 @@ static uint64_t sys_fcntl(uint64_t fd, uint64_t command, uint64_t c) {
            says: a libc that asked for "w+" and is told write-only gives up
            on the file it has just been handed. */
         if (h->start == SOCK_MARK || h->start == PIPE_MARK) {
-            return (h->start == SOCK_MARK || h->size == PIPE_EVENT ? O_RDWR :
+            return (h->start == SOCK_MARK || h->size == PIPE_EVENT || h->size == PIPE_PAIR ? O_RDWR :
                     h->size == PIPE_WRITE ? O_WRONLY : O_RDONLY) | (h->offset & O_NONBLOCK);
         }
         return h->start == CONSOLE_MARK || h->start == WRITE_MARK ? O_RDWR : O_RDONLY;
@@ -2212,7 +2632,9 @@ static uint64_t poll_once(struct pollfd *p, uint64_t count, bool *sockets) {
             continue;
         }
         if ((p[i].events & POLLIN) != 0 &&
-            (h->start != PIPE_MARK || h->size != PIPE_EVENT || event_ready(h)) &&
+            (h->start != PIPE_MARK ||
+             (h->size != PIPE_EVENT && h->size != PIPE_PAIR && h->size != PIPE_READ) ||
+             event_ready(h) || readable(h)) &&
             (!is_console((uint64_t)p[i].fd) || console_ready())) {
             p[i].revents |= POLLIN;
         }
@@ -2239,8 +2661,9 @@ static uint64_t poll_until(uint64_t fds, uint64_t count, int64_t wait_ms) {
 
     while ((ready = poll_once(p, count, &sockets)) == 0 &&
            (wait_ms < 0 || (int64_t)efi_uptime_ms() < until)) {
-        if (sockets) {
-            interrupt_check();
+        if (interrupt_check()) {
+            wait_ended(began);
+            return ERR(EINTR);
         }
         thread_yield();
     }
@@ -2394,6 +2817,15 @@ static uint64_t sys_renameat(uint64_t olddir, uint64_t oldpath, uint64_t newdir)
     return fs_errno(fs_rename(kept, new_name));
 }
 
+/* Extended attributes, which this filesystem does not have: what Linux
+   answers for one without them, and ls -l takes in its stride. */
+static uint64_t sys_no_xattr(uint64_t a, uint64_t b, uint64_t c) {
+    (void)a;
+    (void)b;
+    (void)c;
+    return ERR(EOPNOTSUPP);
+}
+
 /* A hard link, or a device node: there are neither here, and a program told
    so goes on to copy rather than stopping. */
 static uint64_t sys_no_links(uint64_t a, uint64_t b, uint64_t c) {
@@ -2401,6 +2833,30 @@ static uint64_t sys_no_links(uint64_t a, uint64_t b, uint64_t c) {
     (void)b;
     (void)c;
     return ERR(EPERM);
+}
+
+/* A FIFO, though, is an empty file that says so in its mode: opened, it is
+   a pipe, the same one for everyone opening it. */
+static uint64_t sys_mknodat(uint64_t dirfd, uint64_t path, uint64_t mode) {
+    char joined[FS_NAME_LEN];
+    const char *name = at_path(dirfd, user_string(path), joined, sizeof joined);
+    struct fs_file file;
+    int err;
+
+    if (name == NULL) {
+        return ERR(EFAULT);
+    }
+    if ((mode & S_IFMT) != S_IFIFO) {
+        return ERR(EPERM);
+    }
+    if (fs_stat(name, &file) == 0) {
+        return ERR(EEXIST);
+    }
+    err = fs_write(name, NULL, 0);
+    if (err == 0) {
+        err = fs_set_mode(name, (unsigned)(S_IFIFO | (mode & 0755)));
+    }
+    return fs_errno(err);
 }
 
 /* Emptying a file by name, which is the only length anything truncates one
@@ -2518,6 +2974,15 @@ static uint32_t folder_ino(unsigned one_based) {
     return one_based + 1;
 }
 
+/* A file is numbered the same way, by its table entry: unlike its sectors,
+   which move when it grows, that stays put while it is written - and a
+   program saving a file checks that it is still the one it opened. */
+static uint32_t file_ino(const char *name, bool follow) {
+    unsigned index;
+
+    return fs_entry(name, follow, &index) == 0 ? folder_ino(index) : 1;
+}
+
 /* Whether a table entry is a folder: the filesystem spells one with a slash
    on the end, and gives it no first sector - so the entry alone cannot be
    told from an empty file without looking at the name. */
@@ -2527,12 +2992,21 @@ static bool is_folder_entry(const struct fs_file *file) {
     return n > 0 && file->name[n - 1] == '/';
 }
 
+/* A folder's permission bits, by its number: 0755 unless it was given
+   others. */
+static unsigned folder_mode(uint64_t ino) {
+    struct fs_file entry;
+
+    return ino > 1 && ino < PROC_INO && fs_file(ino - 2, &entry) == 0 &&
+           (entry.start & FS_MODE) != 0 ? entry.start & 07777 : 0755;
+}
+
 static void fill_stat(struct stat *out, uint64_t size, bool folder, uint32_t start) {
     memset(out, 0, sizeof *out);
     out->dev = 1;
     out->ino = start != 0 ? start : 1;
     out->nlink = 1;
-    out->mode = (folder ? S_IFDIR | 0755 : S_IFREG | 0644);
+    out->mode = (folder ? S_IFDIR | folder_mode(out->ino) : S_IFREG | 0644);
     out->size = size;
     out->blksize = SECTOR_SIZE;
     out->blocks = (int64_t)((size + 511) / 512);
@@ -2552,7 +3026,9 @@ static uint64_t stat_of_handle(uint64_t fd, struct stat *st) {
     fill_stat(st, h->size, h->start == FOLDER_MARK || h->start == PROCDIR_MARK,
               h->start == FOLDER_MARK ? folder_ino(h->folder) :
               h->start == PROC_MARK ? PROC_INO + h->folder :
-              h->start == PROCDIR_MARK ? PROC_INO : h->start);
+              h->start == PROCDIR_MARK ? PROC_INO :
+              h->start == WRITE_MARK ? file_ino(writer_names[h->writer - 1], true) :
+              h->start < FIRST_MARK && h->folder != 0 ? folder_ino(h->folder) : h->start);
     if (h->start == CONSOLE_MARK) {
         /* Not a file at all: a program told this is a regular file reads it
            as one, all at once and to its end. */
@@ -2563,7 +3039,8 @@ static uint64_t stat_of_handle(uint64_t fd, struct stat *st) {
     } else if (h->start == PIPE_MARK) {
         struct pipe *p = pipe_of(h);
 
-        st->mode = h->size == PIPE_FILE ? S_IFREG | 0444 : S_IFIFO | 0600;
+        st->mode = h->size == PIPE_FILE ? S_IFREG | 0444 :
+                   h->size == PIPE_PAIR ? S_IFSOCK | 0777 : S_IFIFO | 0600;
         st->size = p == NULL ? 0 : pipe_left(p);
         st->blocks = 0;
     } else if (h->start == SOCK_MARK) {
@@ -2660,7 +3137,7 @@ static uint64_t sys_statx(uint64_t dirfd, uint64_t path, uint64_t flags) {
         out->blksize = SECTOR_SIZE;
         out->nlink = 1;
         out->mode = S_IFLNK | 0777;
-        out->ino = file.start;
+        out->ino = file_ino(name, false);
         out->size = file.size & ~FS_LINK;
         out->blocks = 1;
         out->dev_minor = 1;
@@ -2684,8 +3161,9 @@ static uint64_t sys_statx(uint64_t dirfd, uint64_t path, uint64_t flags) {
     out->mask = STATX_BASIC;
     out->blksize = SECTOR_SIZE;
     out->nlink = 1;
-    out->mode = (uint16_t)(folder ? S_IFDIR | 0755 : S_IFREG | 0644);
-    out->ino = file.start != 0 ? file.start : 1;
+    out->mode = (uint16_t)(folder ? S_IFDIR | folder_mode(file.start) :
+                           is_fifo(&file) ? file.start : S_IFREG | 0644);
+    out->ino = folder ? file.start : file_ino(name, true);
     out->size = folder ? 0 : file.size;
     out->blocks = (file.size + 511) / 512;
     out->dev_minor = 1;
@@ -2733,14 +3211,17 @@ static uint64_t sys_newfstatat(uint64_t dirfd, uint64_t path, uint64_t out) {
     }
     if ((arg[3] & AT_SYMLINK_NOFOLLOW) != 0 && fs_lstat(name, &file) == 0 &&
         (file.size & FS_LINK) != 0) {
-        fill_stat((struct stat *)out, file.size & ~FS_LINK, false, file.start);
+        fill_stat((struct stat *)out, file.size & ~FS_LINK, false, file_ino(name, false));
         ((struct stat *)out)->mode = S_IFLNK | 0777;
         return 0;
     }
     int err = fs_stat(name, &file);
 
     if (err == 0 && !is_folder_entry(&file)) {
-        fill_stat((struct stat *)out, file.size, false, file.start);
+        fill_stat((struct stat *)out, file.size, false, file_ino(name, true));
+        if (is_fifo(&file)) {
+            ((struct stat *)out)->mode = file.start & 0177777;
+        }
         return 0;
     }
     if (err == FS_ELOOP) {
@@ -2804,7 +3285,7 @@ struct dirent64 {
     char     name[];
 };
 
-/* /proc, which holds one entry per built-in command and nothing else. */
+/* /ctl, which holds one entry per built-in command and nothing else. */
 static uint64_t proc_dents(struct handle *h, uint64_t buf, uint64_t count) {
     uint64_t used = 0;
 
@@ -2885,7 +3366,7 @@ static uint64_t sys_getdents64(uint64_t fd, uint64_t buf, uint64_t count) {
             break;                  /* the rest waits for the next call */
         }
         struct dirent64 *out = (struct dirent64 *)(buf + used);
-        out->ino = is_folder ? folder_ino((unsigned)index + 1) : entry.start;
+        out->ino = folder_ino((unsigned)index + 1);    /* a file's as a folder's */
         out->off = (int64_t)next;
         out->reclen = (uint16_t)reclen;
         out->type = is_folder ? DT_DIR : (entry.size & FS_LINK) != 0 ? DT_LNK : DT_REG;
@@ -3016,7 +3497,7 @@ static uint64_t sys_gettimeofday(uint64_t tv, uint64_t tz, uint64_t c) {
 static void sleep_until(uint64_t until_ms) {
     uint64_t began = wait_began();
 
-    while (efi_uptime_ms() < until_ms) {
+    while (efi_uptime_ms() < until_ms && !interrupt_check()) {
         thread_yield();
         __asm__ volatile("pause");
     }
@@ -3038,7 +3519,7 @@ static uint64_t sys_nanosleep(uint64_t req, uint64_t rem, uint64_t c) {
     if (rem != 0) {
         memset((void *)rem, 0, 16);
     }
-    return 0;
+    return deliverable() != 0 ? ERR(EINTR) : 0;    /* cut short by a signal */
 }
 
 #define TIMER_ABSTIME 1
@@ -3063,7 +3544,7 @@ static uint64_t sys_clock_nanosleep(uint64_t clock, uint64_t flags, uint64_t req
     if (rem != 0) {
         memset((void *)rem, 0, 16);
     }
-    return 0;
+    return deliverable() != 0 ? ERR(EINTR) : 0;    /* cut short by a signal */
 }
 
 static uint64_t sys_time(uint64_t out, uint64_t b, uint64_t c) {
@@ -3384,6 +3865,8 @@ static const uint16_t numbers[] = {
     SYS_SETRESUID,
     SYS_SETRESGID,
     SYS_SETGROUPS,
+    SYS_SOCKETPAIR,
+    SYS_RT_SIGRETURN,
 };
 
 static const syscall_fn handlers[] = {
@@ -3422,8 +3905,8 @@ static const syscall_fn handlers[] = {
     sys_ok,
     sys_clock_nanosleep,
     sys_ok,
-    sys_ok,
-    sys_ok,
+    sys_kill,
+    sys_tgkill,
     sys_gettid,
     sys_getcwd,
     sys_arch_prctl,
@@ -3453,8 +3936,8 @@ static const syscall_fn handlers[] = {
     sys_root,
     sys_root,
     sys_root,
-    sys_ok,
-    sys_ok,
+    sys_rt_sigaction,
+    sys_rt_sigprocmask,
     sys_nanosleep,
     sys_exit,
     sys_exit_group,
@@ -3506,7 +3989,7 @@ static const syscall_fn handlers[] = {
     sys_symlinkat,
     sys_no_links,
     sys_symlink,
-    sys_no_links,
+    sys_mknodat,
     sys_truncate,
     sys_readv,
     sys_pwrite64,
@@ -3534,6 +4017,8 @@ static const syscall_fn handlers[] = {
     sys_ok,
     sys_ok,
     sys_ok,
+    sys_socketpair,
+    sys_rt_sigreturn,
 };
 
 #define SYSCALLS (sizeof numbers / sizeof numbers[0])
@@ -3558,6 +4043,9 @@ void syscall_init(void) {
 
 /* The handler for a number, or NULL. */
 static syscall_fn handler_for(uint64_t number) {
+    if (number >= SYS_SETXATTR && number <= SYS_FREMOVEXATTR) {
+        return sys_no_xattr;        /* all twelve of them, one answer */
+    }
     if (number < LOW_NUMBERS) {
         return low[number] != 0 ? handlers[low[number] - 1] : NULL;
     }
@@ -3568,6 +4056,8 @@ static syscall_fn handler_for(uint64_t number) {
     }
     return NULL;
 }
+
+static unsigned calls;              /* syscalls made, for the look at Ctrl-C */
 
 /* Called by syscall_entry. Every call is recorded on the way through,
    including the numbers this kernel has no handler for. */
@@ -3583,6 +4073,11 @@ uint64_t syscall_dispatch(uint64_t a, uint64_t b, uint64_t c,
     arg[5] = f;
 
     syscall_fn handler = handler_for(number);
+    struct handle *h = number == SYS_SENDTO || number == SYS_RECVFROM ? handle_of(a) : NULL;
+
+    if (h != NULL && h->start == PIPE_MARK && h->size == PIPE_PAIR) {
+        handler = number == SYS_SENDTO ? sys_write : sys_read;     /* a socketpair */
+    }
 
     if (handler == NULL && net != NULL) {
         handler = net->syscall(number);     /* the socket calls are the module's */
@@ -3591,8 +4086,22 @@ uint64_t syscall_dispatch(uint64_t a, uint64_t b, uint64_t c,
     if (handler != NULL) {
         struct kernel_mark mark = kernel_began();
 
+        struct user_regs *frame = user_frame;
+
         result = handler(a, b, c);
+        held_run(false);
         kernel_ended(mark);
+        user_frame = frame;         /* a fork's child left its own there */
+    }
+
+    /* A program that never waits is asked every so often whether Ctrl-C
+       was typed - nothing else would ask - and a SIGINT it handles goes to
+       its handler here, on the way out. */
+    if ((++calls & 63) == 0) {
+        interrupt_check();
+    }
+    if (deliverable() != 0 && number != SYS_RT_SIGRETURN && program_running()) {
+        result = signal_deliver(result);
     }
 
     /* SYS_EXIT does not come back, and neither does a program killed
@@ -4098,6 +4607,9 @@ int program_run(uint64_t entry, unsigned argc, const char *const *argv,
     if (fresh) {
         handles_reset();
         console_reset();
+        memset(on_signal, 0, sizeof on_signal);
+        pending = 0;
+        blocked = 0;
         now_running = (struct times){ .started = efi_uptime_us() };
     }
 
@@ -4118,6 +4630,7 @@ int program_run(uint64_t entry, unsigned argc, const char *const *argv,
     int code = user_enter(entry, rsp);
     thread_leave();
     entered--;
+    held_drop();
 
     /* Its name goes back to whatever started it, but what it did stays in
        the ring to be written out when the machine is next idle: a program
@@ -4191,10 +4704,16 @@ struct saved {
     uint64_t  brk, map;
     uint64_t  fs_base;      /* where its libc keeps its thread's own data */
     struct times times;     /* its time, while a child runs */
+    struct sig_action on_signal[3];     /* what it does with the signals sent */
+    unsigned  pending;
+    uint64_t  sigmask;      /* the forking thread's blocked signals */
     struct mapping maps[MAPPINGS];  /* what its mmaps still owe it */
 };
 
 static unsigned nest;               /* how deep we are in that */
+static unsigned forked_at = ~0u;    /* programs running at the latest fork:
+                                       while it is still entered, a child
+                                       that has not started one of its own */
 
 static uint64_t sys_pipe2(uint64_t out, uint64_t flags, uint64_t c) {
     uint32_t *fds = (uint32_t *)out;
@@ -4202,7 +4721,6 @@ static uint64_t sys_pipe2(uint64_t out, uint64_t flags, uint64_t c) {
     uint64_t read_fd, write_fd;
     void *data = NULL;
 
-    (void)flags;
     (void)c;
     if (!user_range(out, 8)) {
         return ERR(EFAULT);
@@ -4210,9 +4728,10 @@ static uint64_t sys_pipe2(uint64_t out, uint64_t flags, uint64_t c) {
     if ((slot = pipe_slot()) == PIPES || (data = mem_alloc(PIPE_FIRST)) == NULL) {
         return ERR(ENFILE);
     }
-    pipes[slot] = (struct pipe){ .data = data, .size = PIPE_FIRST, .refs = 2 };
+    pipes[slot] = (struct pipe){ .data = data, .size = PIPE_FIRST, .refs = 2, .count = 1 };
 
-    struct handle h = { .start = PIPE_MARK, .folder = slot + 1 };
+    struct handle h = { .start = PIPE_MARK, .folder = slot + 1,
+                        .offset = (uint32_t)flags & O_NONBLOCK };
 
     read_fd = give_handle(h);
     h.size = 1;                     /* the writing end */
@@ -4257,6 +4776,61 @@ static uint64_t sys_eventfd(uint64_t count, uint64_t b, uint64_t c) {
     return sys_eventfd2(count, 0, c);
 }
 
+/* Two connected AF_UNIX stream sockets, each end a pipe to read and the
+   other's to write - what a program wakes its own poll with from a
+   thread, curl's resolver among them. send and recv on one are write and
+   read (syscall_dispatch). */
+#define AF_UNIX     1
+#define SOCK_STREAM 1
+#define SOCK_TYPE   0xF
+
+static uint64_t sys_socketpair(uint64_t domain, uint64_t type, uint64_t c) {
+    uint32_t *fds = (uint32_t *)arg[3];
+    unsigned slot[2];
+    uint64_t fd[2];
+
+    (void)c;
+    if (domain != AF_UNIX) {
+        return ERR(EAFNOSUPPORT);
+    }
+    if ((type & SOCK_TYPE) != SOCK_STREAM) {
+        return ERR(EOPNOTSUPP);
+    }
+    if (!user_range(arg[3], 8)) {
+        return ERR(EFAULT);
+    }
+    for (int i = 0; i < 2; i++) {
+        void *data = (slot[i] = pipe_slot()) < PIPES ? mem_alloc(PIPE_FIRST) : NULL;
+
+        if (data == NULL) {
+            if (i == 1) {
+                pipe_drop(&pipes[slot[0]]);
+            }
+            return ERR(ENFILE);
+        }
+        pipes[slot[i]] = (struct pipe){ .data = data, .size = PIPE_FIRST, .refs = 2, .count = 1 };
+    }
+    for (int i = 0; i < 2; i++) {
+        fd[i] = give_handle((struct handle){ .start = PIPE_MARK, .folder = slot[i] + 1,
+                                             .size = PIPE_PAIR,
+                                             .offset = (slot[1 - i] + 1) << 16 |
+                                                       ((uint32_t)type & O_NONBLOCK) });
+    }
+    if ((int64_t)fd[0] < 0 || (int64_t)fd[1] < 0) {
+        for (int i = 0; i < 2; i++) {
+            if ((int64_t)fd[i] >= 0) {
+                handles[fd[i]].used = 0;
+            }
+            mem_free(pipes[slot[i]].data);
+            pipes[slot[i]] = (struct pipe){ 0 };
+        }
+        return ERR(EMFILE);
+    }
+    fds[0] = (uint32_t)fd[0];
+    fds[1] = (uint32_t)fd[1];
+    return 0;
+}
+
 /* ---- what a child leaves behind ----------------------------------------- */
 
 #define CHILDREN 8
@@ -4283,7 +4857,14 @@ static void child_done(int pid, int code, uint64_t user, uint64_t sys) {
 }
 
 static uint64_t sys_wait4(uint64_t pid, uint64_t status, uint64_t options) {
-    (void)options;
+    uint64_t usage_at = arg[3];     /* a held child run here makes calls of its own */
+
+    /* A held child is run by its parent waiting for it - or, with WNOHANG,
+       only if its input is all there, and otherwise it is still running. */
+    held_run((options & 1) == 0);
+    if ((options & 1) != 0 && held_waiting((int)pid)) {
+        return 0;
+    }
     for (unsigned i = 0; i < CHILDREN; i++) {
         struct child *ch = &children[i];
 
@@ -4294,10 +4875,10 @@ static uint64_t sys_wait4(uint64_t pid, uint64_t status, uint64_t options) {
             continue;
         }
         ch->waited = true;
-        if (arg[3] != 0) {          /* its rusage: the times, nothing else */
-            int64_t *usage = (int64_t *)arg[3];
+        if (usage_at != 0) {        /* its rusage: the times, nothing else */
+            int64_t *usage = (int64_t *)usage_at;
 
-            if (!user_range(arg[3], 144)) {
+            if (!user_range(usage_at, 144)) {
                 return ERR(EFAULT);
             }
             memset(usage, 0, 144);
@@ -4340,6 +4921,10 @@ static struct saved *context_save(void) {
     s->fs_base = rdmsr(MSR_FS_BASE);
     s->times = now_running;
     now_running = (struct times){ .started = efi_uptime_us() };  /* the child's */
+    memcpy(s->on_signal, on_signal, sizeof on_signal);  /* which a fork's child inherits */
+    s->pending = pending;
+    s->sigmask = blocked;
+    pending = 0;
     memcpy(s->maps, mappings, sizeof mappings);
     pipes_hold(1);                  /* it still holds its ends of them */
     return s;
@@ -4354,6 +4939,9 @@ static void context_restore(struct saved *s) {
     program_break = s->brk;
     program_map = s->map;
     wrmsr(MSR_FS_BASE, s->fs_base);
+    memcpy(on_signal, s->on_signal, sizeof on_signal);
+    pending = s->pending;
+    blocked = s->sigmask;
     /* All the child ran, its own children included, is the parent's
        children's; what of it was CPU time is their CPU time. */
     struct times child = now_running;
@@ -4374,6 +4962,7 @@ extern struct user_regs *user_frame;
 extern int user_resume(const struct user_regs *regs, uint64_t rax);
 
 static uint64_t fork_on(uint64_t stack);
+static bool held_keep(int pid);
 
 static uint64_t sys_fork(uint64_t a, uint64_t b, uint64_t c) {
     (void)a;
@@ -4425,9 +5014,13 @@ static uint64_t fork_on(uint64_t stack) {
     }
     pid = ++last_pid;
     nest++;
+    unsigned was_forked = forked_at;
+
+    forked_at = entered;
     thread_enter();
     code = user_resume(child, 0);   /* the child, from this very syscall */
     thread_leave();
+    forked_at = was_forked;
     nest--;
     mem_free(child);
 
@@ -4436,7 +5029,17 @@ static uint64_t fork_on(uint64_t stack) {
     vm_unwind(was_level);
     vm_undo_end(true);
     context_restore(state);
+    if (held_keep(pid)) {
+        return (uint64_t)pid;       /* it runs later: held_run */
+    }
     child_done(pid, code, now_running.children_user - user0, now_running.children_sys - sys0);
+    if (handled(SIGCHLD)) {
+        /* The child is over by the time the parent hears it was born, so
+           its SIGCHLD comes with this answer. */
+        pending |= 1u << SIGCHLD;
+        child_pid = (uint64_t)pid;
+        child_code = (uint64_t)code;
+    }
     return (uint64_t)pid;
 }
 
@@ -4514,10 +5117,10 @@ static uint64_t sys_rt_sigtimedwait(uint64_t set, uint64_t info, uint64_t timeou
     }
     uint64_t until = timeout != 0 ? efi_uptime_ms() + timespec_ms(timeout) : 0;
 
-    while (until == 0 || efi_uptime_ms() < until) {
+    while ((until == 0 || efi_uptime_ms() < until) && !interrupt_check()) {
         thread_yield();
     }
-    return ERR(EAGAIN);
+    return ERR(deliverable() != 0 ? EINTR : EAGAIN);
 }
 /* ---- timers ---------------------------------------------------------------
  *
@@ -4711,6 +5314,193 @@ int program_start(const char *path, unsigned argc, const char *const *argv,
     return err;
 }
 
+/* ---- a child held back --------------------------------------------------
+ *
+ * A child runs to its end inside the fork, which is too soon for one whose
+ * input its parent has still to write: fish runs `echo hi | cat` as cat
+ * first and echo's output into the pipe after. So a child whose execve finds
+ * its standard input an empty pipe that something still writes to is held
+ * instead - the program it asked for and the files it has, none of its
+ * memory - and run once nothing writes to that pipe any more, or its parent
+ * waits for it, or reads a pipe it would fill. */
+#define HELD 4
+
+struct held_child {
+    struct exec_args *args;
+    unsigned argc, envc;
+    int      pid;
+    unsigned owner;                 /* `entered` of its parent */
+    struct handle handles[PROGRAM_FILES];
+    char     writers[WRITERS][FS_NAME_LEN];
+    char     cwd[FS_NAME_LEN + 1];
+    struct sig_action on_signal[3];
+    uint64_t sigmask;
+};
+
+static struct held_child *held[HELD];
+static struct held_child *holding;  /* execve's, until its fork files it */
+
+/* Whether nothing writes to its input any more. */
+static bool held_ready(const struct held_child *c) {
+    const struct pipe *p = pipe_of(&c->handles[0]);
+
+    return p == NULL || p->count == 0;
+}
+
+/* In execve, in a fork's child: holds it if its input is not there yet. The
+   files go with it, so the child ending lets go of none of them. */
+static bool held_take(struct exec_args *args, unsigned argc, unsigned envc) {
+    const struct handle *in = &handles[0];
+    const struct pipe *p = in->used != 0 && in->size == PIPE_READ ? pipe_of(in) : NULL;
+    struct held_child *c;
+    unsigned free = 0;
+
+    while (free < HELD && held[free] != NULL) {
+        free++;
+    }
+    if (p == NULL || p->len != p->read_at || p->count == 0 || nest == 0 ||
+        forked_at != entered || free == HELD || (c = mem_alloc(sizeof *c)) == NULL) {
+        return false;
+    }
+    *c = (struct held_child){ .args = args, .argc = argc, .envc = envc,
+                              .sigmask = blocked };
+    memcpy(c->handles, handles, sizeof handles);
+    memcpy(c->writers, writer_names, sizeof writer_names);
+    c->cwd[0] = '/';
+    strcpy(c->cwd + 1, fs_cwd());
+    for (unsigned i = 0; i < 3; i++) {   /* as execve leaves them */
+        c->on_signal[i] = on_signal[i].handler == SIG_IGN ? on_signal[i] : (struct sig_action){ 0 };
+    }
+    memset(handles, 0, sizeof handles);
+    holding = c;
+    return true;
+}
+
+/* In fork_on, once the child is over: files the one it held, if it did. */
+static bool held_keep(int pid) {
+    unsigned free = 0;
+
+    if (holding == NULL) {
+        return false;
+    }
+    while (held[free] != NULL) {    /* held_take found one */
+        free++;
+    }
+    holding->pid = pid;
+    holding->owner = entered;
+    held[free] = holding;
+    holding = NULL;
+    return true;
+}
+
+static void held_free(struct held_child *c) {
+    for (unsigned fd = 0; fd < PROGRAM_FILES; fd++) {
+        const struct handle *h = &c->handles[fd];
+
+        if (h->used != 0 && h->start == PIPE_MARK) {
+            pipe_release(h);
+        } else if (h->used != 0 && h->start == SOCK_MARK && net != NULL) {
+            net->drop((int)h->folder);
+        }
+    }
+    mem_free(c->args);
+    mem_free(c);
+}
+
+/* What the program that has just ended was still holding goes with it. */
+static void held_drop(void) {
+    for (unsigned i = 0; i < HELD; i++) {
+        if (held[i] != NULL && held[i]->owner > entered) {
+            held_free(held[i]);
+            held[i] = NULL;
+        }
+    }
+}
+
+/* Runs it, as its fork would have: in the parent's place, and undone. */
+static void held_start(struct held_child *c) {
+    uint64_t user0 = now_running.children_user, sys0 = now_running.children_sys;
+    unsigned was_level = vm_level();
+    struct saved *state;
+    struct fs_file file;
+    uint64_t entry;
+    int code = 127;
+
+    if (nest >= NEST_DEPTH || thread_stack_left(&state) < STACK_MARGIN ||
+        (state = context_save()) == NULL) {
+        child_done(c->pid, code, 0, 0);
+        held_free(c);
+        return;
+    }
+    pipes_hold(-1);                 /* the parent's files are not the child's */
+    memcpy(handles, c->handles, sizeof handles);
+    memcpy(writer_names, c->writers, sizeof writer_names);
+    fs_chdir(c->cwd);
+    memcpy(on_signal, c->on_signal, sizeof on_signal);
+    blocked = c->sigmask;
+    if (vm_undo_begin()) {
+        nest++;
+        if (fs_stat(c->args->name, &file) == 0 && vm_push()) {
+            if (program_load(&file, &entry) == 0) {
+                code = program_run(entry, c->argc, c->args->words, c->envc, c->args->env, false);
+            }
+            vm_pop();
+        }
+        nest--;
+        vm_unwind(was_level);
+        vm_undo_end(true);
+    }
+    context_restore(state);         /* lets go of the files it had */
+    child_done(c->pid, code, now_running.children_user - user0, now_running.children_sys - sys0);
+    if (handled(SIGCHLD)) {
+        pending |= 1u << SIGCHLD;
+        child_pid = (uint64_t)c->pid;
+        child_code = (uint64_t)code;
+    }
+    mem_free(c->args);
+    mem_free(c);
+}
+
+/* Runs the running program's held children whose input is all there - or
+   every one, oldest first; true if any ran. */
+static bool held_run(bool all) {
+    bool ran = false;
+
+    if (forked_at == entered) {
+        return false;               /* a child, still between fork and execve */
+    }
+    for (;;) {
+        unsigned next = HELD;
+
+        for (unsigned i = 0; i < HELD; i++) {
+            struct held_child *c = held[i];
+
+            if (c != NULL && c->owner == entered && (all || held_ready(c)) &&
+                (next == HELD || c->pid < held[next]->pid)) {
+                next = i;
+            }
+        }
+        if (next == HELD) {
+            return ran;
+        }
+        struct held_child *c = held[next];
+
+        held[next] = NULL;
+        held_start(c);
+        ran = true;
+    }
+}
+
+/* Whether one it would wait for is still held. */
+static bool held_waiting(int pid) {
+    for (unsigned i = 0; i < HELD; i++) {
+        if (held[i] != NULL && held[i]->owner == entered && (pid <= 0 || held[i]->pid == pid)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static uint64_t sys_execve(uint64_t path, uint64_t argv, uint64_t envp) {
     const char *given = user_string(path);
     const struct proc_cmd *cmd;
@@ -4790,6 +5580,9 @@ static uint64_t sys_execve(uint64_t path, uint64_t argv, uint64_t envp) {
             return ERR(ENOENT);
         }
     }
+    if (held_take(held, argc, envc)) {
+        process_exit(0);            /* for now: held_run */
+    }
     /* A region of its own, so that whoever forked this child keeps theirs. */
     if (!vm_push()) {
         mem_free(held);
@@ -4799,6 +5592,13 @@ static uint64_t sys_execve(uint64_t path, uint64_t argv, uint64_t envp) {
     if (code == 0) {
         /* Its files are what the fork left it - a shell sets those up between
            the fork and here, and that is what a redirection is. */
+        /* What the old image caught, the new one cannot: back to the
+           default - an ignored signal stays ignored, as Linux keeps it. */
+        for (unsigned i = 0; i < 3; i++) {
+            if (on_signal[i].handler != SIG_IGN) {
+                on_signal[i] = (struct sig_action){ 0 };
+            }
+        }
         code = program_run(entry, argc, held->words, envc, held->env, false);
     } else {
         dbg("exec: %s could not be loaded (%d)\n", held->name, (uint64_t)code);

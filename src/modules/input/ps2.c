@@ -178,6 +178,7 @@ static bool ps2_init(void) {
 #define SC_RSHIFT   0x36
 #define SC_CTRL     0x1D        /* the right one is the same, behind E0 */
 #define SC_CAPS     0x3A
+#define SC_ALT      0x38
 
 /* Scancode set 1, up to the space bar. Anything at 0 has no character. */
 static const char unshifted[0x3A] = {
@@ -214,7 +215,7 @@ static const char shifted[0x3A] = {
 
 static char    keys[KEYS];
 static uint8_t key_head, key_tail;
-static bool    shift, ctrl, caps, extended;
+static bool    shift, ctrl, alt, caps, extended;
 
 static void key_push(char c) {
     if (c != 0 && (uint8_t)(key_tail - key_head) < KEYS) {
@@ -241,6 +242,17 @@ static const char *grey_key(uint8_t code) {
     }
 }
 
+/* F1 to F12, as the Linux console sends them - what TERM=linux says. */
+static const char *function_key(uint8_t code) {
+    static const char *const keys[] = {
+        "\033[[A", "\033[[B", "\033[[C", "\033[[D", "\033[[E",
+        "\033[17~", "\033[18~", "\033[19~", "\033[20~", "\033[21~",
+    };
+
+    return code >= 0x3B && code <= 0x44 ? keys[code - 0x3B]
+         : code == 0x57 ? "\033[23~" : code == 0x58 ? "\033[24~" : NULL;
+}
+
 static void key_byte(uint8_t code) {
     uint8_t key = code & ~SC_RELEASE;
     bool was_extended = extended;
@@ -260,6 +272,10 @@ static void key_byte(uint8_t code) {
         ctrl = (code & SC_RELEASE) == 0;
         return;
     }
+    if (key == SC_ALT) {            /* left Alt, or right with E0 before it */
+        alt = (code & SC_RELEASE) == 0;
+        return;
+    }
     if (code & SC_RELEASE) {
         return;
     }
@@ -267,15 +283,15 @@ static void key_byte(uint8_t code) {
         caps = !caps;
         return;
     }
-    if (was_extended) {
-        const char *text = grey_key(code);
+    const char *text = was_extended ? grey_key(code) : function_key(code);
 
-        if (text != NULL) {
-            while (*text != '\0') {
-                key_push(*text++);
-            }
-            return;
+    if (text != NULL) {
+        while (*text != '\0') {
+            key_push(*text++);
         }
+        return;
+    }
+    if (was_extended) {
         /* Of the rest, only the keypad's Enter and slash type anything. */
         c = code == 0x1C ? '\n' : code == 0x35 ? '/' : 0;
     } else if (code < sizeof unshifted) {
@@ -289,6 +305,9 @@ static void key_byte(uint8_t code) {
            is 4, which ends a program's input, and a shell of its own knows
            what to do with the rest. Letters come out the same either case. */
         c = (char)(c >= 'a' ? c - 'a' + 1 : c - '@');
+    }
+    if (alt && c != 0) {
+        key_push('\033');           /* Alt is Escape first, as Linux sends it */
     }
     key_push(c);
 }

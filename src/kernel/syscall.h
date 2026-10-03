@@ -107,6 +107,7 @@ enum {
     SYS_ACCESS     = 21,    /* (path, mode): whether a file is there */
     SYS_RT_SIGACTION   = 13,
     SYS_RT_SIGPROCMASK = 14,
+    SYS_RT_SIGRETURN   = 15,    /* back from a signal handler */
     SYS_NANOSLEEP  = 35,
     SYS_DUP        = 32,
     SYS_DUP2       = 33,
@@ -213,6 +214,9 @@ enum {
 
     /* IPv4 sockets: TCP, UDP and ICMP echo, once the network module is in. */
     SYS_SOCKET     = 41,    /* (domain, type, protocol) */
+    SYS_SOCKETPAIR = 53,    /* (AF_UNIX, SOCK_STREAM, 0, int fds[2]): the kernel's own */
+    SYS_SETXATTR   = 188,   /* extended attributes, 188 to 199: there are none */
+    SYS_FREMOVEXATTR = 199,
     SYS_CONNECT    = 42,
     SYS_SENDTO     = 44,
     SYS_RECVFROM   = 45,
@@ -294,7 +298,7 @@ struct handle *handle_of(uint64_t fd);
 uint64_t give_handle(struct handle h);
 bool     user_range(uint64_t addr, uint64_t size);
 uint64_t *syscall_args(void);
-void     interrupt_check(void);
+bool     interrupt_check(void);   /* true: a signal is to be handled - end the wait with EINTR */
 uint64_t wait_began(void);
 void     wait_ended(uint64_t began);
 

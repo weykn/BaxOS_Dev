@@ -73,6 +73,15 @@ MCFLAGS  := $(filter-out -flto -fpie,$(CFLAGS)) -fPIC -fvisibility=hidden -fno-p
 MLDFLAGS := -shared -nostdlib -s \
             -Wl,--hash-style=sysv,-z,noseparate-code,--gc-sections,--build-id=none \
             -Wl,-z,max-page-size=16,-z,common-page-size=16,-z,norelro
+# The package manager, src/tuxpac, is /usr/bin/tuxpac on the disk: a
+# program like any other, but built here with the kernel - a static PIE,
+# freestanding and alone, there being no libc on the disk to link against.
+TUXPAC   := $(BUILD)/tuxpac
+PCFLAGS  := -std=gnu11 -Oz -Wall -Wextra -ffreestanding -fno-builtin -nostdlib -static-pie \
+            -fpie -fno-stack-protector -fno-asynchronous-unwind-tables \
+            -ffunction-sections -fdata-sections -fcf-protection=none -Wa,-mx86-used-note=no \
+            -Wl,--gc-sections,--build-id=none,-z,noexecstack,-z,noseparate-code,-z,norelro -s
+
 KASMS := $(shell find src/kernel -name '*.asm' ! -name start.asm)
 KOBJS := $(KSRCS:src/%.c=$(BUILD)/%.o) $(KASMS:src/%.asm=$(BUILD)/%.o)
 
@@ -139,6 +148,10 @@ mod_objs = $(patsubst src/%.c,$(BUILD)/%.o,$(wildcard src/modules/$(1).c src/mod
 $(BUILD)/modules/%.kmod: $$(call mod_objs,$$*)
 	$(CC) $(MLDFLAGS) $^ -o $@
 
+$(TUXPAC): $(wildcard src/tuxpac/*.c src/tuxpac/*.h) Makefile
+	@mkdir -p $(@D)
+	$(CC) $(PCFLAGS) $(filter %.c,$^) -o $@
+
 $(KERNEL_ELF): $(START_OBJ) $(KOBJS) src/kernel/kernel.ld
 	$(CC) $(CFLAGS) $(LDFLAGS) $(START_OBJ) $(KOBJS) -o $@
 
@@ -164,9 +177,10 @@ $(MKFS): tools/mkfs.c src/kernel/fs.c src/kernel/fs.h src/kernel/ata.h
 
 # The filesystem partition is updated in place rather than recreated, so files
 # saved from inside Tuxlet OS survive a rebuild. `make clean` wipes them.
-$(FS_IMG): $(KERNEL_BIN) $(MKFS) $(DISK_FILES) $(MODULES) $(SIZE_FILE)
+$(FS_IMG): $(KERNEL_BIN) $(MKFS) $(DISK_FILES) $(MODULES) $(TUXPAC) $(SIZE_FILE)
 	$(MKFS) $@ $(shell numfmt --from=iec $(FREE)) $(DISK_ROOT) $(KERNEL_BIN) $(DISK_FILES) \
-	    $(foreach m,$(MODULES),usr/lib/$(m:$(BUILD)/%=%)=$(m))
+	    $(foreach m,$(MODULES),usr/lib/$(m:$(BUILD)/%=%)=$(m)) \
+	    usr/bin/tuxpac=$(TUXPAC)
 
 # Laid end to end, with nothing between: the GPT (sectors 0-33), the EFI
 # system partition sized to the loader - plus 64 sectors for FAT12's own

@@ -32,6 +32,9 @@
 #define FS_LINKS     40     /* links followed in one path, as Linux allows */
 #define FS_LINK_LEN  128    /* a link's target, including the NUL */
 #define FS_LINK      0x80000000u    /* in an entry's size: it is a link */
+#define FS_MODE      0x80000000u    /* in the start of a folder, or of an
+                                       empty file, which have no sectors to
+                                       start at: their mode is the low bits */
 
 enum {
     FS_EIO       = -1,      /* the disk reported an error */
@@ -111,6 +114,11 @@ int fs_remove(const char *path);
 /* Creates a folder. Returns 0 or an FS_E* code. */
 int fs_mkdir(const char *path);
 
+/* Sets the mode of a folder or an empty file - Linux's, the type bits in
+   it too, which is what makes a file a FIFO. A folder is 0755 until this is
+   called. */
+int fs_set_mode(const char *path, unsigned mode);
+
 /* Moves to a folder. "" and "/" are the root, ".." is one level up. */
 int fs_chdir(const char *path);
 
@@ -144,7 +152,12 @@ const char *fs_error(int err);
    "." and any relative path, like everything else here. */
 int fs_folder_at(const char *path, unsigned *index);
 
-/* Renames a file, which is how one is moved: the sectors stay put. Returns 0
+/* The table entry of whatever is at path, one-based, following a link at
+   its end if follow says to. Returns 0 or an FS_E* code. */
+int fs_entry(const char *path, bool follow, unsigned *index);
+
+/* Renames a file, which is how one is moved: the sectors stay put, and a
+   file already at to is replaced, as rename(2) replaces one. Returns 0
    or an FS_E* code; folders cannot be renamed. */
 int fs_rename(const char *from, const char *to);
 

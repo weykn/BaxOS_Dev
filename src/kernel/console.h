@@ -22,15 +22,22 @@
 void console_reset(void);
 
 /* Reads up to count bytes of what is typed, as the settings say to: a line
-   at a time when cooked, one key at a time when raw. Returns how many. */
+   at a time when cooked, one key at a time when raw. Returns how many, or
+   CONSOLE_SIGNAL if Ctrl-C or Ctrl-\\ was typed first - with ISIG on, as a
+   terminal sends a signal rather than the key. */
+#define CONSOLE_SIGNAL ((uint64_t)-1)
 uint64_t console_read(char *buf, uint64_t count);
 
 /* Whether a key is waiting. Looking takes it off the keyboard, so it is kept
    for the next read. */
 bool console_ready(void);
 
-/* Whether Ctrl-C has been typed, taking it if so. */
-bool console_interrupted(void);
+/* The signal typed - 2 for Ctrl-C (SIGINT), 3 for Ctrl-\\ (SIGQUIT) - or 0,
+   taking it. Only while ISIG is on: off, they are keys like any other -
+   except that three Ctrl-Cs nothing reads are CONSOLE_FORCE, which ends
+   the program whatever it would do with them. */
+#define CONSOLE_FORCE 9
+int console_signal(void);
 
 /* The settings, as Linux's tcgetattr and tcsetattr pass them. size is how
    much of them the program asked for or handed over. */

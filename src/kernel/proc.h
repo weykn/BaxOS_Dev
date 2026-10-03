@@ -3,16 +3,16 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-/* The kernel's own commands, as files under /proc.
+/* The kernel's own commands, as files under /ctl (for control).
  *
  * Everything the shell cannot do for itself - the screen's size, the text's
  * size, what memory and the clock say, the syscall log - is
  * kernel state, and a command that changes it has to run in the kernel. So
- * each one is a file: `mem` at the prompt and /proc/mem are the same thing, because the shell looks
- * the name up in /proc like it looks any other command up on the path, and
+ * each one is a file: `mem` at the prompt and /ctl/mem are the same thing, because the shell looks
+ * the name up in /ctl like it looks any other command up on the path, and
  * running the file runs the command.
  *
- * /proc is not on the disk. It is answered here: listing it gives the
+ * /ctl is not on the disk. It is answered here: listing it gives the
  * commands, reading one gives its usage line, and running one calls it. */
 
 struct proc_cmd {
@@ -24,11 +24,11 @@ struct proc_cmd {
 /* Command i, or NULL past the last, for listing them. */
 const struct proc_cmd *proc_at(unsigned i);
 
-/* The command a path names - "/proc/mem", or "mem" relative to /proc -
+/* The command a path names - "/ctl/mem", or "mem" relative to /ctl -
    or NULL if the path is not one of them. */
 const struct proc_cmd *proc_command(const char *path);
 
-/* Whether a path names /proc itself. */
+/* Whether a path names /ctl itself. */
 bool proc_folder(const char *path);
 
 /* What reading the file gives: its name and usage, one line. Returns how

@@ -243,16 +243,6 @@ char keyboard_poll_char(char (*idle)(void)) {
     return 0;
 }
 
-char keyboard_read_char(char (*idle)(void)) {
-    for (;;) {
-        char c = keyboard_poll_char(idle);
-
-        if (c != 0) {
-            return c;
-        }
-        __asm__ volatile("pause");
-    }
-}
 
 /* ---- the disk ----------------------------------------------------------- */
 

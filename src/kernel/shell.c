@@ -27,11 +27,11 @@
  * is the environment - /etc/tuxlet/env, which the boot script runs first,
  * exports PATH, HOME and the rest.
  *
- * The shell is in here too, as /proc/tsh: reading a line is the console's
+ * The shell is in here too, as /ctl/tsh: reading a line is the console's
  * own line editor, and running a program is what the kernel does anyway, so
  * a shell that is a program of its own costs a region, its page tables and
- * its code for nothing but a loop. Another shell - bash, say - is a program
- * on the disk like any other, which /etc/tuxlet/shell may name instead. */
+ * its pages for nothing but a loop. Another shell - bash, say - is a
+ * program on the disk like any other, which /etc/tuxlet/shell may name. */
 
 #define BOOT_DIR      "/etc/tuxlet"
 #define BOOT_CONF     BOOT_DIR "/boot"
@@ -127,34 +127,132 @@ static void env_set(const char *pair) {
  * As small as a shell can be and still be one: it reads a line, splits it
  * into words on blanks, and runs the first with the rest as its arguments -
  * whatever path it names, or the first of that name in PATH: a command of
- * the kernel's from /proc, or a program. `cd`, `export`, `exit` and `help`
- * are its own. There are no
- * pipes, redirections, variables or quoting: bash is on the disk for those. */
+ * the kernel's from /ctl, or a program. `cd`, `ls`, `cat`, `cp`, `mv`,
+ * `rm`, `mkdir`, `put`, `export`, `exit` and `help` are its own. There are
+ * no pipes, redirections, variables or quoting: bash is there to install
+ * for those. */
 
 #define TSH_LINE  256
 #define TSH_WORDS 32
+#define CP_RUN    32            /* sectors a copy moves at a time */
 
 static bool     failed;             /* a command was not there to run */
 static unsigned ran;                /* commands run, for the shell script */
 
+/* A complaint about name, in red: what went wrong with it. */
+static void tsh_fail(const char *what, const char *name, const char *why) {
+    vga_set_color(VGA_LIGHTRED, VGA_BLACK);
+    kprintf("tsh: %s%s%s: %s\n", what, *what != '\0' ? ": " : "", name, why);
+    vga_set_color(VGA_LIGHTGRAY, VGA_BLACK);
+}
+
 static void tsh_help(void) {
-    kprintf("Built-in commands:\n"
-            "\n"
-            "  cd [dir]      change directory\n"
-            "  export [N=v]  set a variable, or list them\n"
-            "  exit          exit the shell\n"
-            "  help          show this message\n"
-            "\n"
-            "Kernel commands, in /proc:\n"
-            "\n ");
+    kprintf("built-in: cd ls cat cp mv rm mkdir put export exit help\n/ctl:");
     for (unsigned i = 0; proc_at(i) != NULL; i++) {
         kprintf(" %s", proc_at(i)->name);
     }
-    kprintf("\n\n");
+    vga_putc('\n');
+}
+
+/* The names in a folder, a folder's with a slash after it. */
+static void tsh_ls(const char *path) {
+    char folder[FS_NAME_LEN];
+    struct fs_file entry;
+    size_t cursor = 0, index;
+
+    if (proc_folder(path)) {
+        for (unsigned i = 0; proc_at(i) != NULL; i++) {
+            kprintf("%s\n", proc_at(i)->name);
+        }
+        return;
+    }
+    if (fs_folder(path, folder, sizeof folder) != 0) {
+        tsh_fail("ls", path, "no such folder");
+        return;
+    }
+    while (fs_list(folder, &cursor, &entry, &index) == 0) {
+        kprintf("%s\n", fs_inside(folder, entry.name));
+    }
+}
+
+static void tsh_cat(unsigned argc, char **argv) {
+    struct fs_file file;
+
+    for (unsigned i = 1; i < argc; i++) {
+        if (fs_stat(argv[i], &file) != 0) {
+            tsh_fail("cat", argv[i], "not found");
+            continue;
+        }
+        for (uint32_t at = 0; at < file.size; at += FS_SECTOR) {
+            const char *sector = fs_sector(file.start, at / FS_SECTOR);
+            uint32_t n = file.size - at < FS_SECTOR ? file.size - at : FS_SECTOR;
+
+            for (uint32_t k = 0; sector != NULL && k < n; k++) {
+                vga_putc(sector[k]);
+            }
+        }
+    }
+}
+
+/* Where from goes when it is put at to: into to, if that is a folder. */
+static const char *tsh_dest(const char *from, const char *to, char *out) {
+    const char *base = strrchr(from, '/');
+    size_t n = strlen(to);
+
+    base = base != NULL ? base + 1 : from;
+    if (fs_folder(to, out, FS_NAME_LEN) != 0 || n + strlen(base) + 2 > FS_NAME_LEN) {
+        return to;
+    }
+    memcpy(out, to, n);
+    n -= n > 1 && to[n - 1] == '/';
+    out[n] = '/';
+    strcpy(out + n + 1, base);
+    return out;
+}
+
+/* A file's contents into another, a run of sectors at a time. */
+static void tsh_cp(const char *from, const char *to) {
+    char dest[FS_NAME_LEN];
+    struct fs_file file, there;
+    char *run;
+    int err;
+
+    if (fs_stat(from, &file) != 0) {
+        tsh_fail("cp", from, "not found");
+        return;
+    }
+    to = tsh_dest(from, to, dest);
+    if (fs_stat(to, &there) == 0 && there.start == file.start && file.size > 0) {
+        tsh_fail("cp", to, "the same file");
+        return;
+    }
+    if ((run = mem_alloc(CP_RUN * FS_SECTOR)) == NULL) {
+        tsh_fail("cp", to, "out of memory");
+        return;
+    }
+    err = fs_write(to, "", 0);
+    for (uint32_t at = 0, n; err == 0 && at < file.size; at += n) {
+        n = file.size - at < CP_RUN * FS_SECTOR ? file.size - at : CP_RUN * FS_SECTOR;
+        err = fs_read_many(file.start, at / FS_SECTOR, (n + FS_SECTOR - 1) / FS_SECTOR, run) < 0
+            ? FS_EIO : fs_write_at(to, at, run, n);
+    }
+    mem_free(run);
+    if (err != 0) {
+        tsh_fail("cp", to, fs_error(err));
+    }
+}
+
+static void tsh_mv(const char *from, const char *to) {
+    char dest[FS_NAME_LEN];
+    int err = fs_rename(from, tsh_dest(from, to, dest));
+
+    if (err != 0) {
+        tsh_fail("mv", from, fs_error(err));
+    }
 }
 
 /* Where a command is: argv[0] itself if it has a slash in it, or the first
-   folder of PATH holding it - a kernel command in /proc, or a file. */
+   folder of PATH holding it - a kernel command in /ctl, or a file. */
 static bool tsh_find(const char *name, char *out, size_t max) {
     const char *dirs = shell_env("PATH");
     struct fs_file file;
@@ -183,6 +281,31 @@ static bool tsh_find(const char *name, char *out, size_t max) {
     return false;
 }
 
+/* Words from, to the end of the line, back into one string: what a
+   command takes as its arguments, or put as its text. */
+static char *rest_of(unsigned argc, char **argv, unsigned from) {
+    for (unsigned i = from + 1; i < argc; i++) {
+        for (char *gap = argv[i - 1] + strlen(argv[i - 1]); gap < argv[i]; gap++) {
+            *gap = ' ';
+        }
+    }
+    return from < argc ? argv[from] : argv[from - 1] + strlen(argv[from - 1]);
+}
+
+/* put <file> [text]: the file holds text and a newline, or nothing. */
+static void tsh_put(unsigned argc, char **argv) {
+    char *text = rest_of(argc, argv, 2);
+    size_t n = strlen(text);
+    int err;
+
+    if (n > 0) {
+        text[n++] = '\n';          /* over the NUL: the line has room for it */
+    }
+    if ((err = fs_write(argv[1], text, n)) < 0) {
+        tsh_fail("put", argv[1], fs_error(err));
+    }
+}
+
 /* Runs one line's words: a kernel command with the rest of the line as its
    arguments, or a program. */
 static void tsh_run(unsigned argc, char **argv) {
@@ -194,15 +317,7 @@ static void tsh_run(unsigned argc, char **argv) {
         path[0] = '\0';
     }
     if ((cmd = path[0] != '\0' ? proc_command(path) : NULL) != NULL) {
-        /* The words back into one line, which is how a command takes them. */
-        char *args = argc > 1 ? argv[1] : argv[0] + strlen(argv[0]);
-
-        for (unsigned i = 2; i < argc; i++) {
-            for (char *gap = argv[i - 1] + strlen(argv[i - 1]); gap < argv[i]; gap++) {
-                *gap = ' ';
-            }
-        }
-        proc_run(cmd, args);
+        proc_run(cmd, rest_of(argc, argv, 1));
         return;
     }
     code = path[0] != '\0' ? program_start(path, argc, (const char *const *)argv,
@@ -212,11 +327,8 @@ static void tsh_run(unsigned argc, char **argv) {
     }
     if (code < 0) {
         failed = true;
-        vga_set_color(VGA_LIGHTRED, VGA_BLACK);
-        kprintf("tsh: %s: %s\n", argv[0],
-                code == FS_ENOENT ? "not found" :
-                code == PROGRAM_EINVAL ? "not a program" : fs_error(code));
-        vga_set_color(VGA_LIGHTGRAY, VGA_BLACK);
+        tsh_fail("", argv[0], code == FS_ENOENT ? "not found" :
+                              code == PROGRAM_EINVAL ? "not a program" : fs_error(code));
     }
 }
 
@@ -247,11 +359,39 @@ static bool tsh_line(char *line) {
         return false;
     } else if (strcmp(argv[0], "help") == 0) {
         tsh_help();
+    } else if (strcmp(argv[0], "ls") == 0) {
+        tsh_ls(argc > 1 ? argv[1] : "");
     } else if (strcmp(argv[0], "cd") == 0) {
         const char *home = shell_env("HOME");
 
         if (fs_chdir(argc > 1 ? argv[1] : home != NULL ? home : "/") < 0) {
-            kprintf("tsh: cd: no such folder\n");
+            tsh_fail("cd", argc > 1 ? argv[1] : "", "no such folder");
+        }
+    } else if (strcmp(argv[0], "cat") == 0) {
+        tsh_cat(argc, argv);
+    } else if (strcmp(argv[0], "cp") == 0 || strcmp(argv[0], "mv") == 0) {
+        if (argc != 3) {
+            kprintf("usage: %s <file> <to>\n", argv[0]);
+        } else if (argv[0][0] == 'c') {
+            tsh_cp(argv[1], argv[2]);
+        } else {
+            tsh_mv(argv[1], argv[2]);
+        }
+    } else if (strcmp(argv[0], "rm") == 0 || strcmp(argv[0], "mkdir") == 0) {
+        bool rm = argv[0][0] == 'r';
+
+        for (unsigned i = 1; i < argc; i++) {
+            int err = rm ? fs_remove(argv[i]) : fs_mkdir(argv[i]);
+
+            if (err != 0) {
+                tsh_fail(argv[0], argv[i], fs_error(err));
+            }
+        }
+    } else if (strcmp(argv[0], "put") == 0) {
+        if (argc < 2) {
+            kprintf("usage: put <file> [text]\n");
+        } else {
+            tsh_put(argc, argv);
         }
     } else if (strcmp(argv[0], "export") == 0) {
         for (unsigned i = 0; argc == 1 && i < env_count; i++) {
@@ -349,6 +489,11 @@ static void tsh(void) {
         }
         kprintf(" $ ");
         got = console_read(line, sizeof line - 1);
+        if (got == CONSOLE_SIGNAL) {
+            console_signal();       /* Ctrl-C: the line is dropped */
+            vga_puts("^C\n");
+            continue;
+        }
         line[got] = '\0';
         if (!tsh_line(line)) {
             return;
@@ -356,7 +501,7 @@ static void tsh(void) {
     }
 }
 
-/* /proc/tsh: the shell, until `exit` - or, given a file, that script. Only
+/* /ctl/tsh: the shell, until `exit` - or, given a file, that script. Only
    from tsh itself, or a script: run by a program, it would be starting
    programs from inside that one's execve. */
 void shell_tsh(char *args) {
@@ -389,13 +534,15 @@ __attribute__((noreturn)) void shell_run(void) {
 
     /* The shell script starts the shell, and when that ends - only `exit`
        ends one - it is started again, there being nothing else for the
-       machine to do. A script that starts nothing, or names a shell that is
-       not there, gets the one in the kernel, which always is. */
+       machine to do. Without a script, or one that starts nothing or names
+       a shell that is not there, the shell is tsh, which always is. */
     for (;;) {
         unsigned before = ran;
 
         failed = false;
-        script_run(SHELL_CONF);
+        if (fs_stat(SHELL_CONF, &file) == 0) {
+            script_run(SHELL_CONF);
+        }
         if (failed || ran == before) {
             tsh();
         }

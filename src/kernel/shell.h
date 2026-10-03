@@ -9,5 +9,5 @@ __attribute__((noreturn)) void shell_run(void);
 /* A variable of the machine's environment, as `export` set it, or NULL. */
 const char *shell_env(const char *name);
 
-/* /proc/tsh, run by a program rather than by the machine. */
+/* /ctl/tsh, run by a program rather than by the machine. */
 void shell_tsh(char *args);

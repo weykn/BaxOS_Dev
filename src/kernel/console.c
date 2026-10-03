@@ -84,50 +84,91 @@ static struct termios settings;
 
 static unsigned handed, ready;      /* a finished line not yet all read */
 
-/* A key taken off the keyboard before anything asked for it, which is what
-   answering "is there anything to read?" costs: the look cannot be undone,
-   so what it found waits here for the next read. */
-static char peeked;
+/* What has been typed and not yet read: taken off the keyboard as soon as
+   anything looks, so that a Ctrl-C is seen however much is ahead of it -
+   which, as on Linux, throws away what was ahead of it, and is never read
+   as a key itself while ISIG is on. */
+#define TYPED 32
+#define VINTR 3                     /* Ctrl-C: SIGINT */
+#define VQUIT 0x1C                  /* Ctrl-\: SIGQUIT */
 
+static char     typed[TYPED];
+static unsigned typed_n;
+static int      signalled;          /* SIGINT or SIGQUIT, typed and not yet taken */
+
+/* Ctrl-Cs typed in a row that nothing has read: three of them end the
+   program whatever it does with Ctrl-C - the way out of one that has
+   stopped reading its keys, which nothing on one console gives otherwise. */
+#define FORCE_AFTER 3
+#define FORCE_IDLE  1000            /* ms with nothing read: not merely typed fast */
+static unsigned unread_intr;
+static uint64_t last_read;
+
+static void gather(void) {
+    char c;
+
+    while ((c = keyboard_poll_char(idle)) != 0) {
+        last_key = efi_uptime_ms();
+        unread_intr = c == VINTR ? unread_intr + 1 : 0;
+        if (unread_intr >= FORCE_AFTER && efi_uptime_ms() - last_read >= FORCE_IDLE) {
+            signalled = CONSOLE_FORCE;
+            typed_n = 0;
+        } else if ((settings.lflag & ISIG) != 0 && (c == VINTR || c == VQUIT)) {
+            signalled = c == VINTR ? 2 : 3;
+            typed_n = 0;
+        } else if (typed_n < TYPED) {
+            typed[typed_n++] = c;
+        }
+    }
+}
+
+/* The next key, waiting for one - or 0 once a signal has been typed. */
 static char take_key(void) {
-    /* While other threads can run, the wait is theirs as well as the
-       keyboard's. */
-    while (peeked == 0 && !thread_alone() && !console_ready()) {
-        thread_yield();
+    gather();
+    while (typed_n == 0 && signalled == 0) {
+        /* While other threads can run, the wait is theirs as well as the
+           keyboard's. */
+        if (thread_alone()) {
+            __asm__ volatile("pause");
+        } else {
+            thread_yield();
+        }
+        gather();
     }
-
-    char c = peeked;
-
-    if (c != 0) {
-        peeked = 0;
-    } else {
-        c = keyboard_read_char(idle);
+    if (signalled != 0) {
+        return 0;
     }
-    last_key = efi_uptime_ms();
+    char c = typed[0];
+
+    memmove(typed, typed + 1, --typed_n);
+    unread_intr = 0;                /* it is reading its keys */
+    last_read = efi_uptime_ms();
     return c;
 }
 
 bool console_ready(void) {
-    if (peeked == 0) {
-        peeked = keyboard_poll_char(idle);
-        if (peeked != 0) {
-            last_key = efi_uptime_ms();
-        }
-    }
-    return peeked != 0;
+    gather();
+    return typed_n > 0 || signalled != 0;
 }
 
-bool console_interrupted(void) {
-    if ((settings.lflag & ISIG) != 0 && console_ready() && peeked == 3) {
-        peeked = 0;
-        return true;
+int console_signal(void) {
+    int sig;
+
+    gather();
+    sig = signalled;
+    signalled = 0;
+    if (sig == CONSOLE_FORCE) {
+        unread_intr = 0;
     }
-    return false;
+    return sig;
 }
 
 void console_reset(void) {
     memset(&settings, 0, sizeof settings);
-    peeked = 0;
+    typed_n = 0;
+    signalled = 0;
+    unread_intr = 0;
+    last_read = efi_uptime_ms();
     handed = ready = 0;             /* what the last one left unread goes */
     settings.iflag = ICRNL | IXON;
     settings.oflag = OPOST | ONLCR;
@@ -137,6 +178,7 @@ void console_reset(void) {
     settings.cc[VEOF] = 4;
     settings.cc[VMIN] = 1;
     vga_set_crlf(true);
+    vga_text_reset();
 }
 
 void console_get(void *out, size_t size) {
@@ -313,7 +355,7 @@ static void candidate(const char *name, size_t n, const char *typed, size_t type
     common[same] = '\0';
 }
 
-/* Every name in folder, through candidate. /proc is the kernel's commands. */
+/* Every name in folder, through candidate. /ctl is the kernel's commands. */
 static void candidates(const char *folder, const char *typed, size_t typed_n, bool list) {
     struct fs_file entry;
     size_t cursor = 0, index;
@@ -452,9 +494,10 @@ static char escape_key(char *other) {
     return c;
 }
 
-/* Edits a line until Enter, which is then what the reads hand out. False if
-   Ctrl-D came with nothing typed: the end of the input. */
-static bool edit_line(void) {
+/* Edits a line until Enter, which is then what the reads hand out: 1, or 0
+   if Ctrl-D came with nothing typed - the end of the input - or -1 if a
+   signal was typed instead. */
+static int edit_line(void) {
     unsigned back = 0;              /* how far into the history, 0 for the new line */
     bool tabbed = false;
 
@@ -463,6 +506,10 @@ static bool edit_line(void) {
         char c = take_key(), other = 0;
         bool tab = false;
 
+        if (c == 0 && signalled != 0) {
+            have = pos = 0;
+            return -1;              /* the line goes with it */
+        }
         if (c == 0x1B) {
             char key = escape_key(&other);
 
@@ -503,7 +550,7 @@ static bool edit_line(void) {
         }
         if (c == (char)settings.cc[VEOF]) {
             if (have == 0) {
-                return false;
+                return 0;
             }
             continue;
         }
@@ -527,7 +574,7 @@ static bool edit_line(void) {
             draw("\n", 1);
             remember();
             line[have++] = '\n';
-            return true;
+            return 1;
         } else if ((unsigned char)c >= ' ') {
             insert(&c, 1);
         }
@@ -553,6 +600,9 @@ uint64_t console_read(char *buf, uint64_t count) {
         do {
             char c = take_key();
 
+            if (c == 0 && signalled != 0) {
+                return n > 0 ? n : CONSOLE_SIGNAL;
+            }
             if (c == '\n' && (settings.iflag & ICRNL) == 0) {
                 c = '\r';
             }
@@ -566,7 +616,12 @@ uint64_t console_read(char *buf, uint64_t count) {
     if (handed == ready) {
         drawing = (settings.lflag & ECHO) != 0;
         handed = 0;
-        ready = edit_line() ? have : 0;
+        int got = edit_line();
+
+        ready = got > 0 ? have : 0;
+        if (got < 0) {
+            return CONSOLE_SIGNAL;
+        }
         if (ready == 0) {
             return 0;               /* Ctrl-D on an empty line */
         }

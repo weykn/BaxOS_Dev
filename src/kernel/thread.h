@@ -33,6 +33,9 @@ int thread_create(const struct user_regs *regs, uint64_t rsp, uint64_t fs, uint6
 /* Lets the process's other threads run, if it has any. */
 void thread_yield(void);
 
+/* The running thread's blocked signals, as rt_sigprocmask has them. */
+uint64_t *thread_sigmask(void);
+
 /* Whether this is the process's only thread. */
 bool thread_alone(void);
 

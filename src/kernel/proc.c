@@ -12,7 +12,7 @@
 #include "shell.h"
 #include "vga.h"
 
-#define PROC_NAME "proc"
+#define PROC_NAME "ctl"
 #define PROC_DIR  "/" PROC_NAME
 
 #define BAR_WIDTH 30        /* cells in a usage bar */
@@ -59,7 +59,7 @@ void usage_bar(const char *label, unsigned used, unsigned total, const char *uni
     pad(strlen(label), 8);
     for (unsigned i = 0; i < BAR_WIDTH; i++) {
         color(i < filled ? COL_FILL : COL_DIM);
-        vga_putc(i < filled ? '\xDB' : '\xB0');
+        vga_puts(i < filled ? "\u2588" : "\u2591");    /* full and light blocks */
     }
     color(COL_TEXT);
     kprintf("  %u", used);
@@ -308,10 +308,10 @@ static const char *past(const char *text, const char *prefix) {
     return text;
 }
 
-/* Strips the folder off a path, if it is the one /proc names. A path is
+/* Strips the folder off a path, if it is the one /ctl names. A path is
    spelled either from the root or against it - the shell looks a bare
-   command name up as "/proc/<name>", and a program's own path arrives
-   already resolved - so both spellings are taken here. From inside /proc,
+   command name up as "/ctl/<name>", and a program's own path arrives
+   already resolved - so both spellings are taken here. From inside /ctl,
    a name is spelled against it, and "." is the folder itself. */
 static const char *in_proc(const char *path) {
     const char *rest;
@@ -338,7 +338,7 @@ bool proc_folder(const char *path) {
     const char *rest = in_proc(path);
 
     if (rest != NULL) {
-        return *rest == '\0';       /* "/proc/" is the folder too */
+        return *rest == '\0';       /* "/ctl/" is the folder too */
     }
     return strcmp(path, PROC_DIR) == 0 || strcmp(path, PROC_NAME) == 0;
 }
