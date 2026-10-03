@@ -40,6 +40,11 @@
 #define SCRIPT_LINE   128       /* the longest line a script may hold */
 #define SCRIPT_DEPTH  4         /* scripts running scripts, at most */
 
+/* The kernel's stack is 8 KiB, and a script can run a script that loads a
+   module through the firmware: each built-in keeps its buffers to itself
+   rather than every line paying for all of them. */
+#define NOINLINE __attribute__((noinline))
+
 static bool memcmp_n(const char *a, const char *b, size_t n) {
     while (n > 0 && *a == *b) {
         a++;
@@ -80,7 +85,7 @@ const char *shell_env(const char *name) {
 
 /* Sets NAME=value, replacing what NAME had. The text is packed again from
    the list each time, so a value changed over and over does not use it up. */
-static void env_set(const char *pair) {
+static NOINLINE void env_set(const char *pair) {
     const char *eq = strchr(pair, '=');
     char packed[ENV_BYTES];
     size_t used = 0, n;
@@ -146,7 +151,7 @@ static void tsh_fail(const char *what, const char *name, const char *why) {
     vga_set_color(VGA_LIGHTGRAY, VGA_BLACK);
 }
 
-static void tsh_help(void) {
+static NOINLINE void tsh_help(void) {
     kprintf("built-in: cd ls cat cp mv rm mkdir put export exit help\n/ctl:");
     for (unsigned i = 0; proc_at(i) != NULL; i++) {
         kprintf(" %s", proc_at(i)->name);
@@ -155,7 +160,7 @@ static void tsh_help(void) {
 }
 
 /* The names in a folder, a folder's with a slash after it. */
-static void tsh_ls(const char *path) {
+static NOINLINE void tsh_ls(const char *path) {
     char folder[FS_NAME_LEN];
     struct fs_file entry;
     size_t cursor = 0, index;
@@ -175,7 +180,7 @@ static void tsh_ls(const char *path) {
     }
 }
 
-static void tsh_cat(unsigned argc, char **argv) {
+static NOINLINE void tsh_cat(unsigned argc, char **argv) {
     struct fs_file file;
 
     for (unsigned i = 1; i < argc; i++) {
@@ -211,7 +216,7 @@ static const char *tsh_dest(const char *from, const char *to, char *out) {
 }
 
 /* A file's contents into another, a run of sectors at a time. */
-static void tsh_cp(const char *from, const char *to) {
+static NOINLINE void tsh_cp(const char *from, const char *to) {
     char dest[FS_NAME_LEN];
     struct fs_file file, there;
     char *run;
@@ -242,7 +247,7 @@ static void tsh_cp(const char *from, const char *to) {
     }
 }
 
-static void tsh_mv(const char *from, const char *to) {
+static NOINLINE void tsh_mv(const char *from, const char *to) {
     char dest[FS_NAME_LEN];
     int err = fs_rename(from, tsh_dest(from, to, dest));
 
@@ -293,7 +298,7 @@ static char *rest_of(unsigned argc, char **argv, unsigned from) {
 }
 
 /* put <file> [text]: the file holds text and a newline, or nothing. */
-static void tsh_put(unsigned argc, char **argv) {
+static NOINLINE void tsh_put(unsigned argc, char **argv) {
     char *text = rest_of(argc, argv, 2);
     size_t n = strlen(text);
     int err;
@@ -308,7 +313,7 @@ static void tsh_put(unsigned argc, char **argv) {
 
 /* Runs one line's words: a kernel command with the rest of the line as its
    arguments, or a program. */
-static void tsh_run(unsigned argc, char **argv) {
+static NOINLINE void tsh_run(unsigned argc, char **argv) {
     char path[FS_NAME_LEN];
     const struct proc_cmd *cmd;
     int code;
@@ -461,6 +466,17 @@ static void script_run(const char *path) {
             mem_free(script);
             script = NULL;
             at = file.size;         /* and the loop ends after it */
+        }
+        /* The line, before it runs - tsh_line cuts it into words. */
+        const char *shown = text;
+
+        while (*shown == ' ' || *shown == '\t') {
+            shown++;
+        }
+        if (*shown != '\0' && *shown != '#') {
+            vga_set_color(VGA_DARKGRAY, VGA_BLACK);
+            kprintf("+ %s\n", shown);
+            vga_set_color(VGA_LIGHTGRAY, VGA_BLACK);
         }
         if (!tsh_line(text)) {
             break;                  /* `exit`: the script is done */

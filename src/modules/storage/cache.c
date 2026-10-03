@@ -12,8 +12,10 @@
  * reading ahead Linux does. A line is also what is given back, whole, which
  * keeps the kernel's list of free memory short.
  *
- * Everything it keeps about the lines is in one block it allocates, and
- * reallocates as the lines outgrow it, so the module itself is a page.
+ * Everything it keeps about the lines is in one block, a chain for each
+ * line: the first few lines' is in the module, and a bigger one is
+ * allocated as the lines outgrow it, so with nothing cached it costs
+ * nothing but the module.
  *
  *   cache                  what it holds, and the files it starts with
  *   cache auto, cache on   as much as is free, less a reserve (the default)
@@ -35,7 +37,7 @@
 #define RESERVE_KIB  8192           /* what auto leaves free for everything else */
 #define BOOT_LINES   256            /* auto while the firmware has the memory:
                                        asking it what is free costs a memory map */
-#define BUCKETS      256
+#define FIRST_ROOM   8              /* lines the module itself has room for */
 #define NONE         0xFFFFFFFFu
 
 struct line {
@@ -46,21 +48,26 @@ struct line {
 };
 
 static struct state {
-    uint32_t bucket[BUCKETS];       /* each chain's first line, one-based */
-    char     files[256];            /* read in at the start, a NUL after each */
-    uint32_t files_len, room;       /* ...and how many lines there is room for */
-    struct line lines[];
+    uint32_t room;                  /* lines there is room for, a power of two */
+    struct line lines[];            /* and then a chain for each, its first
+                                       line, one-based */
 } *st;
+
+#define HEAD(n) (sizeof(struct state) + (n) * (sizeof(struct line) + sizeof(uint32_t)))
+
+static uint64_t first_block[(HEAD(FIRST_ROOM) + 7) / 8];
+#define FIRST ((struct state *)first_block)
+
+static char     files[256];         /* read in at the start, a NUL after each */
+static uint32_t files_len;
 
 static unsigned count;              /* lines with memory */
 static uint32_t clock;
 static size_t   limit;              /* in lines; 0 is auto */
 static bool     off, busy;          /* busy: inside a read, not to be shrunk */
 
-#define HEAD(n) (sizeof(struct state) + (n) * sizeof(struct line))
-
 static uint32_t *chain(uint32_t first) {
-    return &st->bucket[first / LINE_SECTORS % BUCKETS];
+    return (uint32_t *)(st->lines + st->room) + first / LINE_SECTORS % st->room;
 }
 
 static void unhook(unsigned i) {
@@ -127,14 +134,22 @@ static bool may_grow(void) {
 static int slot(void) {
     if (may_grow()) {
         if (count == st->room) {
-            struct state *bigger = mem_alloc(HEAD(st->room * 2));
+            struct state *was = st, *bigger = mem_alloc(HEAD(st->room * 2));
 
             if (bigger != NULL) {
-                memcpy(bigger, st, HEAD(st->room));
-                memset(bigger->lines + st->room, 0, st->room * sizeof(struct line));
-                bigger->room = st->room * 2;
-                mem_free(st);
+                memset(bigger, 0, HEAD(was->room * 2));
+                memcpy(bigger->lines, was->lines, was->room * sizeof(struct line));
+                bigger->room = was->room * 2;
                 st = bigger;
+                for (unsigned i = 0; i < was->room; i++) {      /* the chains again */
+                    if (st->lines[i].first != NONE) {
+                        st->lines[i].next = *chain(st->lines[i].first);
+                        *chain(st->lines[i].first) = i + 1;
+                    }
+                }
+                if (was != FIRST) {
+                    mem_free(was);
+                }
             }
         }
         for (unsigned i = 0; i < st->room; i++) {
@@ -214,7 +229,7 @@ static size_t cache_shrink(size_t bytes) {
 }
 
 static size_t cache_memory(void) {
-    return (size_t)count * LINE_BYTES + HEAD(st->room);
+    return (size_t)count * LINE_BYTES + (st != FIRST ? HEAD(st->room) : 0);
 }
 
 static const struct disk_cache cache = { cache_read, cache_written, cache_shrink, cache_memory };
@@ -248,8 +263,8 @@ static void start(void) {
     uint32_t lba[2];
     unsigned n[2];
 
-    for (size_t at = 0; at < st->files_len; at += strlen(st->files + at) + 1) {
-        preload(st->files + at);
+    for (size_t at = 0; at < files_len; at += strlen(files + at) + 1) {
+        preload(files + at);
     }
     if (fs_runs(lba, n) == 0) {
         read_in(lba[0], n[0]);
@@ -258,9 +273,9 @@ static void start(void) {
 }
 
 static char *listed(const char *path) {
-    for (size_t at = 0; at < st->files_len; at += strlen(st->files + at) + 1) {
-        if (strcmp(st->files + at, path) == 0) {
-            return st->files + at;
+    for (size_t at = 0; at < files_len; at += strlen(files + at) + 1) {
+        if (strcmp(files + at, path) == 0) {
+            return files + at;
         }
     }
     return NULL;
@@ -290,15 +305,15 @@ static void cmd_cache(char *args) {
             char *at = listed(path);
             size_t n = strlen(path) + 1;
 
-            if (what[0] == 'a' && at == NULL && st->files_len + n <= sizeof st->files) {
-                memcpy(st->files + st->files_len, path, n);
-                st->files_len += (uint32_t)n;
+            if (what[0] == 'a' && at == NULL && files_len + n <= sizeof files) {
+                memcpy(files + files_len, path, n);
+                files_len += (uint32_t)n;
                 if (!off) {
                     preload(path);
                 }
             } else if (what[0] == 'r' && at != NULL) {
-                memmove(at, at + n, st->files_len - (size_t)(at - st->files) - n);
-                st->files_len -= (uint32_t)n;
+                memmove(at, at + n, files_len - (size_t)(at - files) - n);
+                files_len -= (uint32_t)n;
             }
         }
     } else if (*what != '\0') {
@@ -324,8 +339,8 @@ static void cmd_cache(char *args) {
                       : held + (free > RESERVE_KIB ? free - RESERVE_KIB : 0),
                       limit != 0 ? "KiB" : "KiB, auto");
         }
-        for (size_t at = 0; at < st->files_len; at += strlen(st->files + at) + 1) {
-            kprintf("  %s\n", st->files + at);
+        for (size_t at = 0; at < files_len; at += strlen(files + at) + 1) {
+            kprintf("  %s\n", files + at);
         }
     }
 }
@@ -335,11 +350,8 @@ static const struct proc_cmd cache_cmd = { "cache", "[auto|on|off|size|add|rm]",
 /* ---- the module ----------------------------------------------------------- */
 
 MODULE_EXPORT int module_init(void) {
-    if ((st = mem_alloc(HEAD(64))) == NULL) {
-        return -12;                 /* ENOMEM */
-    }
-    memset(st, 0, HEAD(64));
-    st->room = 64;
+    st = FIRST;
+    st->room = FIRST_ROOM;
     disk_cache_register(&cache);
     proc_add(&cache_cmd);
     return 0;
@@ -349,6 +361,8 @@ MODULE_EXPORT int module_exit(void) {
     disk_cache_register(NULL);
     proc_remove(&cache_cmd);
     cap(0);
-    mem_free(st);
+    if (st != FIRST) {
+        mem_free(st);
+    }
     return 0;
 }

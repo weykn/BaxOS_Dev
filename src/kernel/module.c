@@ -1,9 +1,11 @@
 #include "module.h"
 
+#include "console.h"
 #include "debug.h"
 #include "driver.h"
 #include "efi_kernel.h"
 #include "fs.h"
+#include "linux.h"
 #include "mem.h"
 #include "net.h"
 #include "pci.h"
@@ -79,6 +81,15 @@ static const struct {
     X(proc_add), X(proc_remove),
     X(handle_of), X(give_handle), X(user_range), X(syscall_args), X(interrupt_check),
     X(wait_began), X(wait_ended), X(thread_yield),
+    X(at_path), X(console_get), X(console_ready), X(console_set), X(deliverable),
+    X(dev_folder), X(devices), X(dev_named), X(efi_power_off), X(efi_restart),
+    X(event_ready), X(file_ino), X(fs_errno), X(fs_file), X(fs_folder_at),
+    X(fs_get_stats), X(fs_inside), X(fs_list), X(fs_lstat), X(fs_readlink), X(fs_rename),
+    X(fs_set_mode), X(fs_symlink), X(is_console), X(is_fifo), X(linux_register),
+    X(mem_get_stats), X(net), X(now_running), X(pipe_left), X(pipe_of), X(proc_at),
+    X(proc_command), X(proc_folder), X(proc_net_name), X(proc_read), X(readable),
+    X(realtime_ms), X(realtime_us), X(self_us), X(user_string), X(user_us), X(vga_height),
+    X(vga_pixel_height), X(vga_pixel_width), X(vga_width), X(writer_names),
 #ifdef DEBUG
     X(dbg),
 #endif
@@ -107,6 +118,13 @@ struct elf_sym {
     uint64_t value, size;
 };
 
+struct elf_section {
+    uint32_t name, type;
+    uint64_t flags, addr, offset, size;
+    uint32_t link, info;
+    uint64_t addralign, entsize;
+};
+
 struct elf_rela {
     uint64_t offset, info;
     int64_t  addend;
@@ -122,6 +140,12 @@ struct elf_rela {
 #define DT_RELA     7
 #define DT_RELASZ   8
 #define DT_JMPREL   23
+#define SHF_ALLOC   2
+#define SHT_STRTAB  3
+#define SHT_RELA    4
+#define SHT_HASH    5
+#define SHT_DYNSYM  11
+#define SHT_GNU_HASH 0x6FFFFFF6
 #define R_NONE      0
 #define R_64        1
 #define R_GLOB_DAT  6
@@ -130,12 +154,10 @@ struct elf_rela {
 
 static struct module {
     char     name[NAME_LEN];        /* empty in a free slot */
-    uint64_t base;
-    uint32_t span;                  /* bytes of its image from base */
-    const struct elf_sym *syms;
-    const char *strs;
-    uint32_t nsyms;
-    uint32_t needs;                 /* the slots it took symbols from */
+    uint64_t base;                  /* what its addresses count from */
+    uint64_t image;                 /* where what is kept of it starts */
+    uint32_t span;                  /* bytes of that */
+    uint64_t exit;                  /* its module_exit, or 0 */
 } mods[MODULES];
 
 static char why[80];                /* what the last failure was */
@@ -149,21 +171,33 @@ static int slot_of(const char *name) {
     return -1;
 }
 
-/* A symbol m defines, or 0. Only exported ones are in the table at all. */
-static uint64_t defined(const struct module *m, const char *name) {
-    for (uint32_t i = 1; i < m->nsyms; i++) {
-        const struct elf_sym *s = &m->syms[i];
+/* What a module is linked with, read from its file: nothing of it is kept. */
+struct link {
+    const uint8_t *file;
+    uint32_t size;
+    const struct elf_header *h;
+    const struct elf_program *p;
+    const struct elf_sym *syms;
+    const char *strs;
+    uint32_t nsyms;
+};
 
-        if (s->shndx != 0 && strcmp(m->strs + s->name, name) == 0) {
-            return m->base + s->value;
+/* Where in the file the bytes at vaddr are, or NULL. */
+static const void *in_file(const struct link *l, uint64_t vaddr, uint64_t bytes) {
+    for (unsigned i = 0; i < l->h->phnum; i++) {
+        const struct elf_program *p = &l->p[i];
+
+        if (p->type == PT_LOAD && vaddr >= p->vaddr && vaddr + bytes <= p->vaddr + p->filesz) {
+            return l->file + p->offset + (vaddr - p->vaddr);
         }
     }
-    return 0;
+    return NULL;
 }
 
-static uint64_t resolve(struct module *m, const struct elf_sym *s) {
-    const char *name = m->strs + s->name;
-    uint64_t at;
+/* Modules meet in the kernel's slots rather than calling each other, so what
+   one calls is the kernel's. */
+static uint64_t resolve(const struct link *l, const struct module *m, const struct elf_sym *s) {
+    const char *name = l->strs + s->name;
 
     if (s->shndx != 0) {
         return m->base + s->value;
@@ -173,26 +207,25 @@ static uint64_t resolve(struct module *m, const struct elf_sym *s) {
             return (uint64_t)exports[i].at;
         }
     }
-    for (int i = 0; i < MODULES; i++) {
-        if (&mods[i] != m && mods[i].name[0] != '\0' && (at = defined(&mods[i], name)) != 0) {
-            m->needs |= 1u << i;
-            return at;
-        }
-    }
     if ((s->info >> 4) != 2) {      /* a weak one may be missing */
         ksprintf(why, "unknown symbol %s", name);
     }
     return 0;
 }
 
-static bool relocate(struct module *m, const struct elf_rela *r, uint64_t bytes) {
+static bool relocate(const struct link *l, struct module *m, uint64_t vaddr, uint64_t bytes) {
+    const struct elf_rela *r = bytes > 0 ? in_file(l, vaddr, bytes) : NULL;
+
+    if (bytes > 0 && r == NULL) {
+        return false;
+    }
     for (; bytes >= sizeof *r; r++, bytes -= sizeof *r) {
         uint64_t *at = (uint64_t *)(m->base + r->offset);
-        uint32_t type = (uint32_t)r->info;
-        const struct elf_sym *s = &m->syms[r->info >> 32];
+        uint32_t type = (uint32_t)r->info, sym = (uint32_t)(r->info >> 32);
         uint64_t value;
 
-        if (r->offset + 8 > m->span) {
+        if (r->offset + m->base < m->image || r->offset + m->base + 8 > m->image + m->span ||
+            sym >= l->nsyms) {
             return false;
         }
         switch (type) {
@@ -204,7 +237,7 @@ static bool relocate(struct module *m, const struct elf_rela *r, uint64_t bytes)
         case R_64:
         case R_GLOB_DAT:
         case R_JUMP_SLOT:
-            value = resolve(m, s);
+            value = resolve(l, m, &l->syms[sym]);
             if (value == 0 && why[0] != '\0') {
                 return false;
             }
@@ -307,68 +340,105 @@ static void image_free(uint64_t base, uint32_t span) {
     }
 }
 
-/* Puts the image in place and links it; false with why set if it cannot. */
-static bool place(struct module *m, const uint8_t *file, uint32_t size) {
+/* Puts the image in place and links it; false with why set if it cannot.
+   As linked, a module starts with its ELF headers and the tables that link
+   it - symbols, their names, relocations - which nothing needs once it is
+   linked: only its code and data are kept, the tables read from the file. */
+static bool place(struct module *m, const uint8_t *file, uint32_t size, uint64_t *init) {
+    /* Kept off the stack, which a module loaded for a syscall is deep in
+       already; one load never runs inside another. */
+    static struct link l;
+    static uint64_t tag[24];
     const struct elf_header *h = (const struct elf_header *)file;
-    const struct elf_program *p = (const struct elf_program *)(file + h->phoff);
+    const struct elf_section *sec;
     const uint64_t *dyn = NULL;
-    uint64_t span = 0, tag[24] = { 0 };
+    uint64_t lo = ~0ull, hi = 0;
+
+    l = (struct link){ file, size, h, NULL, NULL, NULL, 0 };
+    memset(tag, 0, sizeof tag);
 
     if (size < sizeof *h || h->ident[0] != 0x7F || h->ident[1] != 'E' || h->type != 3 ||
-        h->machine != 0x3E || h->phoff + (uint64_t)h->phnum * sizeof *p > size) {
+        h->machine != 0x3E || h->phoff + (uint64_t)h->phnum * sizeof *l.p > size ||
+        h->shoff + (uint64_t)h->shnum * sizeof *sec > size) {
         strcpy(why, "not a module");
         return false;
     }
+    l.p = (const struct elf_program *)(file + h->phoff);
+    sec = (const struct elf_section *)(file + h->shoff);
     for (unsigned i = 0; i < h->phnum; i++) {
-        if (p[i].type == PT_LOAD) {
-            if (p[i].offset + p[i].filesz > size || p[i].filesz > p[i].memsz) {
-                strcpy(why, "not a module");
-                return false;
-            }
-            if (p[i].vaddr + p[i].memsz > span) {
-                span = p[i].vaddr + p[i].memsz;
-            }
+        if (l.p[i].offset + l.p[i].filesz > size || l.p[i].filesz > l.p[i].memsz) {
+            strcpy(why, "not a module");
+            return false;
+        }
+        if (l.p[i].type == PT_DYNAMIC) {
+            dyn = (const uint64_t *)(file + l.p[i].offset);
         }
     }
-    m->span = (uint32_t)span;
-    if ((m->base = image_alloc(m->span)) == 0) {
-        strcpy(why, "out of memory");
-        return false;
-    }
-    memset((void *)m->base, 0, span);
-    for (unsigned i = 0; i < h->phnum; i++) {
-        if (p[i].type == PT_LOAD) {
-            memcpy((void *)(m->base + p[i].vaddr), file + p[i].offset, p[i].filesz);
-        } else if (p[i].type == PT_DYNAMIC) {
-            dyn = (const uint64_t *)(m->base + p[i].vaddr);
+    for (unsigned i = 0; i < h->shnum; i++) {
+        uint32_t t = sec[i].type;
+
+        if ((sec[i].flags & SHF_ALLOC) != 0 && sec[i].size > 0 && t != SHT_STRTAB &&
+            t != SHT_RELA && t != SHT_HASH && t != SHT_DYNSYM && t != SHT_GNU_HASH) {
+            lo = sec[i].addr < lo ? sec[i].addr : lo;
+            hi = sec[i].addr + sec[i].size > hi ? sec[i].addr + sec[i].size : hi;
         }
     }
-    for (; dyn != NULL && dyn[0] != DT_NULL; dyn += 2) {
+    for (; dyn != NULL && (const uint8_t *)(dyn + 2) <= file + size && dyn[0] != DT_NULL;
+         dyn += 2) {
         if (dyn[0] < 24) {
             tag[dyn[0]] = dyn[1];
         }
     }
-    if (tag[DT_SYMTAB] == 0 || tag[DT_STRTAB] == 0 || tag[DT_HASH] == 0) {
+    const uint32_t *hash = in_file(&l, tag[DT_HASH], 8);
+
+    l.nsyms = hash != NULL ? hash[1] : 0;
+    l.syms = in_file(&l, tag[DT_SYMTAB], (uint64_t)l.nsyms * sizeof *l.syms);
+    l.strs = in_file(&l, tag[DT_STRTAB], 1);
+    if (lo >= hi || l.syms == NULL || l.strs == NULL) {
         strcpy(why, "not a module");
         return false;
     }
-    m->syms = (const struct elf_sym *)(m->base + tag[DT_SYMTAB]);
-    m->strs = (const char *)(m->base + tag[DT_STRTAB]);
-    m->nsyms = ((const uint32_t *)(m->base + tag[DT_HASH]))[1];
+    m->span = (uint32_t)(hi - lo);
+    if ((m->image = image_alloc(m->span)) == 0) {
+        strcpy(why, "out of memory");
+        return false;
+    }
+    m->base = m->image - lo;
+    memset((void *)m->image, 0, m->span);
+    for (unsigned i = 0; i < h->phnum; i++) {
+        const struct elf_program *p = &l.p[i];
+        uint64_t from = p->vaddr > lo ? p->vaddr : lo;
+        uint64_t to = p->vaddr + p->filesz < hi ? p->vaddr + p->filesz : hi;
+
+        if (p->type == PT_LOAD && from < to) {
+            memcpy((void *)(m->base + from), file + p->offset + (from - p->vaddr), to - from);
+        }
+    }
     why[0] = '\0';
-    if (!relocate(m, (const struct elf_rela *)(m->base + tag[DT_RELA]), tag[DT_RELASZ]) ||
-        !relocate(m, (const struct elf_rela *)(m->base + tag[DT_JMPREL]), tag[DT_PLTRELSZ])) {
+    if (!relocate(&l, m, tag[DT_RELA], tag[DT_RELASZ]) ||
+        !relocate(&l, m, tag[DT_JMPREL], tag[DT_PLTRELSZ])) {
         if (why[0] == '\0') {
             strcpy(why, "not a module");
         }
         return false;
     }
+    /* Only what it marks MODULE_EXPORT is in the table at all. */
+    *init = 0;
+    for (uint32_t i = 1; i < l.nsyms; i++) {
+        const struct elf_sym *s = &l.syms[i];
+
+        if (s->shndx != 0 && strcmp(l.strs + s->name, "module_init") == 0) {
+            *init = m->base + s->value;
+        } else if (s->shndx != 0 && strcmp(l.strs + s->name, "module_exit") == 0) {
+            m->exit = m->base + s->value;
+        }
+    }
     return true;
 }
 
 static void release(struct module *m) {
-    if (m->base != 0) {
-        image_free(m->base, m->span);
+    if (m->image != 0) {
+        image_free(m->image, m->span);
     }
     *m = (struct module){ 0 };
 }
@@ -418,11 +488,10 @@ static int load_one(const char *name) {
         return -1;
     }
     strcpy(m->name, name);
-    bool placed = place(m, file, size);
+    uint64_t init = 0;
+    bool placed = place(m, file, size, &init);
 
     mem_free(file);
-    uint64_t init = placed ? defined(m, "module_init") : 0;
-
     if (placed && init == 0) {
         strcpy(why, "no module_init");
     }
@@ -437,7 +506,7 @@ static int load_one(const char *name) {
         release(m);
         return err;
     }
-    dbg("module: %s at %x, %u bytes\n", name, m->base, m->span);
+    dbg("module: %s at %x, %u bytes\n", name, m->image, m->span);
     return 0;
 }
 
@@ -445,25 +514,29 @@ static bool load(const char *name) {
     return slot_of(name) >= 0 || load_one(name) == 0;
 }
 
-/* Unloads a module and, first, everything that uses it. A module still in
-   use - the disk driver once the firmware is gone - says so from its
-   module_exit, and stays, and so does whatever it uses. */
+/* Unloads a module. One still in use - the disk driver once the firmware
+   is gone - says so from its module_exit, and stays. */
 static bool unload(int slot) {
     struct module *m = &mods[slot];
 
-    for (int i = 0; i < MODULES; i++) {
-        if (mods[i].name[0] != '\0' && (mods[i].needs & 1u << slot) != 0 && !unload(i)) {
-            return false;
-        }
-    }
-    uint64_t exit = defined(m, "module_exit");
-
-    if (exit != 0 && ((int (*)(void))exit)() < 0) {
+    if (m->exit != 0 && ((int (*)(void))m->exit)() < 0) {
         strcpy(why, "in use");
         return false;
     }
     release(m);
     return true;
+}
+
+bool module_need(const char *name) {
+    return load(name);
+}
+
+void module_drop(const char *name) {
+    int slot = slot_of(name);
+
+    if (slot >= 0) {
+        unload(slot);
+    }
 }
 
 uint32_t module_memory(void) {
@@ -522,7 +595,9 @@ static void list_in(const char *top) {
 }
 
 /* Every module there is, in each folder of MODPATH. */
-static void list(void) {
+/* Out of line, as is auto_enable: modman runs deep in a boot script, and
+   their buffers would otherwise be on the stack for every enable. */
+static __attribute__((noinline)) void list(void) {
     char dir[FS_NAME_LEN], top[FS_NAME_LEN];
     const char *dirs = shell_env("MODPATH");
 
@@ -544,7 +619,7 @@ static void list(void) {
 /* modman auto <category>: every module of the category that starts on
    this machine is enabled - a driver whose hardware is not here answers
    -ENODEV and is let go again. Each one enabled is named. */
-static void auto_enable(const char *cat) {
+static __attribute__((noinline)) void auto_enable(const char *cat) {
     char dir[FS_NAME_LEN], top[FS_NAME_LEN], folder[FS_NAME_LEN], name[NAME_LEN];
     const char *dirs = shell_env("MODPATH");
     struct fs_file file;

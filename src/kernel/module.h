@@ -10,8 +10,8 @@
  *
  * A module is an ELF shared object, built with -fPIC and linked -shared.
  * The loader puts it anywhere, applies its relocations, and resolves what
- * it calls by name: first against the kernel's exports (module.c), then
- * against the modules already loaded, whatever they mark MODULE_EXPORT.
+ * it calls by name against the kernel's exports (module.c). Only its code
+ * and data stay in memory: the tables that link it are read from the file.
  * Modules that work together - a card driver and the network stack - meet
  * in a slot the kernel keeps (driver.h, net.h) rather than calling each
  * other, so each one loads and runs on its own.
@@ -23,9 +23,14 @@
 
 #define MODULE_EXPORT __attribute__((visibility("default")))
 
-/* What a module defines. */
+/* What a module defines, and all it marks MODULE_EXPORT that is used. */
 MODULE_EXPORT int  module_init(void);
 MODULE_EXPORT int  module_exit(void);
+
+/* Loads a module for the kernel's own use - true if it is in, now or
+   already - and unloads it again. */
+bool module_need(const char *name);
+void module_drop(const char *name);
 
 /* RAM the loaded modules' own images take, in bytes. */
 uint32_t module_memory(void);

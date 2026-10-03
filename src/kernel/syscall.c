@@ -14,6 +14,8 @@
 #include "thread.h"
 #include "vga.h"
 #include "vm.h"
+#include "linux.h"
+#include "module.h"
 
 #define MSR_EFER  0xC0000080
 #define MSR_STAR  0xC0000081
@@ -28,48 +30,6 @@
 
 static uint64_t write_protect(bool on);
 
-/* Linux answers a failed call with the negated error number, and a libc
-   tells the two apart by the result being a small negative. -1 on its own
-   means EPERM, which is rarely what went wrong. */
-#define ERR(e) ((uint64_t)-(int64_t)(e))
-
-#define ENOENT  2
-#define EBADF   9
-#define ENOMEM 12
-#define EIO     5
-#define EFAULT 14
-#define EACCES 13
-#define EEXIST 17
-#define EAGAIN 11
-#define EINTR  4
-#define EMFILE 24
-#define ENOTTY 25
-#define EINVAL 22
-#define ENOSYS 38
-#define ENOEXEC 8
-#define ENOTDIR 20
-#define ERANGE  34
-#define ECHILD 10
-#define ENOSPC 28
-#define EPERM   1
-#define ENOTEMPTY 39
-#define ENFILE 23
-#define EPIPE  32
-#define ESPIPE 29
-
-#define S_IFMT  0170000             /* a file's type, in its mode */
-#define S_IFIFO 0010000
-#define S_IFCHR 0020000
-#define S_IFDIR 0040000
-#define S_IFREG 0100000
-#define S_IFLNK 0120000
-#define S_IFSOCK 0140000
-#define ELOOP  40
-#define EPROTONOSUPPORT 93
-#define ESOCKTNOSUPPORT 94
-#define EAFNOSUPPORT    97
-#define EOPNOTSUPP      95
-#define ENOTSOCK        88
 
 /* The arguments of the call being handled, all six of them. Handlers take
    the first three, which is all but a few of them want; the rest read the
@@ -105,7 +65,6 @@ static uint64_t sys_getrandom(uint64_t buf, uint64_t length, uint64_t flags);
 static bool fits(uint64_t addr, uint64_t size);
 static bool claim(uint64_t addr, uint64_t size);
 static int  read_at(const struct fs_file *file, uint64_t offset, void *dest, uint64_t size);
-static uint64_t fs_errno(int err);
 struct handle;
 
 /* What the loaded program turned out to be, for the auxiliary vector its
@@ -157,7 +116,7 @@ bool user_range(uint64_t addr, uint64_t size) {
 
 /* The program's NUL-terminated string at addr, or NULL if it runs to the end
    of the window without one. */
-static const char *user_string(uint64_t addr) {
+const char *user_string(uint64_t addr) {
     if (!user_range(addr, 0)) {
         return NULL;
     }
@@ -183,25 +142,11 @@ static const char *user_string(uint64_t addr) {
    the filesystem by name - and only a few are ever open at once, so the
    names live here rather than in every handle, where they would cost four
    times as much. */
-#define WRITERS 4
 
-static char writer_names[WRITERS][FS_NAME_LEN];
+char writer_names[WRITERS][FS_NAME_LEN];
 
 static struct handle handles[PROGRAM_FILES];
 
-#define FOLDER_MARK  0xFFFFFFFFu
-#define WRITE_MARK   0xFFFFFFFEu    /* a file open for writing */
-#define CONSOLE_MARK 0xFFFFFFFDu    /* the screen and the keyboard */
-#define PROCDIR_MARK 0xFFFFFFFCu    /* /proc, or /dev with folder 1: not on the disk */
-#define PROC_MARK    0xFFFFFFFBu    /* one of the commands in it */
-#define PIPE_MARK    0xFFFFFFFAu    /* one end of a pipe */
-#define DEV_MARK     0xFFFFFFF9u    /* one of the made-up files in /dev */
-#define FIRST_MARK   SOCK_MARK      /* below this, a start is a sector */
-
-/* Where a made-up file's number starts, clear of any real one: those are
-   sector numbers, and the disk is far smaller than this. */
-#define PROC_INO 0x01000000u
-#define DEV_INO  (PROC_INO + 0x10000u)    /* /dev's, as its listing numbers them */
 
 /* ---- /dev ----------------------------------------------------------------
  *
@@ -212,14 +157,8 @@ static struct handle handles[PROGRAM_FILES];
  * /dev/null is where a shell sends output it does not want, and a program
  * given nowhere to put something and no /dev/null to put it stops. */
 
-enum dev {
-    DEV_NULL = 1, DEV_ZERO, DEV_FULL, DEV_RANDOM, DEV_TTY,
-};
 
-static const struct {
-    const char *name;
-    enum dev    which;
-} devices[] = {
+const struct device devices[DEVICES] = {
     { "/dev/null",    DEV_NULL   },
     { "/dev/zero",    DEV_ZERO   },
     { "/dev/full",    DEV_FULL   },
@@ -232,7 +171,6 @@ static const struct {
     { "/dev/console", DEV_TTY    },
 };
 
-#define DEVICES (sizeof devices / sizeof devices[0])
 
 /* What a path names inside /dev - "" for the folder itself - or NULL if it
    is elsewhere. From inside /dev, a name is spelled against it. */
@@ -257,7 +195,7 @@ static const char *in_dev(const char *name) {
 }
 
 /* Which of them a path names, or 0. */
-static enum dev dev_named(const char *name) {
+enum dev dev_named(const char *name) {
     const char *leaf = in_dev(name);
 
     for (unsigned i = 0; leaf != NULL && *leaf != '\0' && i < DEVICES; i++) {
@@ -268,7 +206,7 @@ static enum dev dev_named(const char *name) {
     return 0;
 }
 
-static bool dev_folder(const char *name) {
+bool dev_folder(const char *name) {
     const char *leaf = in_dev(name);
 
     return leaf != NULL && *leaf == '\0';
@@ -284,7 +222,7 @@ struct handle *handle_of(uint64_t fd) {
 
 /* True if fd is the console rather than a file, which is what decides
    whether a terminal's questions have an answer. */
-static bool is_console(uint64_t fd) {
+bool is_console(uint64_t fd) {
     struct handle *h = handle_of(fd);
 
     return h != NULL && h->start == CONSOLE_MARK;
@@ -315,15 +253,6 @@ static void handles_reset(void) {
 #define PIPE_FIRST 8192
 #define PIPE_MAX   (1024 * 1024)
 
-/* A pipe handle's size says which end it is. An eventfd is a pipe with no
-   buffer, only a count; O_NONBLOCK and EFD_SEMAPHORE are in its offset. */
-#define PIPE_READ  0
-#define PIPE_WRITE 1
-#define PIPE_EVENT 2
-#define PIPE_FILE  3                /* a /proc/net file: the text, read once */
-#define PIPE_PAIR  4                /* an AF_UNIX socketpair end: it reads its
-                                       own pipe and writes the other's, whose
-                                       slot is in offset from bit 16 */
 #define PIPE_TEXT  8192             /* the most of one */
 #define EFD_SEMAPHORE 1
 
@@ -335,7 +264,7 @@ static struct pipe {
     uint32_t fifo;                  /* a FIFO's: the number of the file it is */
 } pipes[PIPES];
 
-static struct pipe *pipe_of(const struct handle *h) {
+struct pipe *pipe_of(const struct handle *h) {
     return h != NULL && h->start == PIPE_MARK && h->folder > 0 &&
            h->folder <= PIPES && pipes[h->folder - 1].refs > 0
          ? &pipes[h->folder - 1] : NULL;
@@ -393,7 +322,7 @@ static void pipe_release(const struct handle *h) {
    nothing can be written to it any more, which is its end. An empty one
    with a write end still open is not ready, as on Linux: a program waiting
    on a pipe its own signal handler writes to is waiting for that. */
-static bool readable(const struct handle *h) {
+bool readable(const struct handle *h) {
     struct pipe *p = pipe_of(h);
 
     if (h->size != PIPE_PAIR && h->size != PIPE_READ) {
@@ -414,7 +343,7 @@ static unsigned pipe_slot(void) {
 }
 
 /* The name of a /proc/net file the network module has, or NULL. */
-static const char *proc_net_name(const char *path) {
+const char *proc_net_name(const char *path) {
     static const char dir[] = "/proc/net/";
 
     if (path == NULL || net == NULL) {
@@ -449,7 +378,7 @@ static uint64_t proc_net_open(const char *name) {
     return fd;
 }
 
-static bool event_ready(const struct handle *h) {
+bool event_ready(const struct handle *h) {
     struct pipe *p = pipe_of(h);
 
     return p != NULL && h->size == PIPE_EVENT && p->count > 0;
@@ -509,7 +438,7 @@ static uint64_t pipe_write(struct pipe *p, const char *from, uint64_t count) {
     return count;
 }
 
-static uint32_t pipe_left(const struct pipe *p) {
+uint32_t pipe_left(const struct pipe *p) {
     return p->len - p->read_at;
 }
 
@@ -632,24 +561,17 @@ static uint64_t sys_write(uint64_t fd, uint64_t text, uint64_t length) {
  * what is left, the time inside its syscalls and page faults is system time
  * and the rest user time. All of it is in microseconds. */
 
-struct times {
-    uint64_t started;           /* when the program began */
-    uint64_t idle;              /* how long it waited */
-    uint64_t sys;               /* how long the kernel worked for it */
-    uint64_t children_wall;     /* how long its finished children ran */
-    uint64_t children_user, children_sys;   /* and what of it was which */
-};
 
-static struct times now_running;    /* the program running now */
+struct times now_running;    /* the program running now */
 
-static uint64_t self_us(void) {
+uint64_t self_us(void) {
     uint64_t took = efi_uptime_us() - now_running.started;
     uint64_t not = now_running.children_wall + now_running.idle;
 
     return took > not ? took - not : 0;
 }
 
-static uint64_t user_us(void) {
+uint64_t user_us(void) {
     uint64_t self = self_us();
 
     return self > now_running.sys ? self - now_running.sys : 0;
@@ -712,7 +634,7 @@ static bool handled(uint64_t sig) {
 
 /* The signal to handle now, if one is waiting and not blocked: SIGINT
    before SIGCHLD. */
-static uint64_t deliverable(void) {
+uint64_t deliverable(void) {
     for (uint64_t sig = SIGINT; sig != 0; sig = sig == SIGINT ? SIGCHLD : 0) {
         if ((pending & 1u << sig) != 0 && (blocked & 1ull << (sig - 1)) == 0) {
             return sig;
@@ -958,7 +880,7 @@ static void kernel_ended(struct kernel_mark m) {
 
 /* The time of day in milliseconds. The firmware's clock counts whole
    seconds, so it is read once and the uptime counted on from there. */
-static uint64_t realtime_us(void) {
+uint64_t realtime_us(void) {
     static uint64_t offset;
 
     if (offset == 0) {
@@ -967,184 +889,8 @@ static uint64_t realtime_us(void) {
     return offset + efi_uptime_us();
 }
 
-static uint64_t realtime_ms(void) {
+uint64_t realtime_ms(void) {
     return realtime_us() / 1000;
-}
-
-#define RUSAGE_CHILDREN (-1)
-
-static uint64_t sys_getrusage(uint64_t who, uint64_t out, uint64_t c) {
-    bool children = (int32_t)who == RUSAGE_CHILDREN;
-    uint64_t user = children ? now_running.children_user : user_us();
-    uint64_t sys = children ? now_running.children_sys : now_running.sys;
-    int64_t *usage = (int64_t *)out;
-
-    (void)c;
-    if (!user_range(out, 144)) {
-        return ERR(EFAULT);
-    }
-    memset(usage, 0, 144);
-    usage[0] = (int64_t)(user / 1000000);       /* ru_utime */
-    usage[1] = (int64_t)(user % 1000000);
-    usage[2] = (int64_t)(sys / 1000000);        /* ru_stime */
-    usage[3] = (int64_t)(sys % 1000000);
-    return 0;
-}
-
-/* In clock ticks, a hundred to the second; the answer is ticks since boot. */
-static uint64_t sys_times(uint64_t out, uint64_t b, uint64_t c) {
-    int64_t *tms = (int64_t *)out;
-
-    (void)b;
-    (void)c;
-    if (out != 0) {
-        if (!user_range(out, 32)) {
-            return ERR(EFAULT);
-        }
-        tms[0] = (int64_t)(user_us() / 10000);
-        tms[1] = (int64_t)(now_running.sys / 10000);
-        tms[2] = (int64_t)(now_running.children_user / 10000);
-        tms[3] = (int64_t)(now_running.children_sys / 10000);
-    }
-    return efi_uptime_ms() / 10;
-}
-
-/* Which of a few descriptors can be read or written without waiting.
- *
- * Every file here is ready the moment it is asked about; the console is
- * ready once something has been typed, so waiting on it is waiting for a
- * key. A shell asks this before it reads, and one told the question cannot
- * be answered at all takes that for the end of its input and leaves - which
- * is what this is here to prevent.
- *
- * An fd_set is a bitmap, and every descriptor this kernel hands out is in
- * its first word, so only that word is read and written. The timeout is
- * seconds and then fractions, per_ms of them to a millisecond: a program
- * telling a lone Escape from the start of an arrow key waits a few tens of
- * them, and has to be answered that quickly. */
-static uint64_t wait_ready(uint64_t nfds, uint64_t readfds, uint64_t writefds,
-                           uint64_t exceptfds, uint64_t timeout, int64_t per_ms) {
-    uint64_t want = 0, ready = 0, writable = 0, console_bits = 0, sock_bits = 0, event_bits = 0;
-    int64_t until = 0;
-
-    if (nfds > PROGRAM_FILES) {
-        nfds = PROGRAM_FILES;
-    }
-    if ((readfds != 0 && !user_range(readfds, 8)) ||
-        (writefds != 0 && !user_range(writefds, 8)) ||
-        (exceptfds != 0 && !user_range(exceptfds, 8)) ||
-        (timeout != 0 && !user_range(timeout, 16))) {
-        return ERR(EFAULT);
-    }
-    if (readfds != 0) {
-        want = *(uint64_t *)readfds;
-    }
-    for (uint64_t fd = 0; fd < nfds; fd++) {
-        uint64_t bit = 1ull << fd;
-
-        if (handle_of(fd) == NULL) {
-            continue;
-        }
-        if (handles[fd].start == SOCK_MARK) {
-            sock_bits |= bit & (want | (writefds != 0 ? *(uint64_t *)writefds : 0));
-            continue;
-        }
-        if (writefds != 0 && (*(uint64_t *)writefds & bit) != 0) {
-            writable |= bit;        /* nothing else here has to wait to write */
-        }
-        if ((want & bit) == 0) {
-            continue;
-        }
-        if (is_console(fd)) {
-            console_bits |= bit;
-        } else if (handles[fd].start == PIPE_MARK) {
-            struct pipe *p = pipe_of(&handles[fd]);
-
-            /* A pipe with nothing left in it is at its end, which is a read
-               that returns nothing rather than a wait. */
-            (void)p;
-            if (handles[fd].size == PIPE_EVENT || handles[fd].size == PIPE_PAIR ||
-                handles[fd].size == PIPE_READ) {
-                event_bits |= bit;  /* ready once something adds to it */
-                ready |= event_ready(&handles[fd]) || readable(&handles[fd]) ? bit : 0;
-            } else {
-                ready |= bit;       /* what is in it, or its end */
-            }
-        } else {
-            ready |= bit;           /* a file is always there to be read */
-        }
-    }
-    if (timeout != 0) {
-        const int64_t *spec = (const int64_t *)timeout;
-
-        until = (int64_t)efi_uptime_ms() + spec[0] * 1000 + spec[1] / per_ms;
-    }
-    uint64_t began = wait_began();
-
-    uint64_t wanted_out = writefds != 0 ? *(uint64_t *)writefds : 0;
-
-    while ((console_bits | sock_bits | event_bits) != 0 && ready == 0 && writable == 0) {
-        if (console_bits != 0 && console_ready()) {
-            ready = console_bits;
-        }
-        for (uint64_t fd = 0; fd < nfds; fd++) {
-            if ((event_bits >> fd & 1) != 0 &&
-                (event_ready(&handles[fd]) ||
-                 readable(&handles[fd]))) {
-                ready |= 1ull << fd;
-            }
-        }
-        for (uint64_t fd = 0; fd < nfds && net != NULL; fd++) {
-            uint64_t bit = 1ull << fd;
-            unsigned r;
-
-            if ((sock_bits & bit) == 0) {
-                continue;
-            }
-            r = net->ready((int)handles[fd].folder);
-            if ((want & bit) != 0 && (r & (NET_IN | NET_HUP | NET_ERR)) != 0) {
-                ready |= bit;
-            }
-            if ((wanted_out & bit) != 0 && (r & (NET_OUT | NET_ERR)) != 0) {
-                writable |= bit;
-            }
-        }
-        if (ready != 0 || writable != 0 ||
-            (timeout != 0 && (int64_t)efi_uptime_ms() >= until)) {
-            break;                  /* it waited as long as it was asked to */
-        }
-        if (interrupt_check()) {
-            wait_ended(began);
-            return ERR(EINTR);
-        }
-        thread_yield();
-    }
-    wait_ended(began);
-    if (readfds != 0) {
-        *(uint64_t *)readfds = ready;
-    }
-    if (writefds != 0) {
-        *(uint64_t *)writefds = writable;
-    }
-    if (exceptfds != 0) {
-        *(uint64_t *)exceptfds = 0;
-    }
-    uint64_t count = 0;
-
-    for (uint64_t bits = ready | writable; bits != 0; bits >>= 1) {
-        count += bits & 1;
-    }
-    return count;
-}
-
-/* select takes a timeval and pselect6 a timespec, which are the same two
-   numbers; what the second of them counts is finer than this clock. */
-static uint64_t sys_select(uint64_t nfds, uint64_t readfds, uint64_t writefds) {
-    return wait_ready(nfds, readfds, writefds, arg[3], arg[4], 1000);
-}
-
-static uint64_t sys_pselect6(uint64_t nfds, uint64_t readfds, uint64_t writefds) {
-    return wait_ready(nfds, readfds, writefds, arg[3], arg[4], 1000000);
 }
 
 /* Reads from where the descriptor is, in the run of sectors starting at
@@ -1292,9 +1038,9 @@ uint64_t give_handle(struct handle h) {
 /* Opens a file, or the folder of that name if there is no such file - which
    is what getdents64 needs a descriptor for. "." is a folder like any other
    here, since the filesystem resolves it. */
-static uint32_t file_ino(const char *name, bool follow);
+uint32_t file_ino(const char *name, bool follow);
 
-static bool is_fifo(const struct fs_file *file) {
+bool is_fifo(const struct fs_file *file) {
     return file->size == 0 && (file->start & FS_MODE) != 0 && (file->start & S_IFMT) == S_IFIFO;
 }
 
@@ -1449,13 +1195,8 @@ static uint64_t sys_open(uint64_t path, uint64_t flags, uint64_t mode) {
  *
  * AT_FDCWD, and an absolute path whatever the descriptor says, are the
  * working directory's business and go through untouched. */
-#define AT_FDCWD (-100)
 
-/* In the flags of an *at call that can be about a link or what it names:
-   the link, please. */
-#define AT_SYMLINK_NOFOLLOW 0x100
-
-static const char *at_path(uint64_t dirfd, const char *name, char *out, size_t max) {
+const char *at_path(uint64_t dirfd, const char *name, char *out, size_t max) {
     struct handle *h;
     struct fs_file folder;
     size_t n;
@@ -1958,25 +1699,10 @@ static uint64_t sys_ok(uint64_t a, uint64_t b, uint64_t c) {
     return 0;                       /* munmap, mprotect, set_tid_address */
 }
 
-/* For the calls that hand back a structure of figures this machine does not
-   keep - how much processor time has been used, and the like. Zeroes are
-   what a program that has only just started would see anyway. */
-static uint64_t sys_zeroed(uint64_t out, uint64_t b, uint64_t c) {
-    (void)b;
-    (void)c;
-    if (out != 0) {
-        if (!user_range(out, 144)) {    /* the largest of them, struct rusage */
-            return ERR(EFAULT);
-        }
-        memset((void *)out, 0, 144);
-    }
-    return 0;
-}
-
 /* What the filesystem said, as a program's libc expects to hear it. Getting
    this wrong is not cosmetic: `mkdir -p a/b` creates the parent only when it
    is told the parent is missing, and anything else it reports and stops. */
-static uint64_t fs_errno(int err) {
+uint64_t fs_errno(int err) {
     switch (err) {
     case 0:            return 0;
     case FS_ENOENT:    return ERR(ENOENT);
@@ -2041,86 +1767,6 @@ static uint64_t sys_mkdirat(uint64_t dirfd, uint64_t path, uint64_t mode) {
     return make_folder(at_path(dirfd, user_string(path), joined, sizeof joined), mode);
 }
 
-static uint64_t sys_rename(uint64_t from, uint64_t to, uint64_t c) {
-    const char *old_name = user_string(from);
-    char kept[FS_NAME_LEN];
-    const char *new_name;
-
-    (void)c;
-    if (old_name == NULL || strlen(old_name) + 1 > sizeof kept) {
-        return ERR(EFAULT);
-    }
-    /* user_string hands back one buffer's worth of pointer at a time, so the
-       first name is copied before the second is asked for. */
-    memcpy(kept, old_name, strlen(old_name) + 1);
-    new_name = user_string(to);
-    if (new_name == NULL) {
-        return ERR(EFAULT);
-    }
-    return fs_errno(fs_rename(kept, new_name));
-}
-
-/* How much disk there is and how much of it is spoken for. */
-struct statfs {
-    int64_t  type, bsize;
-    uint64_t blocks, bfree, bavail, files, ffree;
-    int32_t  fsid[2];
-    int64_t  namelen, frsize, flags, spare[4];
-};
-
-/* The same figures whichever file is asked about: there is one filesystem,
-   and every path on the machine is on it. */
-static uint64_t statfs_fill(uint64_t out) {
-    struct statfs *stats = (struct statfs *)out;
-    struct fs_stats disk;
-
-    if (!user_range(out, sizeof *stats)) {
-        return ERR(EFAULT);
-    }
-    if (fs_get_stats(&disk) != 0) {
-        return ERR(EIO);
-    }
-    memset(stats, 0, sizeof *stats);
-    stats->type = FS_MAGIC;
-    stats->bsize = SECTOR_SIZE;
-    stats->frsize = SECTOR_SIZE;
-    stats->blocks = disk.total;
-    stats->bfree = disk.total - disk.used;
-    stats->bavail = stats->bfree;
-    /* The table grows while there is disk to grow into, so free space is
-       as good a count of the files still to come as any. */
-    stats->files = disk.files + stats->bfree;
-    stats->ffree = stats->bfree;
-    stats->namelen = FS_NAME_LEN - 1;
-    return 0;
-}
-
-static uint64_t sys_statfs(uint64_t path, uint64_t out, uint64_t c) {
-    (void)c;
-    return user_string(path) == NULL ? ERR(EFAULT) : statfs_fill(out);
-}
-
-/* Switching the machine off, or starting it again, the way Linux spells it:
-   two magic numbers so that it cannot happen by accident. */
-#define REBOOT_MAGIC1 0xFEE1DEADu
-#define REBOOT_RESTART 0x01234567u
-#define REBOOT_POWER_OFF 0x4321FEDCu
-
-static uint64_t sys_reboot(uint64_t magic1, uint64_t magic2, uint64_t command) {
-    (void)magic2;
-    if ((uint32_t)magic1 != REBOOT_MAGIC1) {
-        return ERR(EINVAL);
-    }
-    if ((uint32_t)command == REBOOT_RESTART) {
-        efi_restart();
-    } else if ((uint32_t)command == REBOOT_POWER_OFF) {
-        efi_power_off();
-    } else {
-        return ERR(EINVAL);
-    }
-    return ERR(EIO);                /* the firmware would not do it */
-}
-
 static uint64_t sys_getpid(uint64_t a, uint64_t b, uint64_t c) {
     (void)a;
     (void)b;
@@ -2138,109 +1784,6 @@ static uint64_t sys_arch_prctl(uint64_t code, uint64_t addr, uint64_t c) {
     }
     wrmsr(MSR_FS_BASE, addr);
     return 0;
-}
-
-/* The console answers what a terminal is asked: its settings, which it
-   keeps, and how wide it is. A file is not a terminal and says so, which is
-   what tells a libc reading a script from one apart from a person typing.
-   Nothing here has process groups, so the questions about those go
-   unanswered - and a shell that asks takes that for "no job control here"
-   and carries on without it. */
-#define TCGETS      0x5401
-#define TCSETS      0x5402
-#define TCSETSW     0x5403      /* once what is queued has been printed */
-#define TCSETSF     0x5404      /* and what was typed thrown away */
-#define TCGETS2     0x802C542Au /* the same four, carrying the line speeds */
-#define TCSETS2     0x402C542Bu
-#define TCSETSW2    0x402C542Cu
-#define TCSETSF2    0x402C542Du
-#define TIOCGWINSZ  0x5413
-/* What a TCGETS hands over, and what the one carrying the line speeds does. */
-#define TERMIOS_OLD 36
-#define TERMIOS_NEW 44
-#define TIOCGPGRP   0x540F      /* which group of programs the keyboard is for */
-#define TIOCSPGRP   0x5410
-#define FIONREAD    0x541B
-#define FIONBIO     0x5421
-
-struct winsize {
-    uint16_t rows, columns, pixel_w, pixel_h;
-};
-
-static uint64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t out) {
-    struct handle *h = handle_of(fd);
-
-    if (h != NULL && h->start == SOCK_MARK && net != NULL && request != FIONBIO) {
-        return net->ioctl(h, request, out);
-    }
-
-    if (h != NULL && (h->start == SOCK_MARK || h->start == PIPE_MARK) && request == FIONBIO) {
-        if (!user_range(out, 4)) {
-            return ERR(EFAULT);
-        }
-        h->offset = *(int32_t *)out != 0 ? h->offset | O_NONBLOCK : h->offset & ~O_NONBLOCK;
-        return 0;
-    }
-    if (!is_console(fd)) {
-        return ERR(ENOTTY);
-    }
-    switch (request) {
-    case TCGETS:
-    case TCGETS2: {
-        size_t size = request == TCGETS ? TERMIOS_OLD : TERMIOS_NEW;
-
-        if (!user_range(out, size)) {
-            return ERR(EFAULT);
-        }
-        console_get((void *)out, size);
-        return 0;
-    }
-    case TCSETS:
-    case TCSETSW:
-    case TCSETSF:
-    case TCSETS2:
-    case TCSETSW2:
-    case TCSETSF2: {
-        size_t size = request < TCGETS2 ? TERMIOS_OLD : TERMIOS_NEW;
-
-        if (!user_range(out, size)) {
-            return ERR(EFAULT);
-        }
-        console_set((const void *)out, size);
-        return 0;
-    }
-    case TIOCGWINSZ: {
-        struct winsize *size = (struct winsize *)out;
-
-        if (!user_range(out, sizeof *size)) {
-            return ERR(EFAULT);
-        }
-        size->rows = (uint16_t)vga_height();
-        size->columns = (uint16_t)vga_width();
-        size->pixel_w = (uint16_t)vga_pixel_width();
-        size->pixel_h = (uint16_t)vga_pixel_height();
-        return 0;
-    }
-    case TIOCGPGRP:
-        /* There is one program, so the keyboard is always its: a shell that
-           is told so keeps its job control rather than complaining its way
-           out of it. */
-        if (!user_range(out, 4)) {
-            return ERR(EFAULT);
-        }
-        *(uint32_t *)out = 1;
-        return 0;
-    case TIOCSPGRP:
-        return 0;               /* handing it to the one group it is already */
-    case FIONREAD:
-        /* Nothing is ever waiting: a key is read when it is asked for. */
-        if (!user_range(out, 4)) {
-            return ERR(EFAULT);
-        }
-        *(uint32_t *)out = 0;
-        return 0;
-    }
-    return ERR(ENOTTY);
 }
 
 /* A read from a given place that leaves the file where it was. */
@@ -2263,43 +1806,6 @@ static uint64_t sys_pread64(uint64_t fd, uint64_t buf, uint64_t count) {
     return got;
 }
 
-/* Whether a file is there. Nothing here has permissions, so being there is
-   the whole of the answer. */
-static uint64_t sys_access(uint64_t path, uint64_t mode, uint64_t c) {
-    struct fs_file file;
-    const char *name = user_string(path);
-
-    (void)mode;
-    (void)c;
-    if (name == NULL) {
-        return ERR(EFAULT);
-    }
-    if (proc_command(name) != NULL || proc_folder(name) || proc_net_name(name) != NULL ||
-        dev_named(name) != 0 || dev_folder(name)) {
-        return 0;
-    }
-    if (fs_stat(name, &file) == 0) {
-        return 0;
-    }
-    return fs_folder_at(name, &(unsigned){ 0 }) == 0 ? 0 : ERR(ENOENT);
-}
-
-static uint64_t sys_faccessat(uint64_t dirfd, uint64_t path, uint64_t mode) {
-    char joined[FS_NAME_LEN];
-    const char *name = at_path(dirfd, user_string(path), joined, sizeof joined);
-    struct fs_file file;
-
-    (void)mode;
-    if (name == NULL) {
-        return ERR(EFAULT);
-    }
-    if (proc_command(name) != NULL || proc_folder(name) || proc_net_name(name) != NULL ||
-        dev_named(name) != 0 || dev_folder(name) || fs_stat(name, &file) == 0) {
-        return 0;
-    }
-    return fs_folder_at(name, &(unsigned){ 0 }) == 0 ? 0 : ERR(ENOENT);
-}
-
 /* Futexes: a thread waits on a word until another wakes it, running the
    others meanwhile (thread.c). One that is alone has nobody to wake it, so
    a wait for ever is answered with "the value changed" - which sends it
@@ -2315,8 +1821,7 @@ static uint64_t sys_faccessat(uint64_t dirfd, uint64_t path, uint64_t mode) {
 #define FUTEX_CMD            0x7F
 #define ETIMEDOUT            110
 
-static uint64_t realtime_ms(void);
-static uint64_t timespec_ms(uint64_t spec);
+uint64_t realtime_ms(void);
 
 static uint64_t futex_wait(uint64_t address, uint64_t op, uint32_t value, uint64_t timeout) {
     uint64_t until = 0;
@@ -2420,17 +1925,6 @@ static uint64_t sys_futex(uint64_t address, uint64_t op, uint64_t value) {
     return ERR(ENOSYS);
 }
 
-/* One processor, and a program may ask which ones it may run on. */
-static uint64_t sys_sched_getaffinity(uint64_t pid, uint64_t size, uint64_t mask) {
-    (void)pid;
-    if (size < 8 || !user_range(mask, 8)) {
-        return ERR(EINVAL);
-    }
-    memset((void *)mask, 0, size < 128 ? size : 128);
-    *(uint8_t *)mask = 1;
-    return 8;
-}
-
 static uint64_t sys_root(uint64_t a, uint64_t b, uint64_t c) {
     (void)a;
     (void)b;
@@ -2447,20 +1941,6 @@ static uint64_t sys_getpgrp(uint64_t a, uint64_t b, uint64_t c) {
     (void)b;
     (void)c;
     return 1;
-}
-
-/* Which user a program is, was, and may go back to being - three copies of
-   the same answer, since everything here is root. */
-static uint64_t sys_getresuid(uint64_t real, uint64_t effective, uint64_t saved) {
-    uint64_t of[3] = { real, effective, saved };
-
-    for (unsigned i = 0; i < 3; i++) {
-        if (!user_range(of[i], 4)) {
-            return ERR(EFAULT);
-        }
-        *(uint32_t *)of[i] = 0;
-    }
-    return 0;
 }
 
 /* The file mode a program's own files would be trimmed by. Nothing here has
@@ -2596,138 +2076,6 @@ static uint64_t sys_pwrite64(uint64_t fd, uint64_t text, uint64_t count) {
     return count;
 }
 
-/* poll, which is select spelled differently: everything but the keyboard
-   is ready at once, and that is waited for as long as it is asked. */
-struct pollfd {
-    int32_t  fd;
-    int16_t  events, revents;
-};
-
-#define POLLIN  0x001
-#define POLLOUT 0x004
-#define POLLERR 0x008
-#define POLLHUP 0x010
-
-static uint64_t poll_once(struct pollfd *p, uint64_t count, bool *sockets) {
-    uint64_t ready = 0;
-
-    for (uint64_t i = 0; i < count; i++) {
-        struct handle *h = handle_of((uint64_t)p[i].fd);
-
-        p[i].revents = 0;
-        if (h == NULL) {
-            continue;
-        }
-        /* Reading the console waits for a key, so it is only ready once one
-           has been typed, and a socket once a packet has come; everything
-           else is there the moment it is asked about. */
-        if (h->start == SOCK_MARK) {
-            unsigned r = net != NULL ? net->ready((int)h->folder) : NET_ERR;
-
-            *sockets = true;
-            p[i].revents = (int16_t)(((p[i].events & POLLIN) && (r & NET_IN) ? POLLIN : 0) |
-                                     ((p[i].events & POLLOUT) && (r & NET_OUT) ? POLLOUT : 0) |
-                                     (r & NET_ERR ? POLLERR : 0) | (r & NET_HUP ? POLLHUP : 0));
-            ready += p[i].revents != 0;
-            continue;
-        }
-        if ((p[i].events & POLLIN) != 0 &&
-            (h->start != PIPE_MARK ||
-             (h->size != PIPE_EVENT && h->size != PIPE_PAIR && h->size != PIPE_READ) ||
-             event_ready(h) || readable(h)) &&
-            (!is_console((uint64_t)p[i].fd) || console_ready())) {
-            p[i].revents |= POLLIN;
-        }
-        if ((p[i].events & POLLOUT) != 0) {
-            p[i].revents |= POLLOUT;
-        }
-        ready += p[i].revents != 0;
-    }
-    return ready;
-}
-
-/* Until something is ready, or wait_ms has gone by; a negative wait is for
-   ever. */
-static uint64_t poll_until(uint64_t fds, uint64_t count, int64_t wait_ms) {
-    struct pollfd *p = (struct pollfd *)fds;
-    int64_t until = (int64_t)efi_uptime_ms() + wait_ms;
-    uint64_t ready;
-    bool sockets = false;
-
-    if (!user_range(fds, count * sizeof *p)) {
-        return ERR(EFAULT);
-    }
-    uint64_t began = wait_began();
-
-    while ((ready = poll_once(p, count, &sockets)) == 0 &&
-           (wait_ms < 0 || (int64_t)efi_uptime_ms() < until)) {
-        if (interrupt_check()) {
-            wait_ended(began);
-            return ERR(EINTR);
-        }
-        thread_yield();
-    }
-    wait_ended(began);
-    return ready;
-}
-
-static uint64_t sys_poll(uint64_t fds, uint64_t count, uint64_t timeout) {
-    return poll_until(fds, count, (int32_t)timeout);
-}
-
-/* ppoll's timeout is a timespec, and no timespec is for ever. */
-static uint64_t sys_ppoll(uint64_t fds, uint64_t count, uint64_t timeout) {
-    const int64_t *spec = (const int64_t *)timeout;
-
-    if (timeout != 0 && !user_range(timeout, 16)) {
-        return ERR(EFAULT);
-    }
-    return poll_until(fds, count, timeout == 0 ? -1 : spec[0] * 1000 + spec[1] / 1000000);
-}
-
-/* Capabilities: root has them all. A program that drops some is told it
-   did. */
-#define CAP_V1 0x19980330u
-#define CAP_V2 0x20071026u
-#define CAP_V3 0x20080522u
-
-static uint64_t sys_capget(uint64_t header, uint64_t data, uint64_t c) {
-    uint32_t *h = (uint32_t *)header;
-
-    (void)c;
-    if (!user_range(header, 8)) {
-        return ERR(EFAULT);
-    }
-    if (h[0] != CAP_V1 && h[0] != CAP_V2 && h[0] != CAP_V3) {
-        h[0] = CAP_V3;
-        return data == 0 ? 0 : ERR(EINVAL);
-    }
-    if (data != 0) {
-        unsigned sets = h[0] == CAP_V1 ? 1 : 2;
-        uint32_t *d = (uint32_t *)data;
-
-        if (!user_range(data, sets * 12)) {
-            return ERR(EFAULT);
-        }
-        for (unsigned i = 0; i < sets; i++) {
-            d[3 * i] = d[3 * i + 1] = 0xFFFFFFFF;   /* effective, permitted */
-            d[3 * i + 2] = 0;                       /* inheritable */
-        }
-    }
-    return 0;
-}
-
-#define PR_CAPBSET_READ 23
-#define CAP_LAST 40
-
-static uint64_t sys_prctl(uint64_t option, uint64_t value, uint64_t c) {
-    (void)c;
-    if (option == PR_CAPBSET_READ) {
-        return value <= CAP_LAST ? 1 : ERR(EINVAL);
-    }
-    return 0;
-}
-
 static uint64_t sys_getrandom(uint64_t buf, uint64_t length, uint64_t flags) {
     uint64_t state = efi_seconds() * 6364136223846793005ull + 1442695040888963407ull;
 
@@ -2773,793 +2121,15 @@ static uint64_t sys_sched_yield(uint64_t a, uint64_t b, uint64_t c) {
     return 0;
 }
 
-/* Resource limits: the stack is the window's top end, and nothing else is
-   limited. new_limit is refused, since nothing here would honour it. */
-#define RLIMIT_NOFILE 7
-
-static uint64_t sys_prlimit64(uint64_t pid, uint64_t resource, uint64_t new_limit) {
-    uint64_t *old = (uint64_t *)arg[3];
-
-    (void)pid;
-    if (new_limit != 0) {
-        return ERR(EINVAL);
-    }
-    if (old != NULL) {
-        if (!user_range(arg[3], 16)) {
-            return ERR(EFAULT);
-        }
-        /* How many files may be open matters: a libc moving a descriptor out
-           of the way puts it just under this, and one told it may have
-           millions would ask for a descriptor this kernel has no room for. */
-        old[0] = resource == RLIMIT_NOFILE ? PROGRAM_FILES
-               : USER_STACK_BYTES;
-        old[1] = (uint64_t)-1;      /* RLIM64_INFINITY */
-    }
-    return 0;
-}
-
-/* Renaming from two folders a program already has open. renameat2's flags -
-   refusing to replace, swapping the two - are not offered: a shell's mv asks
-   for them, finds they are not there, and falls back to asking plainly. */
-static uint64_t sys_renameat(uint64_t olddir, uint64_t oldpath, uint64_t newdir) {
-    char joined[FS_NAME_LEN], kept[FS_NAME_LEN];
-    const char *old_name = at_path(olddir, user_string(oldpath), joined, sizeof joined);
-    const char *new_name;
-
-    if (old_name == NULL || strlen(old_name) + 1 > sizeof kept) {
-        return ERR(EFAULT);
-    }
-    memcpy(kept, old_name, strlen(old_name) + 1);
-    new_name = at_path(newdir, user_string(arg[3]), joined, sizeof joined);
-    if (new_name == NULL) {
-        return ERR(EFAULT);
-    }
-    return fs_errno(fs_rename(kept, new_name));
-}
-
-/* Extended attributes, which this filesystem does not have: what Linux
-   answers for one without them, and ls -l takes in its stride. */
-static uint64_t sys_no_xattr(uint64_t a, uint64_t b, uint64_t c) {
-    (void)a;
-    (void)b;
-    (void)c;
-    return ERR(EOPNOTSUPP);
-}
-
-/* A hard link, or a device node: there are neither here, and a program told
-   so goes on to copy rather than stopping. */
-static uint64_t sys_no_links(uint64_t a, uint64_t b, uint64_t c) {
-    (void)a;
-    (void)b;
-    (void)c;
-    return ERR(EPERM);
-}
-
-/* A FIFO, though, is an empty file that says so in its mode: opened, it is
-   a pipe, the same one for everyone opening it. */
-static uint64_t sys_mknodat(uint64_t dirfd, uint64_t path, uint64_t mode) {
-    char joined[FS_NAME_LEN];
-    const char *name = at_path(dirfd, user_string(path), joined, sizeof joined);
-    struct fs_file file;
-    int err;
-
-    if (name == NULL) {
-        return ERR(EFAULT);
-    }
-    if ((mode & S_IFMT) != S_IFIFO) {
-        return ERR(EPERM);
-    }
-    if (fs_stat(name, &file) == 0) {
-        return ERR(EEXIST);
-    }
-    err = fs_write(name, NULL, 0);
-    if (err == 0) {
-        err = fs_set_mode(name, (unsigned)(S_IFIFO | (mode & 0755)));
-    }
-    return fs_errno(err);
-}
-
-/* Emptying a file by name, which is the only length anything truncates one
-   to here. */
-static uint64_t sys_truncate(uint64_t path, uint64_t length, uint64_t c) {
-    const char *name = user_string(path);
-
-    (void)c;
-    if (name == NULL) {
-        return ERR(EFAULT);
-    }
-    if (length != 0) {
-        return ERR(EINVAL);
-    }
-    return fs_write(name, NULL, 0) < 0 ? ERR(EIO) : 0;
-}
-
-/* Nothing here has a /proc to read a link out of. */
-/* The older pair, which name the resource and the place to put it rather
-   than a process as well. */
-static uint64_t sys_getrlimit(uint64_t resource, uint64_t out, uint64_t c) {
-    uint64_t kept = arg[3];
-    uint64_t result;
-
-    (void)c;
-    arg[3] = out;
-    result = sys_prlimit64(0, resource, 0);
-    arg[3] = kept;
-    return result;
-}
-
-static uint64_t sys_fstatfs(uint64_t fd, uint64_t out, uint64_t c) {
-    (void)c;
-    return handle_of(fd) == NULL ? ERR(EBADF) : statfs_fill(out);
-}
-
-/* ---- symbolic links ------------------------------------------------------
- *
- * A link is a file holding a path, and the filesystem follows it wherever a
- * path is resolved - /bin is one, to usr/bin. These are the calls that make
- * one and read one back, and neither follows the link it is given. */
-
-static uint64_t sys_symlinkat(uint64_t target, uint64_t dirfd, uint64_t path) {
-    char kept[FS_LINK_LEN], joined[FS_NAME_LEN];
-    const char *to = user_string(target);
-    const char *name;
-
-    if (to == NULL || strlen(to) + 1 > sizeof kept) {
-        return ERR(to == NULL ? EFAULT : EINVAL);
-    }
-    strcpy(kept, to);
-    name = at_path(dirfd, user_string(path), joined, sizeof joined);
-    if (name == NULL) {
-        return ERR(EFAULT);
-    }
-    return fs_errno(fs_symlink(kept, name));
-}
-
-static uint64_t sys_symlink(uint64_t target, uint64_t path, uint64_t c) {
-    (void)c;
-    return sys_symlinkat(target, (uint64_t)AT_FDCWD, path);
-}
-
-/* Linux's readlink writes no NUL, and returns how many bytes it did write. */
-static uint64_t sys_readlinkat(uint64_t dirfd, uint64_t path, uint64_t buf) {
-    char joined[FS_NAME_LEN];
-    const char *name = at_path(dirfd, user_string(path), joined, sizeof joined);
-    uint64_t size = arg[3];
-    int got;
-
-    if (name == NULL || !user_range(buf, size)) {
-        return ERR(EFAULT);
-    }
-    got = fs_readlink(name, (char *)buf, size);
-    return got < 0 ? fs_errno(got) : (uint64_t)got;
-}
-
-static uint64_t sys_readlink(uint64_t path, uint64_t buf, uint64_t size) {
-    uint64_t kept = arg[3], result;
-
-    arg[3] = size;
-    result = sys_readlinkat((uint64_t)AT_FDCWD, path, buf);
-    arg[3] = kept;
-    return result;
-}
-
-/* ---- describing files ---------------------------------------------------- */
-
-
-struct stat {
-    uint64_t dev, ino, nlink;
-    uint32_t mode, uid, gid, pad;
-    uint64_t rdev, size;
-    int64_t  blksize, blocks;
-    int64_t  times[6];
-    int64_t  unused[3];
-};
-
-_Static_assert(sizeof(struct stat) == 144, "struct stat is what Linux's is");
-
-/* A file's number, which has to differ from every other file's: a loader
-   decides whether it has already loaded a library by comparing the device
-   and inode of the file against the ones it holds, and would take two
-   different libraries for the same one if they shared a number. The first
-   sector serves, since no two files start in the same place. */
-/* The number a folder is known by, from its entry in the table, counting
-   from one. Nought is the root, which has no entry of its own - so every
-   folder's number is one past its entry's, leaving 1 for the root. A file
-   goes by its first sector instead, and those start far higher than the
-   table has entries, so the two can never collide.
-
-   Getting this wrong is not a small thing: a program walking a tree takes
-   two folders with one number for a loop, and stops. */
-static uint32_t folder_ino(unsigned one_based) {
-    return one_based + 1;
-}
-
 /* A file is numbered the same way, by its table entry: unlike its sectors,
    which move when it grows, that stays put while it is written - and a
    program saving a file checks that it is still the one it opened. */
-static uint32_t file_ino(const char *name, bool follow) {
+uint32_t file_ino(const char *name, bool follow) {
     unsigned index;
 
     return fs_entry(name, follow, &index) == 0 ? folder_ino(index) : 1;
 }
 
-/* Whether a table entry is a folder: the filesystem spells one with a slash
-   on the end, and gives it no first sector - so the entry alone cannot be
-   told from an empty file without looking at the name. */
-static bool is_folder_entry(const struct fs_file *file) {
-    size_t n = strlen(file->name);
-
-    return n > 0 && file->name[n - 1] == '/';
-}
-
-/* A folder's permission bits, by its number: 0755 unless it was given
-   others. */
-static unsigned folder_mode(uint64_t ino) {
-    struct fs_file entry;
-
-    return ino > 1 && ino < PROC_INO && fs_file(ino - 2, &entry) == 0 &&
-           (entry.start & FS_MODE) != 0 ? entry.start & 07777 : 0755;
-}
-
-static void fill_stat(struct stat *out, uint64_t size, bool folder, uint32_t start) {
-    memset(out, 0, sizeof *out);
-    out->dev = 1;
-    out->ino = start != 0 ? start : 1;
-    out->nlink = 1;
-    out->mode = (folder ? S_IFDIR | folder_mode(out->ino) : S_IFREG | 0644);
-    out->size = size;
-    out->blksize = SECTOR_SIZE;
-    out->blocks = (int64_t)((size + 511) / 512);
-}
-
-/* What a descriptor is, for whoever is asking: fstat, and a statx of an
-   empty path, which is what a libc's fstat has become. */
-static uint64_t stat_of_handle(uint64_t fd, struct stat *st) {
-    struct handle *h = handle_of(fd);
-
-    if (h == NULL) {
-        return ERR(EBADF);
-    }
-    /* A folder is numbered by its table entry, one-based - the same number
-       getdents64 and newfstatat give it, so that a program walking a tree
-       can tell one folder from another. */
-    fill_stat(st, h->size, h->start == FOLDER_MARK || h->start == PROCDIR_MARK,
-              h->start == FOLDER_MARK ? folder_ino(h->folder) :
-              h->start == PROC_MARK ? PROC_INO + h->folder :
-              h->start == PROCDIR_MARK ? PROC_INO :
-              h->start == WRITE_MARK ? file_ino(writer_names[h->writer - 1], true) :
-              h->start < FIRST_MARK && h->folder != 0 ? folder_ino(h->folder) : h->start);
-    if (h->start == CONSOLE_MARK) {
-        /* Not a file at all: a program told this is a regular file reads it
-           as one, all at once and to its end. */
-        st->mode = S_IFCHR | 0620;
-        st->size = 0;
-        st->blocks = 0;
-        st->rdev = 0x0500 | fd;     /* a terminal, as Linux numbers them */
-    } else if (h->start == PIPE_MARK) {
-        struct pipe *p = pipe_of(h);
-
-        st->mode = h->size == PIPE_FILE ? S_IFREG | 0444 :
-                   h->size == PIPE_PAIR ? S_IFSOCK | 0777 : S_IFIFO | 0600;
-        st->size = p == NULL ? 0 : pipe_left(p);
-        st->blocks = 0;
-    } else if (h->start == SOCK_MARK) {
-        st->mode = S_IFSOCK | 0777;
-        st->size = 0;
-        st->blocks = 0;
-    } else if (h->start == DEV_MARK) {
-        st->mode = S_IFCHR | 0666;
-        st->size = 0;
-        st->blocks = 0;
-        st->rdev = 0x0103;
-    }
-    return 0;
-}
-
-static uint64_t sys_fstat(uint64_t fd, uint64_t out, uint64_t c) {
-    (void)c;
-    if (!user_range(out, sizeof(struct stat))) {
-        return ERR(EFAULT);
-    }
-    return stat_of_handle(fd, (struct stat *)out);
-}
-
-/* The newer stat, which takes the same answers in a different shape. */
-struct statx_timestamp {
-    int64_t  seconds;
-    uint32_t nanoseconds, pad;
-};
-
-struct statx {
-    uint32_t mask, blksize;
-    uint64_t attributes;
-    uint32_t nlink, uid, gid;
-    uint16_t mode, pad;
-    uint64_t ino, size, blocks, attributes_mask;
-    struct statx_timestamp atime, btime, ctime, mtime;
-    uint32_t rdev_major, rdev_minor, dev_major, dev_minor;
-    uint64_t rest[14];
-};
-
-#define STATX_BASIC 0x7ff
-
-static uint64_t sys_statx(uint64_t dirfd, uint64_t path, uint64_t flags) {
-    struct statx *out = (struct statx *)arg[4];
-    char joined[FS_NAME_LEN];
-    const char *given = user_string(path);
-    const char *name = at_path(dirfd, given, joined, sizeof joined);
-    struct fs_file file;
-    bool folder = false;
-
-    if (name == NULL || !user_range(arg[4], sizeof *out)) {
-        return ERR(EINVAL);
-    }
-    /* An empty path is the descriptor itself - which is what a libc's fstat
-       has become, so this is the common case rather than a corner of one. */
-    if (given != NULL && given[0] == '\0') {
-        struct stat st;
-        uint64_t err = stat_of_handle(dirfd, &st);
-
-        if ((int64_t)err < 0) {
-            return err;
-        }
-        memset(out, 0, sizeof *out);
-        out->mask = STATX_BASIC;
-        out->blksize = (uint32_t)st.blksize;
-        out->nlink = 1;
-        out->mode = st.mode;
-        out->ino = st.ino;
-        out->size = st.size;
-        out->blocks = (uint64_t)st.blocks;
-        out->rdev_minor = (uint32_t)(st.rdev & 0xFF);
-        out->dev_minor = 1;
-        return 0;
-    }
-    const struct proc_cmd *cmd = proc_command(name);
-    enum dev which = dev_named(name);
-
-    if (cmd != NULL || proc_folder(name) || which != 0 || dev_folder(name)) {
-        memset(out, 0, sizeof *out);
-        out->mask = STATX_BASIC;
-        out->blksize = SECTOR_SIZE;
-        out->nlink = 1;
-        out->mode = (uint16_t)(which != 0 ? S_IFCHR | 0666 :
-                               cmd != NULL ? S_IFREG | 0755 : S_IFDIR | 0755);
-        out->ino = PROC_INO;
-        out->size = cmd != NULL ? proc_read(cmd, 0, NULL, 0) : 0;
-        out->dev_minor = 1;
-        return 0;
-    }
-    if ((flags & AT_SYMLINK_NOFOLLOW) != 0 && fs_lstat(name, &file) == 0 &&
-        (file.size & FS_LINK) != 0) {
-        memset(out, 0, sizeof *out);
-        out->mask = STATX_BASIC;
-        out->blksize = SECTOR_SIZE;
-        out->nlink = 1;
-        out->mode = S_IFLNK | 0777;
-        out->ino = file_ino(name, false);
-        out->size = file.size & ~FS_LINK;
-        out->blocks = 1;
-        out->dev_minor = 1;
-        return 0;
-    }
-    int err = fs_stat(name, &file);
-
-    if (err != 0 || is_folder_entry(&file)) {
-        unsigned index = 0;
-
-        if (err == FS_ELOOP) {
-            return ERR(ELOOP);
-        }
-        if (fs_folder_at(name, &index) != 0) {
-            return ERR(ENOENT);
-        }
-        file = (struct fs_file){ .start = folder_ino(index) };
-        folder = true;
-    }
-    memset(out, 0, sizeof *out);
-    out->mask = STATX_BASIC;
-    out->blksize = SECTOR_SIZE;
-    out->nlink = 1;
-    out->mode = (uint16_t)(folder ? S_IFDIR | folder_mode(file.start) :
-                           is_fifo(&file) ? file.start : S_IFREG | 0644);
-    out->ino = folder ? file.start : file_ino(name, true);
-    out->size = folder ? 0 : file.size;
-    out->blocks = (file.size + 511) / 512;
-    out->dev_minor = 1;
-    return 0;
-}
-
-static uint64_t sys_newfstatat(uint64_t dirfd, uint64_t path, uint64_t out) {
-    struct fs_file file;
-    char joined[FS_NAME_LEN];
-    const char *name = at_path(dirfd, user_string(path), joined, sizeof joined);
-
-    if (name == NULL || !user_range(out, sizeof(struct stat))) {
-        return ERR(EFAULT);
-    }
-    /* An empty name with AT_EMPTY_PATH is the descriptor itself. */
-    if (name[0] == '\0') {
-        return sys_fstat(dirfd, out, 0);
-    }
-    const struct proc_cmd *cmd = proc_command(name);
-
-    if (cmd != NULL) {
-        fill_stat((struct stat *)out, proc_read(cmd, 0, NULL, 0), false,
-                  PROC_INO + 1);
-        ((struct stat *)out)->mode = S_IFREG | 0755;    /* it is run, not read */
-        return 0;
-    }
-    if (proc_folder(name)) {
-        fill_stat((struct stat *)out, 0, true, PROC_INO);
-        return 0;
-    }
-    if (proc_net_name(name) != NULL) {
-        fill_stat((struct stat *)out, 0, false, PROC_INO + 2);
-        ((struct stat *)out)->mode = S_IFREG | 0444;
-        return 0;
-    }
-    if (dev_named(name) != 0) {
-        fill_stat((struct stat *)out, 0, false, PROC_INO);
-        ((struct stat *)out)->mode = S_IFCHR | 0666;
-        ((struct stat *)out)->rdev = 0x0103;     /* what Linux calls /dev/null */
-        return 0;
-    }
-    if (dev_folder(name)) {
-        fill_stat((struct stat *)out, 0, true, PROC_INO);
-        return 0;
-    }
-    if ((arg[3] & AT_SYMLINK_NOFOLLOW) != 0 && fs_lstat(name, &file) == 0 &&
-        (file.size & FS_LINK) != 0) {
-        fill_stat((struct stat *)out, file.size & ~FS_LINK, false, file_ino(name, false));
-        ((struct stat *)out)->mode = S_IFLNK | 0777;
-        return 0;
-    }
-    int err = fs_stat(name, &file);
-
-    if (err == 0 && !is_folder_entry(&file)) {
-        fill_stat((struct stat *)out, file.size, false, file_ino(name, true));
-        if (is_fifo(&file)) {
-            ((struct stat *)out)->mode = file.start & 0177777;
-        }
-        return 0;
-    }
-    if (err == FS_ELOOP) {
-        return ERR(ELOOP);
-    }
-    /* Not a file: a folder, which the filesystem knows by its own spelling -
-       and which is how the root, having no entry of its own, is one. */
-    unsigned folder = 0;
-
-    if (fs_folder_at(name, &folder) != 0) {
-        /* Nothing of that name. -1 on its own is EPERM, and a program told
-           that reports the file as one it is not allowed to read rather than
-           one that is not there. */
-        return ERR(ENOENT);
-    }
-    /* Its table entry, one-based, which is the number getdents64 gives it
-       too: a program walking a tree compares the two, and one that cannot
-       tell two folders apart takes the second for a loop and stops. */
-    fill_stat((struct stat *)out, 0, true, folder_ino(folder));
-    return 0;
-}
-
-/* The older pair, which name a file rather than a descriptor and a name, and
-   differ only in whether a link at the end is followed. */
-static uint64_t stat_flags(uint64_t path, uint64_t out, uint64_t flags) {
-    uint64_t kept = arg[3], result;
-
-    arg[3] = flags;
-    result = sys_newfstatat((uint64_t)AT_FDCWD, path, out);
-    arg[3] = kept;
-    return result;
-}
-
-static uint64_t sys_stat(uint64_t path, uint64_t out, uint64_t c) {
-    (void)c;
-    return stat_flags(path, out, 0);
-}
-
-static uint64_t sys_lstat(uint64_t path, uint64_t out, uint64_t c) {
-    (void)c;
-    return stat_flags(path, out, AT_SYMLINK_NOFOLLOW);
-}
-
-/* ---- what is in a folder -------------------------------------------------
- *
- * The table holds whole paths, so a folder is read by walking every entry
- * and keeping the ones that lie directly inside it. The descriptor remembers
- * how far the walk got, which is what makes repeated calls pick up where the
- * last left off, as Linux's do. */
-
-#define DT_CHR 2
-#define DT_DIR 4
-#define DT_REG 8
-#define DT_LNK 10
-
-struct dirent64 {
-    uint64_t ino;
-    int64_t  off;
-    uint16_t reclen;
-    uint8_t  type;
-    char     name[];
-};
-
-/* /ctl, which holds one entry per built-in command and nothing else. */
-static uint64_t proc_dents(struct handle *h, uint64_t buf, uint64_t count) {
-    uint64_t used = 0;
-
-    for (const struct proc_cmd *cmd; (cmd = proc_at(h->offset)) != NULL; h->offset++) {
-        size_t length = strlen(cmd->name);
-        uint64_t reclen = (sizeof(struct dirent64) + length + 1 + 7) & ~7ull;
-
-        if (used + reclen > count) {
-            break;                  /* the rest waits for the next call */
-        }
-        struct dirent64 *out = (struct dirent64 *)(buf + used);
-
-        out->ino = PROC_INO + h->offset + 1;
-        out->off = (int64_t)(h->offset + 1);
-        out->reclen = (uint16_t)reclen;
-        out->type = DT_REG;
-        memcpy(out->name, cmd->name, length + 1);
-        used += reclen;
-    }
-    return used;
-}
-
-/* /dev, from its table: names as the folder shows them, without "/dev/". */
-static uint64_t dev_dents(struct handle *h, uint64_t buf, uint64_t count) {
-    uint64_t used = 0;
-
-    for (; h->offset < DEVICES; h->offset++) {
-        const char *name = devices[h->offset].name + sizeof "/dev/" - 1;
-        size_t length = strlen(name);
-        uint64_t reclen = (sizeof(struct dirent64) + length + 1 + 7) & ~7ull;
-
-        if (used + reclen > count) {
-            break;                  /* the rest waits for the next call */
-        }
-        struct dirent64 *out = (struct dirent64 *)(buf + used);
-
-        out->ino = DEV_INO + h->offset + 1;
-        out->off = (int64_t)(h->offset + 1);
-        out->reclen = (uint16_t)reclen;
-        out->type = DT_CHR;
-        memcpy(out->name, name, length + 1);
-        used += reclen;
-    }
-    return used;
-}
-
-static uint64_t sys_getdents64(uint64_t fd, uint64_t buf, uint64_t count) {
-    struct handle *h = handle_of(fd);
-    struct fs_file folder, entry;
-    uint64_t used = 0;
-
-    if (h == NULL || !user_range(buf, count)) {
-        return ERR(h == NULL ? EBADF : EFAULT);
-    }
-    if (h->start == PROCDIR_MARK) {
-        return h->folder != 0 ? dev_dents(h, buf, count) : proc_dents(h, buf, count);
-    }
-    if (h->start != FOLDER_MARK) {
-        return ERR(ENOTDIR);
-    }
-    if (h->folder == 0) {
-        folder.name[0] = '\0';      /* the root, which has no entry */
-    } else if (fs_file(h->folder - 1, &folder) != 0) {
-        return ERR(EBADF);
-    }
-    for (;;) {
-        size_t next = h->offset, index;
-
-        if (fs_list(folder.name, &next, &entry, &index) != 0) {
-            break;
-        }
-        const char *leaf = fs_inside(folder.name, entry.name);
-        size_t length = strlen(leaf);
-        bool is_folder = leaf[length - 1] == '/';
-        uint64_t reclen = (sizeof(struct dirent64) + length + 1 + 7) & ~7ull;
-
-        if (used + reclen > count) {
-            break;                  /* the rest waits for the next call */
-        }
-        struct dirent64 *out = (struct dirent64 *)(buf + used);
-        out->ino = folder_ino((unsigned)index + 1);    /* a file's as a folder's */
-        out->off = (int64_t)next;
-        out->reclen = (uint16_t)reclen;
-        out->type = is_folder ? DT_DIR : (entry.size & FS_LINK) != 0 ? DT_LNK : DT_REG;
-        memcpy(out->name, leaf, length);
-        out->name[is_folder ? length - 1 : length] = '\0';
-
-        used += reclen;
-        h->offset = (uint32_t)next;
-    }
-    return used;
-}
-
-/* ---- the machine, and the time ------------------------------------------- */
-
-/* What Linux tells a program about the machine as a whole. Only the figures
-   this machine actually has are filled in - how long it has been up, and how
-   much RAM there is and is left - which is what anything asking wants. */
-struct sysinfo {
-    int64_t  uptime;
-    uint64_t loads[3];
-    uint64_t totalram, freeram, sharedram, bufferram;
-    uint64_t totalswap, freeswap;
-    uint16_t procs, pad;
-    uint64_t totalhigh, freehigh;
-    uint32_t unit;
-    char     spare[4];
-};
-
-_Static_assert(sizeof(struct sysinfo) == 112, "struct sysinfo is what Linux's is");
-
-static uint64_t sys_sysinfo(uint64_t out, uint64_t b, uint64_t c) {
-    struct sysinfo *info = (struct sysinfo *)out;
-    struct mem_stats m;
-
-    (void)b;
-    (void)c;
-    if (!user_range(out, sizeof *info)) {
-        return ERR(EFAULT);
-    }
-    mem_get_stats(&m);
-    memset(info, 0, sizeof *info);
-    info->uptime = (int64_t)(efi_uptime_ms() / 1000);
-    info->totalram = (uint64_t)m.total_kib * 1024;
-    info->freeram = (uint64_t)m.free_kib * 1024;
-    info->procs = 1;
-    info->unit = 1;
-    return 0;
-}
-
-static uint64_t sys_uname(uint64_t out, uint64_t b, uint64_t c) {
-    static const char *const fields[] = { "Tuxlet", "tuxlet", "1", "1", "x86_64", "" };
-    char *field = (char *)out;
-
-    (void)b;
-    (void)c;
-    if (!user_range(out, 6 * 65)) {
-        return ERR(EFAULT);
-    }
-    for (unsigned i = 0; i < 6; i++, field += 65) {
-        memset(field, 0, 65);
-        memcpy(field, fields[i], strlen(fields[i]));
-    }
-    return 0;
-}
-
-/* CLOCK_MONOTONIC and its kin count from when the machine started; the rest
-   count from 1970. Seconds is all the firmware's clock offers either way,
-   except for the monotonic ones, where the loader's own millisecond count
-   can do better. */
-
-static uint64_t sys_clock_gettime(uint64_t clock, uint64_t out, uint64_t c) {
-    int64_t *spec = (int64_t *)out;
-
-    (void)c;
-    if (!user_range(out, 16)) {
-        return ERR(EFAULT);
-    }
-    /* The realtime ones - REALTIME, its coarse twin, TAI - count from 1970;
-       the CPU-time ones, what the program has used; the rest - MONOTONIC,
-       BOOTTIME and their variants - from boot. */
-    uint64_t us = clock == 0 || clock == 5 || clock == 11 ? realtime_us()
-                : clock == 2 || clock == 3 ? self_us()
-                : efi_uptime_us();
-
-    spec[0] = (int64_t)(us / 1000000);
-    spec[1] = (int64_t)(us % 1000000) * 1000;
-    return 0;
-}
-
-/* Every clock counts in microseconds. The timespec may be NULL. */
-static uint64_t sys_clock_getres(uint64_t clock, uint64_t out, uint64_t c) {
-    (void)clock;
-    (void)c;
-    if (out == 0) {
-        return 0;
-    }
-    if (!user_range(out, 16)) {
-        return ERR(EFAULT);
-    }
-    ((int64_t *)out)[0] = 0;
-    ((int64_t *)out)[1] = 1000;
-    return 0;
-}
-
-/* The time of day, in seconds since 1970 - the firmware's clock, which is
-   all there is. gettimeofday takes a timezone as well, and is handed the
-   one everything here keeps: none at all. */
-static uint64_t sys_gettimeofday(uint64_t tv, uint64_t tz, uint64_t c) {
-    int64_t *out = (int64_t *)tv;
-
-    (void)tz;
-    (void)c;
-    if (tv == 0) {
-        return 0;
-    }
-    if (!user_range(tv, 16)) {
-        return ERR(EFAULT);
-    }
-    uint64_t us = realtime_us();
-
-    out[0] = (int64_t)(us / 1000000);
-    out[1] = (int64_t)(us % 1000000);
-    return 0;
-}
-
-/* Waits until the clock reaches until_ms. There is nothing else to run, so
-   the waiting is the whole of it. */
-static void sleep_until(uint64_t until_ms) {
-    uint64_t began = wait_began();
-
-    while (efi_uptime_ms() < until_ms && !interrupt_check()) {
-        thread_yield();
-        __asm__ volatile("pause");
-    }
-    wait_ended(began);
-}
-
-static uint64_t timespec_ms(uint64_t spec) {
-    const int64_t *t = (const int64_t *)spec;
-
-    return (uint64_t)t[0] * 1000 + (uint64_t)(t[1] + 999999) / 1000000;
-}
-
-static uint64_t sys_nanosleep(uint64_t req, uint64_t rem, uint64_t c) {
-    (void)c;
-    if (!user_range(req, 16) || (rem != 0 && !user_range(rem, 16))) {
-        return ERR(EFAULT);
-    }
-    sleep_until(efi_uptime_ms() + timespec_ms(req));
-    if (rem != 0) {
-        memset((void *)rem, 0, 16);
-    }
-    return deliverable() != 0 ? ERR(EINTR) : 0;    /* cut short by a signal */
-}
-
-#define TIMER_ABSTIME 1
-
-/* The same, on a named clock, and with TIMER_ABSTIME until a time on it
-   rather than for a while. */
-static uint64_t sys_clock_nanosleep(uint64_t clock, uint64_t flags, uint64_t req) {
-    uint64_t rem = arg[3];
-    uint64_t want;
-
-    if (!user_range(req, 16) || (rem != 0 && !user_range(rem, 16))) {
-        return ERR(EFAULT);
-    }
-    want = timespec_ms(req);
-    if (flags & TIMER_ABSTIME) {
-        uint64_t now = clock == 0 || clock == 5 || clock == 11 ? realtime_ms()
-                     : efi_uptime_ms();
-
-        want = want > now ? want - now : 0;
-    }
-    sleep_until(efi_uptime_ms() + want);
-    if (rem != 0) {
-        memset((void *)rem, 0, 16);
-    }
-    return deliverable() != 0 ? ERR(EINTR) : 0;    /* cut short by a signal */
-}
-
-static uint64_t sys_time(uint64_t out, uint64_t b, uint64_t c) {
-    int64_t now = (int64_t)(realtime_ms() / 1000);
-
-    (void)b;
-    (void)c;
-    if (out != 0) {
-        if (!user_range(out, 8)) {
-            return ERR(EFAULT);
-        }
-        *(int64_t *)out = now;
-    }
-    return (uint64_t)now;
-}
 
 /* ---- descriptors and exceptions ------------------------------------------
  *
@@ -3722,77 +2292,42 @@ static const uint16_t numbers[] = {
     SYS_WRITE,
     SYS_OPEN,
     SYS_CLOSE,
-    SYS_FSTAT,
     SYS_LSEEK,
     SYS_MMAP,
     SYS_MPROTECT,
     SYS_MUNMAP,
     SYS_BRK,
-    SYS_IOCTL,
     SYS_WRITEV,
     SYS_GETPID,
-    SYS_UNAME,
-    SYS_SYSINFO,
     SYS_SCHED_YIELD,
     SYS_MADVISE,
-    SYS_GETRUSAGE,
-    SYS_TIMES,
-    SYS_UTIMENSAT,
-    SYS_UTIMES,
-    SYS_FUTIMESAT,
-    SYS_CHMOD,
-    SYS_FCHMOD,
-    SYS_FCHMODAT,
-    SYS_CHOWN,
-    SYS_FCHOWN,
-    SYS_LCHOWN,
-    SYS_FCHOWNAT,
     SYS_FSYNC,
     SYS_FDATASYNC,
     SYS_SYNC,
-    SYS_FADVISE64,
-    SYS_CLOCK_NANOSLEEP,
     SYS_RT_SIGSUSPEND,
     SYS_KILL,
     SYS_TGKILL,
     SYS_GETTID,
     SYS_GETCWD,
     SYS_ARCH_PRCTL,
-    SYS_GETDENTS64,
     SYS_SET_TID_ADDRESS,
     SYS_GETRANDOM,
     SYS_SET_ROBUST_LIST,
-    SYS_PRLIMIT64,
-    SYS_READLINKAT,
-    SYS_CLOCK_GETTIME,
-    SYS_CLOCK_GETRES,
     SYS_PREAD64,
     SYS_UNLINK,
     SYS_RMDIR,
     SYS_MKDIR,
-    SYS_RENAME,
-    SYS_STATFS,
-    SYS_REBOOT,
-    SYS_ACCESS,
-    SYS_FACCESSAT,
-    SYS_FACCESSAT2,
-    SYS_STATX,
     SYS_FCNTL,
     SYS_FUTEX,
-    SYS_SCHED_GETAFFINITY,
     SYS_GETUID,
     SYS_GETGID,
     SYS_GETEUID,
     SYS_GETEGID,
     SYS_RT_SIGACTION,
     SYS_RT_SIGPROCMASK,
-    SYS_NANOSLEEP,
     SYS_EXIT,
     SYS_EXIT_GROUP,
     SYS_OPENAT,
-    SYS_NEWFSTATAT,
-    SYS_STAT,
-    SYS_LSTAT,
     SYS_CHDIR,
     SYS_FCHDIR,
     SYS_DUP,
@@ -3800,19 +2335,12 @@ static const uint16_t numbers[] = {
     SYS_DUP3,
     SYS_FTRUNCATE,
     SYS_UMASK,
-    SYS_GETTIMEOFDAY,
-    SYS_TIME,
     SYS_GETPPID,
     SYS_GETPGRP,
     SYS_GETPGID,
     SYS_SETPGID,
     SYS_SETSID,
-    SYS_READLINK,
     SYS_SIGALTSTACK,
-    SYS_GETRESUID,
-    SYS_GETRESGID,
-    SYS_SELECT,
-    SYS_PSELECT6,
     SYS_FORK,
     SYS_VFORK,
     SYS_CLONE,
@@ -3831,40 +2359,9 @@ static const uint16_t numbers[] = {
     SYS_EVENTFD2,
     SYS_UNLINKAT,
     SYS_MKDIRAT,
-    SYS_RENAMEAT,
-    SYS_RENAMEAT2,
-    SYS_LINKAT,
-    SYS_SYMLINKAT,
-    SYS_LINK,
-    SYS_SYMLINK,
-    SYS_MKNODAT,
-    SYS_TRUNCATE,
     SYS_READV,
     SYS_PWRITE64,
-    SYS_POLL,
-    SYS_PPOLL,
-    SYS_FSTATFS,
-    SYS_GETRLIMIT,
-    SYS_SETRLIMIT,
-    SYS_FLOCK,
-    SYS_FALLOCATE,
-    SYS_MSYNC,
     SYS_SYNCFS,
-    SYS_GETCPU,
-    SYS_GETGROUPS,
-    SYS_SCHED_GETSCHEDULER,
-    SYS_SCHED_SETSCHEDULER,
-    SYS_SCHED_GETPARAM,
-    SYS_GETPRIORITY,
-    SYS_SETPRIORITY,
-    SYS_CAPGET,
-    SYS_CAPSET,
-    SYS_PRCTL,
-    SYS_SETUID,
-    SYS_SETGID,
-    SYS_SETRESUID,
-    SYS_SETRESGID,
-    SYS_SETGROUPS,
     SYS_SOCKETPAIR,
     SYS_RT_SIGRETURN,
 };
@@ -3874,77 +2371,42 @@ static const syscall_fn handlers[] = {
     sys_write,
     sys_open,
     sys_close,
-    sys_fstat,
     sys_lseek,
     sys_mmap,
     sys_ok,
     sys_munmap,
     sys_brk,
-    sys_ioctl,
     sys_writev,
     sys_getpid,
-    sys_uname,
-    sys_sysinfo,
     sys_sched_yield,
     sys_ok,
-    sys_getrusage,
-    sys_times,
-    sys_ok,
-    sys_ok,
-    sys_ok,
-    sys_ok,
-    sys_ok,
-    sys_ok,
-    sys_ok,
-    sys_ok,
-    sys_ok,
-    sys_ok,
     sys_sync,
     sys_sync,
     sys_sync,
-    sys_ok,
-    sys_clock_nanosleep,
     sys_ok,
     sys_kill,
     sys_tgkill,
     sys_gettid,
     sys_getcwd,
     sys_arch_prctl,
-    sys_getdents64,
     sys_set_tid_address,
     sys_getrandom,
     sys_set_robust_list,
-    sys_prlimit64,
-    sys_readlinkat,
-    sys_clock_gettime,
-    sys_clock_getres,
     sys_pread64,
     sys_unlink,
     sys_unlink,
     sys_mkdir,
-    sys_rename,
-    sys_statfs,
-    sys_reboot,
-    sys_access,
-    sys_faccessat,
-    sys_faccessat,
-    sys_statx,
     sys_fcntl,
     sys_futex,
-    sys_sched_getaffinity,
     sys_root,
     sys_root,
     sys_root,
     sys_root,
     sys_rt_sigaction,
     sys_rt_sigprocmask,
-    sys_nanosleep,
     sys_exit,
     sys_exit_group,
     sys_openat,
-    sys_newfstatat,
-    sys_stat,
-    sys_lstat,
     sys_chdir,
     sys_fchdir,
     sys_dup,
@@ -3952,19 +2414,12 @@ static const syscall_fn handlers[] = {
     sys_dup2,
     sys_ftruncate,
     sys_umask,
-    sys_gettimeofday,
-    sys_time,
     sys_root,
     sys_getpgrp,
     sys_getpgrp,
     sys_ok,
     sys_getpgrp,
-    sys_readlink,
     sys_ok,
-    sys_getresuid,
-    sys_getresuid,
-    sys_select,
-    sys_pselect6,
     sys_fork,
     sys_fork,
     sys_clone,
@@ -3983,40 +2438,9 @@ static const syscall_fn handlers[] = {
     sys_eventfd2,
     sys_unlinkat,
     sys_mkdirat,
-    sys_renameat,
-    sys_renameat,
-    sys_no_links,
-    sys_symlinkat,
-    sys_no_links,
-    sys_symlink,
-    sys_mknodat,
-    sys_truncate,
     sys_readv,
     sys_pwrite64,
-    sys_poll,
-    sys_ppoll,
-    sys_fstatfs,
-    sys_getrlimit,
-    sys_ok,
-    sys_ok,
-    sys_ok,
-    sys_ok,
     sys_sync,
-    sys_zeroed,
-    sys_root,
-    sys_root,
-    sys_ok,
-    sys_zeroed,
-    sys_root,
-    sys_ok,
-    sys_capget,
-    sys_ok,
-    sys_prctl,
-    sys_ok,
-    sys_ok,
-    sys_ok,
-    sys_ok,
-    sys_ok,
     sys_socketpair,
     sys_rt_sigreturn,
 };
@@ -4043,9 +2467,6 @@ void syscall_init(void) {
 
 /* The handler for a number, or NULL. */
 static syscall_fn handler_for(uint64_t number) {
-    if (number >= SYS_SETXATTR && number <= SYS_FREMOVEXATTR) {
-        return sys_no_xattr;        /* all twelve of them, one answer */
-    }
     if (number < LOW_NUMBERS) {
         return low[number] != 0 ? handlers[low[number] - 1] : NULL;
     }
@@ -4058,6 +2479,16 @@ static syscall_fn handler_for(uint64_t number) {
 }
 
 static unsigned calls;              /* syscalls made, for the look at Ctrl-C */
+
+/* compat/linux's calls, while it is in. The kernel loads it at the first
+   call that is its, and drops it once no program is running - unless it
+   was enabled by hand, which is then whoever enabled it's to undo. */
+static syscall_fn (*linux_find)(uint64_t number);
+static bool linux_ours;             /* the kernel loaded it, or tried to */
+
+void linux_register(syscall_fn (*find)(uint64_t number)) {
+    linux_find = find;
+}
 
 /* Called by syscall_entry. Every call is recorded on the way through,
    including the numbers this kernel has no handler for. */
@@ -4081,6 +2512,13 @@ uint64_t syscall_dispatch(uint64_t a, uint64_t b, uint64_t c,
 
     if (handler == NULL && net != NULL) {
         handler = net->syscall(number);     /* the socket calls are the module's */
+    }
+    if (handler == NULL && linux_find == NULL && !linux_ours) {
+        linux_ours = true;
+        module_need(LINUX_MODULE);
+    }
+    if (handler == NULL && linux_find != NULL) {
+        handler = linux_find(number);
     }
 
     if (handler != NULL) {
@@ -5311,6 +3749,10 @@ int program_start(const char *path, unsigned argc, const char *const *argv,
         err = program_run(entry, argc, argv, envc, envv, true);
     }
     mem_free(w);
+    if (linux_ours && !program_running()) {
+        module_drop(LINUX_MODULE);
+        linux_ours = false;
+    }
     return err;
 }
 
