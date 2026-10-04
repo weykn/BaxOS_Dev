@@ -459,7 +459,8 @@ int vga_start(struct boot_info *info) {
     /* The screen is already up - the loader saw to that - so this cannot
        fail the way setting a mode could. Finding the protocol again is only
        so that the mode can be changed later. */
-    if (EFI_ERROR(info->system->boot->locate_protocol(&gop_guid, NULL, (void **)&gop))) {
+    if (info->system == NULL ||
+        EFI_ERROR(info->system->boot->locate_protocol(&gop_guid, NULL, (void **)&gop))) {
         gop = NULL;
     }
     /* The firmware's own record of the mode is fresher than the loader's. */

@@ -80,12 +80,18 @@ static bool is_ps2(efi_handle handle) {
    was one, which is the only trustworthy sign the controller exists at all:
    on a machine without one the ports read back as all ones. */
 static bool stop_firmware(void) {
-    struct efi_boot_services *bs = efi_boot()->system->boot;
+    struct efi_boot_services *bs;
     struct efi_guid guid = EFI_SIMPLE_TEXT_INPUT_GUID;
     efi_handle *handles;
     efi_uintn count = 0;
     bool found = false;
 
+    /* A BIOS drives it from interrupts the kernel never takes, so there is
+       nothing to stop: the controller is there if its port answers. */
+    if (efi_boot()->system == NULL) {
+        return inb(PS2_STATUS) != 0xFF;
+    }
+    bs = efi_boot()->system->boot;
     if (EFI_ERROR(bs->locate_handle_buffer(2 /* by protocol */, &guid, NULL,
                                            &count, &handles))) {
         return false;
@@ -343,15 +349,15 @@ static char ps2_key(void) {
 static const struct keyboard_driver driver = { ps2_init, ps2_key };
 
 MODULE_EXPORT int module_init(void) {
-    keyboard_register(&driver);
+    keyboard_register(&driver, true);
     return 0;
 }
 
 /* Once it has the keyboard, nothing else is reading it. */
 MODULE_EXPORT int module_exit(void) {
-    if (present && mem_ours()) {
+    if (present && efi_gone()) {
         return -EBUSY;
     }
-    keyboard_register(NULL);
+    keyboard_register(&driver, false);
     return 0;
 }

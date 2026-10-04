@@ -14,6 +14,7 @@
 #include "keyboard.h"
 #include "driver.h"
 #include "vga.h"
+#include "bios.h"
 
 /* The kernel's side of the firmware.
  *
@@ -37,6 +38,19 @@ static uint64_t         disk_base;  /* where the partition starts, once a disk
 
 const struct disk_driver *disk_driver;
 
+/* Whether the firmware has been let go (efi_leave): from then on only the
+   modules' drivers are asked. */
+static bool gone;
+
+bool efi_gone(void) {
+    return gone;
+}
+
+/* A machine started by a BIOS rather than UEFI: bios.c answers instead. */
+static bool bios(void) {
+    return boot->system == NULL;
+}
+
 /* A disk module takes the disk over the moment it registers, firmware or no
    firmware: a firmware read costs ten milliseconds, one of ours a few
    microseconds, and everything the boot does after the first module - the
@@ -44,17 +58,74 @@ const struct disk_driver *disk_driver;
    only touches the controller when it is called, and it is not called
    again. Taking the module away before the firmware is gone hands the disk
    back to it. */
-void disk_register(const struct disk_driver *d) {
+bool disk_register(const struct disk_driver *d) {
+    uint64_t base = d != NULL ? d->find(FS_LBA, FS_MAGIC) : 0;
+
+    /* A driver whose disks do not hold the filesystem changes nothing: with
+       several storage modules, the one that has it keeps it. */
+    if (d != NULL && base == 0) {
+        return false;
+    }
+    if (d == NULL && gone) {
+        return false;
+    }
     ata_sync();                     /* what the old way has, on the disk */
     disk_driver = d;
-    disk_base = d != NULL ? d->find(FS_LBA, FS_MAGIC) : 0;
+    disk_base = base;
     fs_cache(disk_base == 0);       /* a read is quick from here on */
     dbg("efi: disk %s\n", disk_base != 0 ? "is the module's" : "is the firmware's");
+    return true;
+}
+
+/* The GPT on a disk read through read, for the partition whose sector at
+   offset starts with magic: its first sector, or 0. */
+uint64_t gpt_find(int (*read)(uint64_t lba, unsigned count, void *buffer),
+                  uint32_t offset, uint32_t magic) {
+    struct {
+        char     signature[8];
+        uint8_t  pad[64];
+        uint64_t entries;
+        uint32_t count, size;
+    } header;
+    uint8_t *sector = mem_alloc(512);
+    uint64_t found = 0;
+
+    if (sector == NULL) {
+        return 0;
+    }
+    if (read(1, 1, sector) < 0) {
+        goto done;
+    }
+    memcpy(&header, sector, sizeof header);
+    if (memcmp(header.signature, "EFI PART", 8) != 0 || header.size < 40 ||
+        header.size > 512) {
+        goto done;
+    }
+    for (uint32_t i = 0; i < header.count && i < 128 && found == 0; i++) {
+        uint64_t first;
+        uint32_t mark;
+
+        if (read(header.entries + i / (512 / header.size), 1, sector) < 0) {
+            break;
+        }
+        memcpy(&first, sector + i % (512 / header.size) * header.size + 32, sizeof first);
+        if (first == 0 || read(first + offset, 1, sector) < 0) {
+            continue;
+        }
+        memcpy(&mark, sector, sizeof mark);
+        found = mark == magic ? first : 0;
+    }
+done:
+    mem_free(sector);
+    return found;
 }
 
 void efi_init(struct boot_info *info) {
     kept = *info;
     boot = &kept;
+    if (bios()) {
+        bios_init(boot);
+    }
 }
 
 const struct boot_info *efi_boot(void) {
@@ -95,9 +166,20 @@ extern uint64_t user_flags;
 
 /* ---- letting the firmware go --------------------------------------------- */
 
+/* Whether any keyboard module can take its keyboard over. */
+static bool keyboard_ready(void) {
+    bool any = false;
+
+    for (unsigned i = 0; i < KEYBOARDS; i++) {
+        if (keyboards[i] != NULL && keyboards[i]->start()) {
+            any = true;
+        }
+    }
+    return any;
+}
+
 const char *efi_leave(void) {
-    static bool gone;
-    struct efi_boot_services *bs = boot->system->boot;
+    struct efi_boot_services *bs;
     efi_uintn size = 0, key, stride, room;
     uint32_t version;
     uint64_t map;
@@ -110,10 +192,18 @@ const char *efi_leave(void) {
     if (disk_base == 0) {
         return "no disk driver";
     }
-    if (keyboard_driver == NULL || !keyboard_driver->start()) {
+    if (!keyboard_ready()) {
         return "no keyboard driver";
     }
     efi_uptime_ms();                /* the clock is timed against the firmware */
+    if (bios()) {
+        bios_leave();
+        gone = true;
+        dbg("bios: left the BIOS\n");
+        return NULL;
+    }
+    bs = boot->system->boot;
+                /* the clock is timed against the firmware */
 
     /* The map, asked for until ExitBootServices takes it: anything the
        firmware does in between - even allocating this - changes it. */
@@ -214,11 +304,18 @@ char keyboard_poll_char(char (*idle)(void)) {
         }
         return c;
     }
-    /* A PS/2 keyboard is read here; one on USB still by the firmware, while
+    /* The keyboards modules drive are read first; the firmware's, while
        there is one. */
-    c = keyboard_driver != NULL ? keyboard_driver->key() : 0;
-    if (c != 0 || mem_ours()) {
-        return c;
+    for (unsigned i = 0; i < KEYBOARDS; i++) {
+        if (keyboards[i] != NULL && (c = keyboards[i]->key()) != 0) {
+            return c;
+        }
+    }
+    if (gone) {
+        return 0;
+    }
+    if (bios()) {
+        return bios_key();
     }
     if (EFI_ERROR(in->read_key(in, &key))) {
         return 0;
@@ -280,6 +377,9 @@ static int read_now(uint32_t lba, unsigned count, void *buffer) {
     if (disk_base != 0) {
         return count == 0 ? -1 : disk_driver->read(disk_base + lba, count, buffer);
     }
+    if (bios()) {
+        return bios_read(lba, count, buffer);
+    }
     if (disk == NULL || count == 0) {
         return -1;
     }
@@ -327,7 +427,7 @@ int ata_write_many(uint32_t lba, unsigned count, const void *buffer) {
 
     unflushed = true;
 
-    if (count == 0 || (disk == NULL && disk_base == 0)) {
+    if (count == 0 || (disk == NULL && disk_base == 0 && !bios())) {
         return -1;
     }
     if (disk_cache != NULL) {
@@ -335,6 +435,9 @@ int ata_write_many(uint32_t lba, unsigned count, const void *buffer) {
     }
     if (disk_base != 0) {
         return disk_driver->write(disk_base + lba, count, buffer);
+    }
+    if (bios()) {
+        return bios_write(lba, count, buffer);
     }
     while (count > 0) {
         unsigned n = count < block_run ? count : block_run;
@@ -400,6 +503,9 @@ static uint64_t ticks_per_second;
 uint64_t efi_uptime_ms(void) {
     uint64_t now = rdtsc();
 
+    if (ticks_per_second == 0 && bios()) {
+        ticks_per_second = bios_ticks_per_second();
+    }
     if (ticks_per_second == 0) {
         uint64_t from = rdtsc();
 
@@ -440,6 +546,9 @@ static efi_status get_time(struct efi_time *now) {
 unsigned efi_seconds(void) {
     struct efi_time now;
 
+    if (bios()) {
+        return bios_seconds();
+    }
     if (EFI_ERROR(get_time(&now))) {
         return 0;
     }
@@ -457,6 +566,9 @@ uint64_t efi_epoch(void) {
     struct efi_time now;
     uint64_t days;
 
+    if (bios()) {
+        return bios_epoch();
+    }
     if (EFI_ERROR(get_time(&now)) ||
         now.year < 1970 || now.month < 1 || now.month > 12) {
         return 0;
@@ -484,12 +596,113 @@ uint64_t efi_epoch(void) {
 
 void efi_power_off(void) {
     ata_sync();
+    if (bios()) {
+        bios_power_off();
+        return;
+    }
     vm_firmware_view(true);
     boot->system->runtime->reset_system(EFI_RESET_SHUTDOWN, EFI_SUCCESS, 0, NULL);
 }
 
 void efi_restart(void) {
     ata_sync();
+    if (bios()) {
+        bios_restart();
+        return;
+    }
     vm_firmware_view(true);
     boot->system->runtime->reset_system(EFI_RESET_COLD, EFI_SUCCESS, 0, NULL);
+}
+
+/* ---- handing devices over ---------------------------------------------------
+ *
+ * A module about to drive a PCI device the firmware's own driver is still
+ * driving - an xHCI controller polled on the firmware's timer, an NVMe one
+ * with queues of its own - takes it away first: DisconnectController stops
+ * every driver on it, and with them whatever they would have done to the
+ * device at ExitBootServices. Given back if the module cannot use it after
+ * all, and the filesystem's disk looked for again, since the block device
+ * the firmware had for it went with the driver. */
+
+#define PCI_IO_GET_LOCATION 14      /* GetLocation's place in EFI_PCI_IO_PROTOCOL */
+
+static efi_handle pci_handle(uint32_t at) {
+    struct efi_guid guid = EFI_PCI_IO_GUID;
+    struct efi_boot_services *bs = boot->system->boot;
+    efi_handle *handles, found = NULL;
+    efi_uintn count = 0;
+
+    if (EFI_ERROR(bs->locate_handle_buffer(2 /* by protocol */, &guid, NULL, &count,
+                                           &handles))) {
+        return NULL;
+    }
+    for (efi_uintn i = 0; i < count && found == NULL; i++) {
+        void **io;
+        efi_uintn seg, bus, dev, fn;
+
+        if (EFI_ERROR(bs->handle_protocol(handles[i], &guid, (void **)&io))) {
+            continue;
+        }
+        efi_status (EFIAPI *location)(void *, efi_uintn *, efi_uintn *, efi_uintn *,
+                                      efi_uintn *) = io[PCI_IO_GET_LOCATION];
+
+        if (!EFI_ERROR(location(io, &seg, &bus, &dev, &fn)) && seg == 0 &&
+            (uint32_t)(bus << 16 | dev << 11 | fn << 8) == at) {
+            found = handles[i];
+        }
+    }
+    bs->free_pool(handles);
+    return found;
+}
+
+/* The block device with the filesystem on it, as the loader finds it. */
+static void find_disk(void) {
+    struct efi_guid guid = EFI_BLOCK_IO_GUID;
+    struct efi_boot_services *bs = boot->system->boot;
+    efi_handle *handles;
+    efi_uintn count = 0;
+    uint32_t *sector = mem_alloc(512);
+
+    boot->disk = NULL;
+    if (sector == NULL) {
+        return;
+    }
+    if (!EFI_ERROR(bs->locate_handle_buffer(2, &guid, NULL, &count, &handles))) {
+        for (efi_uintn i = 0; i < count && boot->disk == NULL; i++) {
+            struct efi_block_io *disk;
+
+            if (EFI_ERROR(bs->handle_protocol(handles[i], &guid, (void **)&disk)) ||
+                !disk->media->present || disk->media->block_size != 512 ||
+                EFI_ERROR(disk->read_blocks(disk, disk->media->media_id, FS_LBA, 512,
+                                            sector)) || *sector != FS_MAGIC) {
+                continue;
+            }
+            boot->disk = disk;
+            boot->media_id = disk->media->media_id;
+        }
+        bs->free_pool(handles);
+    }
+    mem_free(sector);
+}
+
+void efi_pci(uint32_t at, bool take) {
+    efi_handle handle;
+
+    if (bios() || gone || (handle = pci_handle(at)) == NULL) {
+        return;
+    }
+    if (take) {
+        /* What is written goes out while the firmware's driver can still
+           write it; and the firmware's disk is looked for again after, as
+           it may have been on this device and gone with its driver. */
+        ata_sync();
+        efi_status st = boot->system->boot->disconnect_controller(handle, NULL, NULL);
+
+        dbg("efi: pci %x released: %x\n", (uint64_t)at, st);
+        (void)st;
+        find_disk();
+        return;
+    }
+    boot->system->boot->connect_controller(handle, NULL, NULL, 1);
+    find_disk();
 }

@@ -5,9 +5,11 @@
 #include "efi.h"
 
 /* What the loader hands the kernel, and the only thing that knows how the
- * machine was started.
+ * machine was started: by UEFI (src/boot/uefi.c), or by a PC BIOS
+ * (src/boot/bios.asm), in which case system is NULL and the bios fields
+ * say the rest.
  *
- * The loader does not call ExitBootServices: the firmware keeps its drivers
+ * The UEFI loader does not call ExitBootServices: the firmware keeps its drivers
  * running, and the kernel reaches the keyboard, the disk and the clock
  * through them. That is what makes this run on a machine whose keyboard is
  * USB and whose disk is NVMe without a line of driver code for either.
@@ -48,4 +50,29 @@ struct boot_info {
        moment this machine can be asked about. Uptime counts from here, so it
        covers loading the kernel as well as running it. */
     uint64_t started;
+
+    /* Only from the BIOS loader. The memory map as INT 15h E820 gave it;
+       the drive it booted from, as INT 13h numbers it; and the way back
+       to real mode: bios_call runs INT bios_regs->vector with the
+       registers in bios_regs, and leaves there what came back. Both live
+       below 1 MiB, in the loader, and stay there. */
+    uint64_t e820;                      /* struct e820 entries */
+    uint32_t e820_count;
+    uint32_t bios_drive;
+    uint64_t bios_call;                 /* void (*)(void), SysV */
+    uint64_t bios_regs;                 /* struct bios_regs */
+    uint64_t bios_buffer;               /* 64 KiB below 1 MiB, for INT 13h */
 };
+
+struct e820 {
+    uint64_t base, length;
+    uint32_t type;                      /* 1 is RAM */
+    uint32_t pad;
+} __attribute__((packed));
+
+struct bios_regs {
+    uint32_t eax, ebx, ecx, edx, esi, edi, ebp;
+    uint16_t ds, es;
+    uint16_t flags;                     /* back out: carry is bit 0 */
+    uint8_t  vector;
+} __attribute__((packed));

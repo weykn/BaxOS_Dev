@@ -27,6 +27,17 @@ void *memset(void *dest, int value, size_t count) {
     return dest;
 }
 
+int memcmp(const void *a, const void *b, size_t count) {
+    const uint8_t *x = a, *y = b;
+
+    for (size_t i = 0; i < count; i++) {
+        if (x[i] != y[i]) {
+            return x[i] - y[i];
+        }
+    }
+    return 0;
+}
+
 /* Forwards, as memcpy is: the caller promises the two do not overlap. */
 void *memcpy(void *dest, const void *src, size_t count) {
     uint8_t *d = dest;

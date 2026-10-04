@@ -10,6 +10,7 @@
  * if the drive reports an error or does not answer. */
 
 #include "driver.h"
+#include "efi_kernel.h"
 #include "io.h"
 #include "mem.h"
 #include "module.h"
@@ -318,19 +319,21 @@ static uint64_t ide_find(uint32_t offset, uint32_t magic) {
 static const struct disk_driver driver = { ide_read, ide_write, ide_flush, ide_find };
 
 MODULE_EXPORT int module_init(void) {
-    if (inb(IDE_COMMAND) == 0xFF) {
-        return -ENODEV;             /* nothing on the channel */
+    uint8_t st = inb(IDE_COMMAND);
+
+    /* Nothing on the channel reads as all ones, or - where there is a
+       controller but no drive - as no drive ready. */
+    if (st == 0xFF || !(st & 0x40)) {
+        return -ENODEV;
     }
     find_bus_master();
-    disk_register(&driver);
-    return 0;
+    return disk_register(&driver) ? 0 : -ENODEV;
 }
 
 /* Once the firmware is gone this is the only way to the disk. */
 MODULE_EXPORT int module_exit(void) {
-    if (disk_driver == &driver && mem_ours()) {
+    if (disk_driver == &driver && !disk_register(NULL)) {
         return -EBUSY;
     }
-    disk_register(NULL);
     return 0;
 }

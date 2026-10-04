@@ -35,6 +35,18 @@ bool mem_own_tables(uint64_t top);
    interrupt table, after moving onto the tables mem_own_tables built. */
 void mem_take_over(const void *map, size_t size, size_t stride);
 
+struct e820;
+struct boot_info;
+
+/* The same for a machine a BIOS started: every page from the E820 map, the
+   kernel's from the start, and its own tables at once. Fills in info's
+   memory figures. */
+void mem_take_bios(const struct e820 *map, unsigned count, struct boot_info *info);
+
+/* Makes sure the device registers at at are mapped, one to one and
+   uncached, in the kernel's own tables - now, or when they are built. */
+void mem_map_io(uint64_t at);
+
 /* Gives back the part of the kernel's own region it does not use. */
 void mem_trim_kernel(void);
 

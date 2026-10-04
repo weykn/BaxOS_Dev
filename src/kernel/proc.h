@@ -43,6 +43,14 @@ void proc_remove(const struct proc_cmd *cmd);
 /* Runs one, with the rest of the command line as its arguments. */
 void proc_run(const struct proc_cmd *cmd, char *args);
 
+/* Prints text as echo does - {bold} in and out of the highlight colour,
+   {n} a new line, {uptime} the time since boot - and a newline. */
+void proc_print(const char *text);
+
+/* What greet set, printed that way, if it set anything: the boot calls
+   it once its script is through. */
+void proc_greet(void);
+
 /* A labelled bar of used out of total, in unit, as `mem` draws one - for the
    commands modules bring. */
 void usage_bar(const char *label, unsigned used, unsigned total, const char *unit);

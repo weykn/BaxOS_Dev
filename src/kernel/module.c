@@ -14,9 +14,10 @@
 #include "string.h"
 #include "syscall.h"
 #include "thread.h"
+#include "usb.h"
 #include "vga.h"
 
-#define MODULES  8
+#define MODULES  12
 #define NAME_LEN 32
 #define EXT      ".kmod"
 #define ENODEV   19
@@ -24,7 +25,7 @@
 /* ---- what the kernel offers ---------------------------------------------- */
 
 const struct net_ops         *net;
-const struct keyboard_driver *keyboard_driver;
+const struct keyboard_driver *keyboards[KEYBOARDS];
 const struct tracer          *tracer;
 
 const struct net_card        *net_card;
@@ -44,8 +45,19 @@ int net_card_register(const struct net_card *card) {
     return 0;
 }
 
-void keyboard_register(const struct keyboard_driver *k) {
-    keyboard_driver = k;
+void keyboard_register(const struct keyboard_driver *k, bool on) {
+    for (unsigned i = 0; i < KEYBOARDS; i++) {
+        if (on ? keyboards[i] == NULL : keyboards[i] == k) {
+            keyboards[i] = on ? k : NULL;
+            return;
+        }
+    }
+}
+
+const struct usb_host *usb_host;
+
+void usb_host_register(const struct usb_host *h) {
+    usb_host = h;
 }
 
 const struct disk_cache *disk_cache;
@@ -71,7 +83,8 @@ static const struct {
     X(kprintf), X(ksprintf), X(vga_putc), X(vga_puts), X(vga_set_color),
     X(efi_boot), X(efi_seconds), X(efi_uptime_ms), X(efi_uptime_us),
     X(mem_pages), X(mem_pages_below), X(mem_pages_free), X(mem_alloc), X(mem_free),
-    X(mem_ours),
+    X(mem_ours), X(efi_gone), X(efi_pci), X(usb_host), X(usb_host_register),
+    X(keyboards), X(memcmp), X(gpt_find), X(pci_next_class), X(pci_memory),
     X(fs_stat), X(fs_sector), X(fs_read_many), X(fs_write), X(fs_error),
     X(pci_read), X(pci_write), X(pci_find), X(pci_find_class),
     X(net_register), X(net_card_register), X(disk_register), X(keyboard_register),

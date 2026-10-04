@@ -9,7 +9,7 @@
  * module refuses while the kernel still needs it (module.h). */
 
 /* A disk the filesystem can be read from once the firmware is gone
-   (storage/ide). Sectors count from the start of the disk; calls answer 0,
+   (storage/ide, ahci, nvme, usb). Sectors count from the start of the disk; calls answer 0,
    or -1 on an error. */
 struct disk_driver {
     int      (*read)(uint64_t lba, unsigned count, void *buffer);
@@ -35,7 +35,8 @@ struct disk_cache {
     size_t (*memory)(void);
 };
 
-/* A keyboard read without the firmware (input/ps2). */
+/* A keyboard read without the firmware (input/ps2, input/usbkbd). There
+   may be several at once, each read in turn. */
 struct keyboard_driver {
     bool (*start)(void);            /* takes it over; false if there is none */
     char (*key)(void);              /* the next character typed, or 0 */
@@ -58,10 +59,19 @@ struct tracer {
 extern const struct disk_driver    *disk_driver;
 extern const struct disk_cache     *disk_cache;
 extern const struct tracer         *tracer;
-extern const struct keyboard_driver *keyboard_driver;
+#define KEYBOARDS 4
+extern const struct keyboard_driver *keyboards[KEYBOARDS];
 
-/* Called by a module as it starts, and with NULL as it goes. */
-void disk_register(const struct disk_driver *d);
+/* Called by a module as it starts, and with NULL as it goes. A disk
+   driver is only taken if one of its disks holds the filesystem: false,
+   and nothing changes, if not - or, for NULL, once the firmware is gone
+   and nothing else could read it. */
+bool disk_register(const struct disk_driver *d);
 void disk_cache_register(const struct disk_cache *c);
-void keyboard_register(const struct keyboard_driver *k);
+/* Where a GPT disk, read through read, has the partition whose sector at
+   offset starts with magic - what a disk driver's find does. 0: none. */
+uint64_t gpt_find(int (*read)(uint64_t lba, unsigned count, void *buffer),
+                  uint32_t offset, uint32_t magic);
+
+void keyboard_register(const struct keyboard_driver *k, bool on);
 void tracer_register(const struct tracer *t);

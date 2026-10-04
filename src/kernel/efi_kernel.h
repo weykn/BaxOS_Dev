@@ -40,6 +40,15 @@ uint64_t efi_free_kib(void);
    once: the screen mode cannot change after. NULL if it went, else why not. */
 const char *efi_leave(void);
 
+/* Whether efi_leave has happened: the firmware - UEFI or BIOS - is no
+   longer asked for anything. */
+bool efi_gone(void);
+
+/* Takes the PCI device at (pci.h's address) from whatever firmware driver
+   has it, or gives it back (take false) if a module could not use it
+   after all. Nothing on a BIOS, or once the firmware is gone. */
+void efi_pci(uint32_t at, bool take);
+
 /* Asks the machine to switch itself off; returns only if it would not. */
 void efi_power_off(void);
 

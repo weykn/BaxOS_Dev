@@ -1,9 +1,11 @@
-# Tuxlet OS - a UEFI-booted x86-64 kernel.
+# Tuxlet OS - an x86-64 kernel, started by UEFI or by a PC BIOS.
 #
-# The disk image is a GPT disk with two partitions: an EFI system partition
-# holding the loader, which carries the kernel inside it, and a partition
-# holding the filesystem - the kernel and every file in src/disk. tools/mkfs
-# builds the second one; mtools and sgdisk build the first.
+# The disk image is a GPT disk with three partitions: an EFI system
+# partition holding the UEFI loader, which carries the kernel inside it; a
+# BIOS boot partition holding the BIOS loader, which carries it too, read by
+# the boot code in the protective MBR; and a partition holding the
+# filesystem - the kernel and every file in src/disk. tools/mkfs builds the
+# last; mtools, sgdisk and nasm the rest.
 
 CC      := gcc
 EFICC   := x86_64-w64-mingw32-gcc
@@ -100,6 +102,7 @@ KERNEL_ELF := $(BUILD)/kernel.elf
 KERNEL_BIN := $(BUILD)/kernel.bin
 KERNEL_OBJ := $(BUILD)/kernel_blob.o
 LOADER     := $(BUILD)/BOOTX64.EFI
+BIOS_LOADER := $(BUILD)/boot/bios.bin
 MKFS       := $(BUILD)/mkfs
 FS_IMG     := $(BUILD)/fs.img
 IMAGE      := $(BUILD)/TuxletOS.img
@@ -169,6 +172,11 @@ $(KERNEL_OBJ): $(KERNEL_BIN)
 $(LOADER): src/boot/uefi.c $(KERNEL_OBJ) src/kernel/boot.h src/kernel/efi.h
 	$(EFICC) $(EFIFLAGS) src/boot/uefi.c $(KERNEL_OBJ) -o $@
 
+# The BIOS loader, with the kernel at its end (bios.asm's incbin).
+$(BIOS_LOADER): src/boot/bios.asm $(KERNEL_BIN)
+	@mkdir -p $(@D)
+	$(NASM) -f bin -DKERNEL_BIN='"$(KERNEL_BIN)"' $< -o $@
+
 # mkfs runs on the host but is built from the kernel's own fs.c. -iquote keeps
 # the kernel's string.h from shadowing libc's.
 $(MKFS): tools/mkfs.c src/kernel/fs.c src/kernel/fs.h src/kernel/ata.h
@@ -184,23 +192,31 @@ $(FS_IMG): $(KERNEL_BIN) $(MKFS) $(DISK_FILES) $(MODULES) $(TUXPAC) $(SIZE_FILE)
 
 # Laid end to end, with nothing between: the GPT (sectors 0-33), the EFI
 # system partition sized to the loader - plus 64 sectors for FAT12's own
-# boot sector, tables, root folder and \EFI\BOOT - then the filesystem,
-# then the backup GPT's 33. Nothing in the OS assumes where a partition
-# starts: the loader reads its own, and storage/ide finds Tuxlet's by its
-# magic number. sgdisk -a 1 after -o, which resets it, or it rounds each
-# start up to 1 MiB.
-$(IMAGE): $(LOADER) $(FS_IMG)
+# boot sector, tables, root folder and \EFI\BOOT - the BIOS boot
+# partition (number 3) sized to the BIOS loader, then the filesystem, then
+# the backup GPT's 33. The boot code goes into the protective MBR's first
+# 440 bytes, assembled knowing where the BIOS loader starts. Nothing in the
+# OS assumes where a partition starts: the loaders read their own, and the
+# kernel and storage modules find Tuxlet's by its magic number. sgdisk -a 1
+# after -o, which resets it, or it rounds each start up to 1 MiB.
+$(IMAGE): $(LOADER) $(BIOS_LOADER) src/boot/mbr.asm $(FS_IMG)
 	@rm -f $@
 	@esp=$$(( ($$(stat -c %s $(LOADER)) + 511) / 512 + 64 )); \
-	 fs=$$(( $$(stat -c %s $(FS_IMG)) / 512 )); at=$$(( 34 + esp )); \
+	 bios=$$(( ($$(stat -c %s $(BIOS_LOADER)) + 511) / 512 )); bat=$$(( 34 + esp )); \
+	 fs=$$(( $$(stat -c %s $(FS_IMG)) / 512 )); at=$$(( bat + bios )); \
 	 truncate -s $$(( (at + fs + 33) * 512 )) $@ && \
 	 sgdisk -o -a 1 -n 1:34:+$$esp -t 1:ef00 -c 1:"EFI System" \
+	        -n 3:$$bat:+$$bios -t 3:ef02 -c 3:"BIOS boot" \
 	        -n 2:$$at:+$$fs -t 2:8300 -c 2:"Tuxlet OS" $@ > /dev/null && \
 	 mformat -i $@@@34s -T $$esp -v TUXLET :: && \
 	 mmd -i $@@@34s ::/EFI ::/EFI/BOOT && \
 	 mcopy -i $@@@34s $(LOADER) ::/EFI/BOOT/BOOTX64.EFI && \
+	 dd if=$(BIOS_LOADER) of=$@ bs=512 seek=$$bat conv=notrunc status=none && \
+	 $(NASM) -f bin -DBLOB_LBA=$$bat -DBLOB_SECTORS=$$bios src/boot/mbr.asm \
+	         -o $(BUILD)/boot/mbr.bin && \
+	 dd if=$(BUILD)/boot/mbr.bin of=$@ bs=440 count=1 conv=notrunc status=none && \
 	 dd if=$(FS_IMG) of=$@ bs=512 seek=$$at conv=notrunc status=none
-	@echo "$@: $$(( $$(stat -c %s $@) / 1024 )) KiB, EFI system partition + filesystem"
+	@echo "$@: $$(( $$(stat -c %s $@) / 1024 )) KiB, EFI system + BIOS boot partitions + filesystem"
 
 -include $(KOBJS:.o=.d) $(patsubst src/%.c,$(BUILD)/%.d,$(MSRCS))
 
@@ -228,11 +244,14 @@ NIC = $(if $(filter none,$(NET)),-nic none,-netdev user$(comma)id=n0 \
       -device $(NET_DEVICE)$(comma)netdev=n0$(comma)romfile=)
 comma := ,
 
+# make run BOOT=bios: started by SeaBIOS instead of OVMF - the same image.
+BOOT ?= uefi
+FIRMWARE = $(if $(filter bios,$(BOOT)),,-drive if=pflash$(comma)format=raw$(comma)readonly=on$(comma)file=$(OVMF_CODE) \
+           -drive if=pflash$(comma)format=raw$(comma)file=$(BUILD)/ovmf_vars.fd)
+
 run: $(IMAGE)
 	@cp -n $(OVMF_VARS) $(BUILD)/ovmf_vars.fd 2>/dev/null || true
-	qemu-system-x86_64 $(ACCEL) \
-	    -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
-	    -drive if=pflash,format=raw,file=$(BUILD)/ovmf_vars.fd \
+	qemu-system-x86_64 $(ACCEL) $(FIRMWARE) \
 	    -drive format=raw,file=$(IMAGE) $(NIC) -m $(MEM)
 
 clean:

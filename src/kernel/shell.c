@@ -4,6 +4,7 @@
 
 #include "debug.h"
 #include "driver.h"
+#include "efi_kernel.h"
 #include "mem.h"
 #include "fs.h"
 #include "io.h"
@@ -543,6 +544,7 @@ __attribute__((noreturn)) void shell_run(void) {
     if (fs_stat(BOOT_CONF, &file) == 0) {
         fs_chdir(BOOT_DIR);
         script_run(BOOT_CONF);
+        proc_greet();
     }
     const char *home = shell_env("HOME");
 

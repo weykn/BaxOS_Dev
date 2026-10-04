@@ -116,9 +116,58 @@ static void cmd_mode(char *args) {
     list(vga_mode_name, vga_mode());
 }
 
+/* Text the way echo and greet print it. Three names in braces mean
+   something: {bold} switches to the highlight colour, and the next one
+   back; {n} starts a new line; {uptime} is the time since the loader
+   started. Anything else is printed as it is. */
+#define HIGHLIGHT "\033[92m"           /* bright green */
+
+void proc_print(const char *text) {
+    bool bold = false;
+
+    for (const char *p = text; *p != '\0'; p++) {
+        if (memcmp(p, "{bold}", 6) == 0) {
+            kprintf(bold ? "\033[0m" : HIGHLIGHT);
+            bold = !bold;
+            p += 5;
+        } else if (memcmp(p, "{n}", 3) == 0) {
+            vga_putc('\n');
+            p += 2;
+        } else if (memcmp(p, "{uptime}", 8) == 0) {
+            uint64_t ms = efi_uptime_ms();
+
+            kprintf("%u.%02us", (unsigned)(ms / 1000), (unsigned)(ms % 1000) / 10);
+            p += 7;
+        } else {
+            vga_putc(*p);
+        }
+    }
+    kprintf(bold ? "\033[0m\n" : "\n");
+}
+
+/* greet <text>: keeps text for the kernel to print, as echo would, once
+   the boot script is through - so {uptime} is the time the boot took.
+   Only booting prints it; set later, it waits for the next boot script
+   that never comes. */
+static char greeting[160];
+
+static void cmd_greet(char *args) {
+    size_t n = strlen(args);
+
+    n = n < sizeof greeting - 1 ? n : sizeof greeting - 1;
+    memcpy(greeting, args, n);
+    greeting[n] = '\0';
+}
+
+void proc_greet(void) {
+    if (greeting[0] != '\0') {
+        proc_print(greeting);
+    }
+}
+
 /* Prints its line, which is how /etc/tuxlet/boot says anything. */
 static void cmd_echo(char *args) {
-    kprintf("%s\n", args);
+    proc_print(args);
 }
 
 static void cmd_scale(char *args) {
@@ -180,9 +229,6 @@ static void cmd_mem(char *args) {
     PART("kernel stack", m.stack);
     PART("page tables", m.page_tables);
     PART("console", m.console);
-    if (m.disk_cache > 0) {
-        PART("disk cache (free)", m.disk_cache);
-    }
     if (m.modules > 0) {
         PART("modules", m.modules);
     }
@@ -230,28 +276,6 @@ static void cmd_clear(char *args) {
     vga_clear();
 }
 
-/* How long the machine has been up, counted from the first thing the loader
-   did - so it covers loading the kernel, not only running it. Shown at the
-   scale that reads best: a fresh boot in seconds and hundredths, an old one
-   in the units that matter. */
-/* Anything after it goes in front, which is how /etc/tuxlet/boot says how long
-   the machine took to come up. */
-static void cmd_uptime(char *args) {
-    uint64_t ms = efi_uptime_ms();
-    unsigned seconds = (unsigned)(ms / 1000);
-
-    if (*args != '\0') {
-        kprintf("%s ", args);
-    }
-    if (seconds < 60) {
-        kprintf("%u.%02us\n", seconds, (unsigned)(ms % 1000) / 10);
-    } else if (seconds < 3600) {
-        kprintf("%um %02us\n", seconds / 60, seconds % 60);
-    } else {
-        kprintf("%uh %02um\n", seconds / 3600, seconds / 60 % 60);
-    }
-}
-
 /* ---- the table ----------------------------------------------------------- */
 
 static const struct proc_cmd commands[] = {
@@ -259,10 +283,10 @@ static const struct proc_cmd commands[] = {
     { "scale",  "[size|off]",        cmd_scale  },
     { "font",   "[size]",            cmd_font   },
     { "mem",    "[all]",             cmd_mem    },
-    { "uptime", "",                  cmd_uptime },
     { "modman", "[enable|disable <module>|auto <category>|takeover]", module_command },
     { "clear",  "",                  cmd_clear },
     { "echo",   "[text]",            cmd_echo },
+    { "greet",  "<text>",            cmd_greet },
     { "tsh",    "[script]",          shell_tsh },
     { "reboot", "",                  cmd_reboot },
     { "poweroff", "",                cmd_poweroff },

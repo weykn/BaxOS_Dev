@@ -67,7 +67,6 @@ make DEBUG=1
 
 # Clean build artifacts
 make clean
-
 ```
 
 > **Tip:** Any files placed inside the `src/disk/` directory are automatically copied onto the root filesystem image during build.
@@ -123,9 +122,8 @@ System control executables are located in `/ctl`:
 | Command | Usage | Description |
 | --- | --- | --- |
 | `mem` | `mem [all]` | Displays current system memory allocation and usage. |
-| `uptime` | `uptime` | Prints total time elapsed since system boot. |
 | `mode` / `scale` / `font` | Standard options | Configures frame-buffer resolution, UI scaling, and console font. |
-| `clear` / `echo` | Text output | Clears terminal screen or prints text strings. |
+| `clear` / `echo` | Text output | Clears terminal screen or prints text; Supports `{bold}`, `{n}` *(newline)* and `{uptime}`. |
 | `modman` | Management | Loads, unloads, and inspects module states (see details below). |
 | `reboot` / `poweroff` | Power control | Restarts or safely shuts down the machine. |
 

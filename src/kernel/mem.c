@@ -264,6 +264,80 @@ static size_t   own_pages;
 
 static uint64_t reclaimed_kib;      /* of what the firmware kept, taken back */
 
+static bool gig_pages(void) {
+    uint32_t a = 0x80000001, b, c = 0, d;
+
+    __asm__ volatile("cpuid" : "+a"(a), "=b"(b), "+c"(c), "=d"(d));
+    return (d >> 26) & 1;
+}
+
+/* Devices' registers can be anywhere in the address space - a firmware
+   puts 64-bit windows far above any RAM, past the 512 GiB the kernel's
+   tables map - so each one a driver asks for (pci_memory) is remembered
+   and its gigabyte mapped, uncached, as the tables are built or straight
+   away if they already are. */
+#define IO_SPANS 8
+#define NO_CACHE 0x18               /* PWT, PCD */
+
+static uint64_t io_spans[IO_SPANS];
+static unsigned io_count;
+static size_t   io_pages;           /* tables bought for them */
+
+static uint64_t *table_for(uint64_t *entry, bool *fresh) {
+    if (*entry & PRESENT) {
+        *fresh = false;
+        return (uint64_t *)(*entry & 0x000FFFFFFFFFF000ull);
+    }
+    uint64_t page = mem_pages_below(1, 1ull << 32);
+
+    if (page == 0) {
+        return NULL;
+    }
+    memset((void *)page, 0, PAGE);
+    io_pages++;
+    *entry = page | PRESENT | WRITE;
+    *fresh = true;
+    return (uint64_t *)page;
+}
+
+static void map_gig(uint64_t *pml4, uint64_t gig) {
+    bool fresh;
+    uint64_t *pdpt = table_for(&pml4[gig >> 39 & 511], &fresh), *pd;
+
+    if (pdpt == NULL || (pdpt[gig >> 30 & 511] & PRESENT)) {
+        return;
+    }
+    if (gig_pages()) {
+        pdpt[gig >> 30 & 511] = gig | PRESENT | WRITE | HUGE | NO_CACHE;
+        return;
+    }
+    if ((pd = table_for(&pdpt[gig >> 30 & 511], &fresh)) != NULL) {
+        for (uint64_t i = 0; i < 512; i++) {
+            pd[i] = (gig + (i << 21)) | PRESENT | WRITE | HUGE | NO_CACHE;
+        }
+    }
+}
+
+void mem_map_io(uint64_t at) {
+    uint64_t gig = at & ~((1ull << 30) - 1);
+
+    if (gig < (512ull << 30) && gig_pages()) {
+        return;                     /* the first table maps it already */
+    }
+    for (unsigned i = 0; i < io_count; i++) {
+        if (io_spans[i] == gig) {
+            return;
+        }
+    }
+    if (io_count < IO_SPANS) {
+        io_spans[io_count++] = gig;
+    }
+    if (own_cr3 != 0 && ours) {
+        map_gig((uint64_t *)own_cr3, gig);
+        __asm__ volatile("mov %%cr3, %%rax\n\tmov %%rax, %%cr3" : : : "rax", "memory");
+    }
+}
+
 bool mem_own_tables(uint64_t top) {
     uint32_t a = 0x80000001, b, c = 0, d;
 
@@ -278,7 +352,9 @@ bool mem_own_tables(uint64_t top) {
         gigs = 512;
     }
     size_t count = 2 + (size_t)gigs;
-    uint64_t at = mem_pages(count);
+    /* Below 4 GiB: the BIOS's way into real mode (bios.asm) has to load
+       CR3 again from 32-bit code on the way back. */
+    uint64_t at = mem_pages_below(count, 1ull << 32);
 
     if (at == 0) {
         return false;
@@ -296,6 +372,9 @@ bool mem_own_tables(uint64_t top) {
     pml4[0] = (uint64_t)pdpt | PRESENT | WRITE;
     own_cr3 = at;
     own_pages = count;
+    for (unsigned i = 0; i < io_count; i++) {
+        map_gig(pml4, io_spans[i]);
+    }
     return true;
 }
 
@@ -365,6 +444,48 @@ void mem_take_over(const void *map, size_t size, size_t stride) {
     ours = true;
 }
 
+/* The BIOS path: no firmware to allocate from at all, so the kernel's own
+   runs are made at once, from the RAM E820 reports above 1 MiB - below it
+   is the BIOS's and the loader's, all but what the loader gave the kernel -
+   and the loader's tables are left for the kernel's own. */
+void mem_take_bios(const struct e820 *map, unsigned count, struct boot_info *info) {
+    uint64_t top = vga_framebuffer_end(), ram = 0, kept = 0;
+
+    for (unsigned i = 0; i < count; i++) {
+        uint64_t start = (map[i].base + PAGE - 1) & ~(uint64_t)(PAGE - 1);
+        uint64_t end = (map[i].base + map[i].length) & ~(uint64_t)(PAGE - 1);
+
+        if (map[i].type == 1 || map[i].type == 3 || map[i].type == 4) {
+            ram += map[i].length / 1024;
+            top = end > top ? end : top;
+        }
+        if (map[i].type == 4) {
+            kept += map[i].length / 1024;   /* ACPI NVS */
+        }
+        if (map[i].type != 1 && map[i].base < (1ull << 30) && kept_low_count < KEPT_LOW) {
+            kept_low[kept_low_count++] = (struct run){ map[i].base & ~(uint64_t)(PAGE - 1),
+                                                       (map[i].length + PAGE - 1) / PAGE };
+        }
+        if (map[i].type != 1) {
+            continue;
+        }
+        if (start < 0x100000) {
+            start = 0x100000;
+        }
+        if (end > start) {
+            run_add(start, (end - start) / PAGE);
+        }
+    }
+    ours = true;
+    info->ram_kib = ram;
+    info->firmware_kib = kept + 640;    /* and what is below 1 MiB */
+    info->memory_kib = mem_free_kib();
+    if (mem_own_tables(top)) {
+        vm_move((uint64_t *)own_cr3, own_pages > 2 ? (uint64_t *)(own_cr3 + 2 * PAGE) : NULL);
+        __asm__ volatile("mov %0, %%cr3" : : "r"(own_cr3) : "memory");
+    }
+}
+
 uint64_t mem_free_kib(void) {
     uint64_t pages = 0;
 
@@ -396,7 +517,7 @@ void mem_get_stats(struct mem_stats *stats) {
     stats->image = span(__kernel_start, __bss_start);
     stats->stack = span(stack_bottom, stack_top);
     stats->data = span(__bss_start, __bss_end) - stats->stack;
-    stats->page_tables = (uint32_t)(program_tables() + own_pages * PAGE);
+    stats->page_tables = (uint32_t)(program_tables() + (own_pages + io_pages) * PAGE);
     stats->console = (uint32_t)vga_memory();
     stats->disk_cache = disk_cache != NULL ? (uint32_t)disk_cache->memory() : 0;
     stats->modules = module_memory();
