@@ -11,6 +11,7 @@
 #include "console.h"
 #include "efi_kernel.h"
 #include "fs.h"
+#include "input.h"
 #include "linux.h"
 #include "mem.h"
 #include "module.h"
@@ -127,7 +128,7 @@ static uint64_t wait_ready(uint64_t nfds, uint64_t readfds, uint64_t writefds,
         if (handle_of(fd) == NULL) {
             continue;
         }
-        if (handle_of(fd)->start == SOCK_MARK) {
+        if (handle_of(fd)->start == SOCK_MARK || handle_of(fd)->start == MOD_MARK) {
             sock_bits |= bit & (want | (writefds != 0 ? *(uint64_t *)writefds : 0));
             continue;
         }
@@ -139,6 +140,9 @@ static uint64_t wait_ready(uint64_t nfds, uint64_t readfds, uint64_t writefds,
         }
         if (is_console(fd)) {
             console_bits |= bit;
+        } else if (handle_of(fd)->start == DEV_MARK && handle_of(fd)->folder >= DEV_EVENT0) {
+            event_bits |= bit;
+            ready |= input_ready(handle_of(fd)->folder - DEV_EVENT0) ? bit : 0;
         } else if (handle_of(fd)->start == PIPE_MARK) {
             struct pipe *p = pipe_of(handle_of(fd));
 
@@ -171,19 +175,20 @@ static uint64_t wait_ready(uint64_t nfds, uint64_t readfds, uint64_t writefds,
         }
         for (uint64_t fd = 0; fd < nfds; fd++) {
             if ((event_bits >> fd & 1) != 0 &&
-                (event_ready(handle_of(fd)) ||
-                 readable(handle_of(fd)))) {
+                (handle_of(fd)->start == DEV_MARK ? input_ready(handle_of(fd)->folder - DEV_EVENT0) :
+                 event_ready(handle_of(fd)) || readable(handle_of(fd)))) {
                 ready |= 1ull << fd;
             }
         }
-        for (uint64_t fd = 0; fd < nfds && net != NULL; fd++) {
+        for (uint64_t fd = 0; fd < nfds; fd++) {
             uint64_t bit = 1ull << fd;
             unsigned r;
 
             if ((sock_bits & bit) == 0) {
                 continue;
             }
-            r = net->ready((int)handle_of(fd)->folder);
+            r = handle_of(fd)->start == SOCK_MARK ? sock_ready(handle_of(fd))
+              : ops_of(handle_of(fd)) != NULL ? ops_of(handle_of(fd))->ready(handle_of(fd)) : NET_ERR;
             if ((want & bit) != 0 && (r & (NET_IN | NET_HUP | NET_ERR)) != 0) {
                 ready |= bit;
             }
@@ -258,7 +263,77 @@ struct statfs {
 
 /* The same figures whichever file is asked about: there is one filesystem,
    and every path on the machine is on it. */
-static uint64_t statfs_fill(uint64_t out) {
+/* ---- mounts -----------------------------------------------------------------
+ *
+ * There is one filesystem, but Linux has /proc, /sys and /dev as filesystems
+ * of their own, mounted there - and a program finds its way about by that: a
+ * udev library will not walk /sys until it knows it is sysfs and not the
+ * disk. So each answers as its own mount, with its own type. */
+
+enum { MOUNT_ROOT = 1, MOUNT_PROC, MOUNT_SYS, MOUNT_DEV };
+
+static unsigned mount_named(const char *name) {
+    static const struct { const char *at; unsigned id; } mounts[] = {
+        { "proc", MOUNT_PROC }, { "sys", MOUNT_SYS }, { "dev", MOUNT_DEV },
+    };
+    const char *rel = name;
+
+    if (name == NULL) {
+        return MOUNT_ROOT;
+    }
+    if (*name != '/') {
+        rel = fs_cwd();             /* a relative name is in the working folder */
+    }
+    while (*rel == '/') {
+        rel++;
+    }
+    for (unsigned i = 0; i < sizeof mounts / sizeof mounts[0]; i++) {
+        size_t n = strlen(mounts[i].at);
+
+        if (memcmp(rel, mounts[i].at, n) == 0 && (rel[n] == '\0' || rel[n] == '/')) {
+            return mounts[i].id;
+        }
+    }
+    return MOUNT_ROOT;
+}
+
+/* The mount a descriptor is on: its file's or folder's name, where it has one. */
+static unsigned mount_of_fd(uint64_t fd) {
+    struct handle *h = handle_of(fd);
+    struct fs_file entry;
+
+    if (h == NULL) {
+        return MOUNT_ROOT;
+    }
+    switch (h->start) {
+    case PROCDIR_MARK:
+        return h->folder != 0 ? MOUNT_DEV : MOUNT_PROC;
+    case PROC_MARK:
+        return MOUNT_PROC;
+    case DEV_MARK:
+    case CONSOLE_MARK:
+    case MOD_MARK:
+        return MOUNT_DEV;
+    case WRITE_MARK:
+        return mount_named(writer_names[h->writer - 1]);
+    default:
+        if (h->start <= FOLDER_MARK && h->folder != 0 && fs_file(h->folder - 1, &entry) == 0) {
+            char whole[FS_NAME_LEN + 1] = "/";      /* the table's names are from the root */
+
+            strcpy(whole + 1, entry.name);
+            return mount_named(whole);
+        }
+        return MOUNT_ROOT;
+    }
+}
+
+#define PROC_SUPER_MAGIC 0x9FA0
+#define SYSFS_MAGIC      0x62656572
+#define TMPFS_MAGIC      0x01021994
+
+static uint64_t statfs_fill(uint64_t out, unsigned mount);
+
+static uint64_t statfs_fill(uint64_t out, unsigned mount) {
     struct statfs *stats = (struct statfs *)out;
     struct fs_stats disk;
 
@@ -269,7 +344,8 @@ static uint64_t statfs_fill(uint64_t out) {
         return ERR(EIO);
     }
     memset(stats, 0, sizeof *stats);
-    stats->type = FS_MAGIC;
+    stats->type = mount == MOUNT_PROC ? PROC_SUPER_MAGIC : mount == MOUNT_SYS ? SYSFS_MAGIC :
+                  mount == MOUNT_DEV ? TMPFS_MAGIC : FS_MAGIC;
     stats->bsize = SECTOR_SIZE;
     stats->frsize = SECTOR_SIZE;
     stats->blocks = disk.total;
@@ -285,7 +361,7 @@ static uint64_t statfs_fill(uint64_t out) {
 
 static uint64_t sys_statfs(uint64_t path, uint64_t out, uint64_t c) {
     (void)c;
-    return user_string(path) == NULL ? ERR(EFAULT) : statfs_fill(out);
+    return user_string(path) == NULL ? ERR(EFAULT) : statfs_fill(out, mount_named(user_string(path)));
 }
 
 /* Switching the machine off, or starting it again, the way Linux spells it:
@@ -333,11 +409,345 @@ struct winsize {
     uint16_t rows, columns, pixel_w, pixel_h;
 };
 
+/* ---- the screen and the input devices ------------------------------------
+ *
+ * What a Linux graphics program asks before it draws: /dev/fb0 for the
+ * screen's size and layout (it then mmaps it), /dev/input/event* for what
+ * the keys and the mouse can send, and the terminal to stop drawing over it
+ * (KDSETMODE) and to stop taking the keys (KDSKBMODE). */
+
+#define FBIOGET_VSCREENINFO 0x4600
+#define FBIOPUT_VSCREENINFO 0x4601
+#define FBIOGET_FSCREENINFO 0x4602
+#define FBIOGETCMAP         0x4604
+#define FBIOPUTCMAP         0x4605
+#define FBIOPAN_DISPLAY     0x4606
+#define FBIOGET_CON2FBMAP   0x460F
+#define FBIOBLANK           0x4611
+#define FBIO_WAITFORVSYNC   0x40044620u
+
+struct fb_bitfield {
+    uint32_t offset, length, msb_right;
+};
+
+struct fb_var {
+    uint32_t xres, yres, xres_virtual, yres_virtual, xoffset, yoffset;
+    uint32_t bits_per_pixel, grayscale;
+    struct fb_bitfield red, green, blue, transp;
+    uint32_t nonstd, activate, height, width, accel_flags, pixclock;
+    uint32_t left_margin, right_margin, upper_margin, lower_margin;
+    uint32_t hsync_len, vsync_len, sync, vmode, rotate, colorspace, reserved[4];
+};
+
+struct fb_fix {
+    char     id[16];
+    uint64_t smem_start;
+    uint32_t smem_len, type, type_aux, visual;
+    uint16_t xpanstep, ypanstep, ywrapstep;
+    uint32_t line_length;
+    uint64_t mmio_start;
+    uint32_t mmio_len, accel;
+    uint16_t capabilities, reserved[2];
+};
+
+_Static_assert(sizeof(struct fb_var) == 160, "fb_var_screeninfo is Linux's");
+_Static_assert(sizeof(struct fb_fix) == 80, "fb_fix_screeninfo is Linux's");
+
+static void fb_var_fill(struct fb_var *v) {
+    struct vga_screen s;
+
+    vga_screen(&s);
+    memset(v, 0, sizeof *v);
+    v->xres = v->xres_virtual = s.width;
+    v->yres = v->yres_virtual = s.height;
+    v->bits_per_pixel = 32;
+    v->red = (struct fb_bitfield){ s.red_first ? 0 : 16, 8, 0 };
+    v->green = (struct fb_bitfield){ 8, 8, 0 };
+    v->blue = (struct fb_bitfield){ s.red_first ? 16 : 0, 8, 0 };
+    v->height = v->width = 0xFFFFFFFF;          /* millimetres: not known */
+    v->pixclock = (uint32_t)(1000000000000ull / ((uint64_t)s.width * s.height * 60 + 1));
+}
+
+static uint64_t fb_ioctl(uint64_t request, uint64_t out) {
+    switch (request) {
+    case FBIOGET_VSCREENINFO:
+        if (!user_range(out, sizeof(struct fb_var))) {
+            return ERR(EFAULT);
+        }
+        fb_var_fill((struct fb_var *)out);
+        return 0;
+    case FBIOPUT_VSCREENINFO: {
+        /* The firmware's mode is the only one there is: asked for it, the
+           answer is yes; asked for another, no. */
+        struct fb_var now, *want = (struct fb_var *)out;
+
+        if (!user_range(out, sizeof now)) {
+            return ERR(EFAULT);
+        }
+        fb_var_fill(&now);
+        if (want->xres != now.xres || want->yres != now.yres ||
+            (want->bits_per_pixel != 0 && want->bits_per_pixel != 32)) {
+            return ERR(EINVAL);
+        }
+        *want = now;
+        return 0;
+    }
+    case FBIOGET_FSCREENINFO: {
+        struct fb_fix *f = (struct fb_fix *)out;
+        struct vga_screen s;
+
+        if (!user_range(out, sizeof *f)) {
+            return ERR(EFAULT);
+        }
+        vga_screen(&s);
+        memset(f, 0, sizeof *f);
+        memcpy(f->id, "EFI VGA", 8);
+        f->smem_start = s.base;
+        f->smem_len = s.pitch * s.height;
+        f->visual = 2;                              /* FB_VISUAL_TRUECOLOR */
+        f->line_length = s.pitch;
+        return 0;
+    }
+    case FBIOGET_CON2FBMAP:
+        if (!user_range(out, 8)) {
+            return ERR(EFAULT);
+        }
+        ((uint32_t *)out)[1] = 0;
+        return 0;
+    case FBIOGETCMAP:
+    case FBIOPUTCMAP:
+    case FBIOPAN_DISPLAY:
+    case FBIOBLANK:
+    case FBIO_WAITFORVSYNC:
+        return 0;
+    }
+    return ERR(ENOTTY);
+}
+
+#define IOC_NR(r)   ((r) & 0xFF)
+#define IOC_TYPE(r) ((r) >> 8 & 0xFF)
+#define IOC_SIZE(r) ((r) >> 16 & 0x3FFF)
+#define IOC_DIR(r)  ((r) >> 30 & 3)
+
+#define EVIOCGVERSION 0x01
+#define EVIOCGID      0x02
+#define EVIOCGREP     0x03
+#define EVIOCGNAME    0x06
+#define EVIOCGPHYS    0x07
+#define EVIOCGUNIQ    0x08
+#define EVIOCGPROP    0x09
+#define EVIOCGKEY     0x18
+#define EVIOCGBIT     0x20          /* + the event type, to 0x3F */
+#define EVIOCGABS     0x40          /* + the axis, to 0x7F */
+#define EVIOCGRAB     0x90
+#define EVIOCSCLOCKID 0xA0
+
+#define KEY_LAST_KBD 0x7F           /* KEY_ESC .. KEY_COMPOSE: what a PC keyboard has */
+
+/* What a variable-length answer comes to: as much as was room for. */
+static uint64_t ev_give(uint64_t out, uint64_t room, const void *what, uint64_t size) {
+    if (!user_range(out, room)) {
+        return ERR(EFAULT);
+    }
+    memset((void *)out, 0, room);
+    memcpy((void *)out, what, size < room ? size : room);
+    return size < room ? size : room;
+}
+
+static void bit_set(uint8_t *bits, unsigned n) {
+    bits[n >> 3] |= (uint8_t)(1 << (n & 7));
+}
+
+static uint64_t ev_ioctl(unsigned device, uint64_t request, uint64_t out) {
+    bool mouse = device == INPUT_MOUSE;
+    unsigned nr = IOC_NR(request);
+    uint64_t room = IOC_SIZE(request);
+    uint8_t bits[INPUT_KEY_BYTES] = { 0 };
+
+    if (IOC_TYPE(request) != 'E') {
+        return ERR(ENOTTY);
+    }
+    if (IOC_DIR(request) == 1) {    /* the ones that set something */
+        if (nr == EVIOCSCLOCKID && user_range(out, 4)) {
+            input_clock(device, *(int32_t *)out != 0);
+        }
+        return nr == EVIOCGRAB || nr == EVIOCSCLOCKID || nr == EVIOCGREP ? 0 : ERR(EINVAL);
+    }
+    switch (nr) {
+    case EVIOCGVERSION: {
+        int32_t version = 0x010001;
+
+        return (int64_t)ev_give(out, 4, &version, 4) < 0 ? ERR(EFAULT) : 0;
+    }
+    case EVIOCGID: {
+        uint16_t id[4] = { 0x11, 0x01, mouse ? 0x02 : 0x01, 0xAB41 };  /* BUS_I8042 */
+
+        return (int64_t)ev_give(out, 8, id, 8) < 0 ? ERR(EFAULT) : 0;
+    }
+    case EVIOCGREP: {
+        uint32_t rep[2] = { 500, 33 };
+
+        return mouse ? ERR(EINVAL) : (int64_t)ev_give(out, 8, rep, 8) < 0 ? ERR(EFAULT) : 0;
+    }
+    case EVIOCGNAME: {
+        const char *name = mouse ? "PS/2 Generic Mouse" : "AT Translated Set 2 keyboard";
+
+        return ev_give(out, room, name, strlen(name) + 1);
+    }
+    case EVIOCGPHYS: {
+        const char *phys = mouse ? "isa0060/serio1/input0" : "isa0060/serio0/input0";
+
+        return ev_give(out, room, phys, strlen(phys) + 1);
+    }
+    case EVIOCGUNIQ:
+        return ERR(ENOENT);
+    case EVIOCGKEY:
+        return ev_give(out, room, input_keys(device), INPUT_KEY_BYTES);
+    case EVIOCGPROP:
+        return ev_give(out, room, bits, 0);
+    }
+    if (nr >= EVIOCGBIT && nr < EVIOCGABS) {
+        switch (nr - EVIOCGBIT) {
+        case 0:
+            bit_set(bits, EV_SYN);
+            bit_set(bits, EV_KEY);
+            bit_set(bits, mouse ? EV_REL : EV_REP);
+            return ev_give(out, room, bits, 4);
+        case EV_KEY:
+            if (mouse) {
+                bit_set(bits, BTN_LEFT);
+                bit_set(bits, BTN_RIGHT);
+                bit_set(bits, BTN_MIDDLE);
+            } else {
+                for (unsigned k = 1; k <= KEY_LAST_KBD; k++) {
+                    bit_set(bits, k);
+                }
+            }
+            return ev_give(out, room, bits, INPUT_KEY_BYTES);
+        case EV_REL:
+            if (mouse) {
+                bit_set(bits, REL_X);
+                bit_set(bits, REL_Y);
+            }
+            return ev_give(out, room, bits, 2);
+        default:
+            return ev_give(out, room, bits, 0);
+        }
+    }
+    if (nr >= EVIOCGABS && nr < EVIOCGABS + 0x40) {
+        return ERR(EINVAL);         /* nothing absolute here */
+    }
+    /* What else there is to read - LEDs, sounds, switches, multitouch
+       slots, effects - this hardware has none of: all clear. */
+    return IOC_DIR(request) == 2 ? ev_give(out, room, bits, 0) : ERR(EINVAL);
+}
+
+#define KDGKBTYPE   0x4B33
+#define KDGETLED    0x4B31
+#define KDSETLED    0x4B32
+#define KDSETMODE   0x4B3A
+#define KDGETMODE   0x4B3B
+#define KDGKBMODE   0x4B44
+#define KDSKBMODE   0x4B45
+#define KDSKBMUTE   0x4B51
+#define VT_OPENQRY  0x5600
+#define VT_GETMODE  0x5601
+#define VT_SETMODE  0x5602
+#define VT_GETSTATE 0x5603
+#define VT_RELDISP  0x5605
+#define VT_ACTIVATE 0x5606
+#define VT_WAITACTIVE 0x5607
+#define TIOCSCTTY   0x540E
+#define TIOCNOTTY   0x5422
+#define K_XLATE     1
+#define K_UNICODE   3
+#define K_OFF       4
+
+static unsigned kb_mode = K_XLATE;
+
+/* The terminal's side of it: there is one console, and it is VT 1. */
+static uint64_t vt_ioctl(uint64_t request, uint64_t out) {
+    switch (request) {
+    case KDSETMODE:
+        graphics_take();
+        vga_lend(out == 1);         /* KD_GRAPHICS */
+        return 0;
+    case KDGETMODE:
+    case KDGKBMODE:
+    case VT_OPENQRY:
+        if (!user_range(out, 4)) {
+            return ERR(EFAULT);
+        }
+        *(int32_t *)out = request == KDGETMODE ? vga_lent() :
+                          request == KDGKBMODE ? (int32_t)kb_mode : 1;
+        return 0;
+    case KDSKBMODE:
+        graphics_take();
+        kb_mode = (unsigned)out;
+        console_keys(out == K_XLATE || out == K_UNICODE);
+        return 0;
+    case KDGKBTYPE:
+    case KDGETLED:
+        if (!user_range(out, 1)) {
+            return ERR(EFAULT);
+        }
+        *(uint8_t *)out = request == KDGKBTYPE ? 2 : 0;     /* KB_101 */
+        return 0;
+    case VT_GETMODE:
+        return user_range(out, 8) ? (memset((void *)out, 0, 8), 0) : ERR(EFAULT);
+    case VT_GETSTATE: {
+        if (!user_range(out, 6)) {
+            return ERR(EFAULT);
+        }
+        uint16_t *st = (uint16_t *)out;
+
+        st[0] = 1;                  /* VT 1 is the one on screen */
+        st[1] = 0;
+        st[2] = 1 << 1;             /* and the only one in use */
+        return 0;
+    }
+    case KDSKBMUTE:                 /* X's way of K_OFF: the keys are its own */
+        graphics_take();
+        console_keys(out == 0);
+        return 0;
+    case KDSETLED:
+    case VT_SETMODE:
+    case VT_RELDISP:
+    case VT_ACTIVATE:
+    case VT_WAITACTIVE:
+    case TIOCSCTTY:
+    case TIOCNOTTY:
+        return 0;
+    }
+    return ERR(ENOTTY);
+}
+
 static uint64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t out) {
     struct handle *h = handle_of(fd);
 
-    if (h != NULL && h->start == SOCK_MARK && net != NULL && request != FIONBIO) {
-        return net->ioctl(h, request, out);
+    if (h != NULL && h->start == DEV_MARK && h->folder == DEV_FB) {
+        return fb_ioctl(request, out);
+    }
+    if (h != NULL && h->start == MOD_MARK) {
+        if (request == FIONBIO && user_range(out, 4)) {
+            h->offset = *(int32_t *)out != 0 ? h->offset | O_NONBLOCK : h->offset & ~O_NONBLOCK;
+            return 0;
+        }
+        return ops_of(h) != NULL ? ops_of(h)->ioctl(h, request, out) : ERR(EIO);
+    }
+    if (h != NULL && h->start == DEV_MARK && h->folder >= DEV_EVENT0) {
+        if (request == FIONBIO) {
+            if (!user_range(out, 4)) {
+                return ERR(EFAULT);
+            }
+            h->offset = *(int32_t *)out != 0 ? h->offset | O_NONBLOCK : h->offset & ~O_NONBLOCK;
+            return 0;
+        }
+        return ev_ioctl(h->folder - DEV_EVENT0, request, out);
+    }
+
+    if (h != NULL && h->start == SOCK_MARK && request != FIONBIO) {
+        return (h->offset & SOCK_UNIX) == 0 && net != NULL ? net->ioctl(h, request, out) : ERR(ENOTTY);
     }
 
     if (h != NULL && (h->start == SOCK_MARK || h->start == PIPE_MARK) && request == FIONBIO) {
@@ -388,16 +798,19 @@ static uint64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t out) {
         return 0;
     }
     case TIOCGPGRP:
-        /* There is one program, so the keyboard is always its: a shell that
-           is told so keeps its job control rather than complaining its way
-           out of it. */
+        /* Which group the keyboard is for: a shell hands it to each job it
+           runs in front, and takes it back after. */
         if (!user_range(out, 4)) {
             return ERR(EFAULT);
         }
-        *(uint32_t *)out = 1;
+        *(int32_t *)out = tty_foreground();
         return 0;
     case TIOCSPGRP:
-        return 0;               /* handing it to the one group it is already */
+        if (!user_range(out, 4)) {
+            return ERR(EFAULT);
+        }
+        tty_set_foreground(*(const int32_t *)out);
+        return 0;
     case FIONREAD:
         /* Nothing is ever waiting: a key is read when it is asked for. */
         if (!user_range(out, 4)) {
@@ -406,11 +819,27 @@ static uint64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t out) {
         *(uint32_t *)out = 0;
         return 0;
     }
-    return ERR(ENOTTY);
+    return vt_ioctl(request, out);
 }
 
 /* Whether a file is there. Nothing here has permissions, so being there is
    the whole of the answer. */
+/* A module's /dev file, by name: whether it is one, and what it is. */
+static bool mod_named(const char *name, uint32_t *mode, uint32_t *rdev) {
+    const char *leaf;
+    const struct file_ops *ops = ops_named(name, &leaf);
+    uint32_t m = 0, r = 0;
+
+    if (ops == NULL || !ops->named(leaf, &m, &r)) {
+        return false;
+    }
+    if (mode != NULL) {
+        *mode = m;
+        *rdev = r;
+    }
+    return true;
+}
+
 static uint64_t sys_access(uint64_t path, uint64_t mode, uint64_t c) {
     struct fs_file file;
     const char *name = user_string(path);
@@ -421,7 +850,7 @@ static uint64_t sys_access(uint64_t path, uint64_t mode, uint64_t c) {
         return ERR(EFAULT);
     }
     if (proc_command(name) != NULL || proc_folder(name) || proc_net_name(name) != NULL ||
-        dev_named(name) != 0 || dev_folder(name)) {
+        dev_named(name) != 0 || dev_folder(name) || mod_named(name, NULL, NULL)) {
         return 0;
     }
     if (fs_stat(name, &file) == 0) {
@@ -433,14 +862,19 @@ static uint64_t sys_access(uint64_t path, uint64_t mode, uint64_t c) {
 static uint64_t sys_faccessat(uint64_t dirfd, uint64_t path, uint64_t mode) {
     char joined[FS_NAME_LEN];
     const char *name = at_path(dirfd, user_string(path), joined, sizeof joined);
+    char target[FS_NAME_LEN + 16];
     struct fs_file file;
 
     (void)mode;
     if (name == NULL) {
         return ERR(EFAULT);
     }
+    if (proc_fd_target(name, target, sizeof target) != NULL) {
+        name = target;
+    }
     if (proc_command(name) != NULL || proc_folder(name) || proc_net_name(name) != NULL ||
-        dev_named(name) != 0 || dev_folder(name) || fs_stat(name, &file) == 0) {
+        dev_named(name) != 0 || dev_folder(name) || mod_named(name, NULL, NULL) ||
+        fs_stat(name, &file) == 0) {
         return 0;
     }
     return fs_folder_at(name, &(unsigned){ 0 }) == 0 ? 0 : ERR(ENOENT);
@@ -496,8 +930,9 @@ static uint64_t poll_once(struct pollfd *p, uint64_t count, bool *sockets) {
         /* Reading the console waits for a key, so it is only ready once one
            has been typed, and a socket once a packet has come; everything
            else is there the moment it is asked about. */
-        if (h->start == SOCK_MARK) {
-            unsigned r = net != NULL ? net->ready((int)h->folder) : NET_ERR;
+        if (h->start == SOCK_MARK || h->start == MOD_MARK) {
+            unsigned r = h->start == SOCK_MARK ? sock_ready(h)
+                       : ops_of(h) != NULL ? ops_of(h)->ready(h) : NET_ERR;
 
             *sockets = true;
             p[i].revents = (int16_t)(((p[i].events & POLLIN) && (r & NET_IN) ? POLLIN : 0) |
@@ -507,6 +942,7 @@ static uint64_t poll_once(struct pollfd *p, uint64_t count, bool *sockets) {
             continue;
         }
         if ((p[i].events & POLLIN) != 0 &&
+            (h->start != DEV_MARK || h->folder < DEV_EVENT0 || input_ready(h->folder - DEV_EVENT0)) &&
             (h->start != PIPE_MARK ||
              (h->size != PIPE_EVENT && h->size != PIPE_PAIR && h->size != PIPE_READ) ||
              event_ready(h) || readable(h)) &&
@@ -558,6 +994,154 @@ static uint64_t sys_ppoll(uint64_t fds, uint64_t count, uint64_t timeout) {
         return ERR(EFAULT);
     }
     return poll_until(fds, count, timeout == 0 ? -1 : spec[0] * 1000 + spec[1] / 1000000);
+}
+
+/* ---- epoll ----------------------------------------------------------------
+ *
+ * poll with the list kept in the kernel: epoll_ctl adds a descriptor once,
+ * and every epoll_wait looks at all of them - an X server's main loop. The
+ * list lives in a buffer descriptor of its own (buffer_open), which is what
+ * the epoll descriptor is, and goes with it. Readiness is poll's; every
+ * entry is level-triggered, which an edge-triggered user only sees as
+ * being told twice. */
+
+#define EPOLL_LIST    4096
+#define EPOLL_ENTRIES ((EPOLL_LIST - 8) / 16)
+#define EPOLL_CTL_ADD 1
+#define EPOLL_CTL_DEL 2
+#define EPOLL_CTL_MOD 3
+#define EPOLLONESHOT  (1u << 30)
+#define EPOLL_EVENTS  0x201F        /* IN, PRI, OUT, ERR, HUP, RDHUP */
+
+struct epoll_event {
+    uint32_t events;
+    uint64_t data;
+} __attribute__((packed));
+
+struct epoll_set {
+    uint32_t count, pad;
+    struct { int32_t fd; uint32_t events; uint64_t data; } entry[EPOLL_ENTRIES];
+};
+
+_Static_assert(sizeof(struct epoll_set) <= EPOLL_LIST, "an epoll set fits its buffer");
+
+static uint64_t sys_epoll_create1(uint64_t flags, uint64_t b, uint64_t c) {
+    uint64_t fd = buffer_open(EPOLL_LIST);
+
+    (void)b;
+    (void)c;
+    if ((int64_t)fd >= 0 && (flags & O_CLOEXEC) != 0) {
+        fd_cloexec(fd, true);
+    }
+    return fd;
+}
+
+static struct epoll_set *epoll_of(uint64_t fd) {
+    return pipe_data(handle_of(fd));
+}
+
+static uint64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t fd) {
+    struct epoll_set *set = epoll_of(epfd);
+    uint64_t at = arg[3];
+    const struct epoll_event *e = (const struct epoll_event *)at;
+    unsigned i = 0;
+
+    if (set == NULL || handle_of(fd) == NULL) {
+        return ERR(EBADF);
+    }
+    if (op != EPOLL_CTL_DEL && !user_range(at, sizeof *e)) {
+        return ERR(EFAULT);
+    }
+    while (i < set->count && set->entry[i].fd != (int32_t)fd) {
+        i++;
+    }
+    switch (op) {
+    case EPOLL_CTL_ADD:
+        if (i < set->count) {
+            return ERR(EEXIST);
+        }
+        if (set->count == EPOLL_ENTRIES) {
+            return ERR(ENOSPC);
+        }
+        set->count++;
+        __attribute__((fallthrough));   /* the new one is filled in like a change */
+    case EPOLL_CTL_MOD:
+        if (i == set->count) {
+            return ERR(ENOENT);
+        }
+        set->entry[i].fd = (int32_t)fd;
+        set->entry[i].events = e->events;
+        set->entry[i].data = e->data;
+        return 0;
+    case EPOLL_CTL_DEL:
+        if (i == set->count) {
+            return ERR(ENOENT);
+        }
+        set->entry[i] = set->entry[--set->count];
+        return 0;
+    }
+    return ERR(EINVAL);
+}
+
+/* The entries ready now, up to max of them, into out; how many. */
+static uint64_t epoll_once(struct epoll_set *set, struct epoll_event *out, uint64_t max) {
+    uint64_t found = 0;
+    bool sockets = false;
+
+    for (unsigned i = 0; i < set->count && found < max; i++) {
+        struct pollfd p = { .fd = set->entry[i].fd,
+                            .events = (int16_t)(set->entry[i].events & EPOLL_EVENTS) };
+
+        if (p.events == 0 || poll_once(&p, 1, &sockets) == 0) {
+            continue;
+        }
+        out[found].events = (uint32_t)(uint16_t)p.revents;
+        out[found].data = set->entry[i].data;
+        found++;
+        if ((set->entry[i].events & EPOLLONESHOT) != 0) {
+            set->entry[i].events = 0;   /* until epoll_ctl arms it again */
+        }
+    }
+    return found;
+}
+
+static uint64_t epoll_until(uint64_t epfd, uint64_t events, uint64_t max, int64_t wait_ms) {
+    struct epoll_set *set = epoll_of(epfd);
+    int64_t until = (int64_t)efi_uptime_ms() + wait_ms;
+    uint64_t found;
+
+    if (set == NULL) {
+        return ERR(EBADF);
+    }
+    if ((int64_t)max <= 0 || !user_range(events, max * sizeof(struct epoll_event))) {
+        return ERR((int64_t)max <= 0 ? EINVAL : EFAULT);
+    }
+    uint64_t began = wait_began();
+
+    while ((found = epoll_once(set, (struct epoll_event *)events, max)) == 0 &&
+           (wait_ms < 0 || (int64_t)efi_uptime_ms() < until)) {
+        if (interrupt_check()) {
+            wait_ended(began);
+            return ERR(EINTR);
+        }
+        thread_yield();
+    }
+    wait_ended(began);
+    return found;
+}
+
+static uint64_t sys_epoll_wait(uint64_t epfd, uint64_t events, uint64_t max) {
+    return epoll_until(epfd, events, max, (int32_t)arg[3]);
+}
+
+/* epoll_pwait2's timeout is a timespec, NULL for ever. */
+static uint64_t sys_epoll_pwait2(uint64_t epfd, uint64_t events, uint64_t max) {
+    const int64_t *spec = (const int64_t *)arg[3];
+
+    if (arg[3] != 0 && !user_range(arg[3], 16)) {
+        return ERR(EFAULT);
+    }
+    return epoll_until(epfd, events, max, arg[3] == 0 ? -1 : spec[0] * 1000 + spec[1] / 1000000);
 }
 
 /* Capabilities: root has them all. A program that drops some is told it
@@ -656,13 +1240,63 @@ static uint64_t sys_no_xattr(uint64_t a, uint64_t b, uint64_t c) {
     return ERR(EOPNOTSUPP);
 }
 
-/* A hard link, or a device node: there are neither here, and a program told
-   so goes on to copy rather than stopping. */
-static uint64_t sys_no_links(uint64_t a, uint64_t b, uint64_t c) {
-    (void)a;
-    (void)b;
+#define LINK_MAX_COPY (1024 * 1024)
+
+/* A second name for a file. The filesystem has one name a file, so the
+   second is a copy - which is all a program wants of one it makes to put a
+   lock file in place without a race: the name there, holding the same. */
+static uint64_t link_copy(const char *from, const char *to) {
+    struct fs_file file, there;
+    char *data = NULL;
+    int err;
+
+    if (from == NULL || to == NULL) {
+        return ERR(EFAULT);
+    }
+    if (fs_stat(from, &file) != 0) {
+        return ERR(ENOENT);
+    }
+    if (fs_lstat(to, &there) == 0) {
+        return ERR(EEXIST);
+    }
+    if (file.size > LINK_MAX_COPY || (file.size & FS_LINK) != 0) {
+        return ERR(EPERM);
+    }
+    if (file.size > 0) {
+        if ((data = mem_alloc(file.size + SECTOR_SIZE)) == NULL) {
+            return ERR(ENOMEM);
+        }
+        if (fs_read_many(file.start, 0, (file.size + SECTOR_SIZE - 1) / SECTOR_SIZE, data) < 0) {
+            mem_free(data);
+            return ERR(EIO);
+        }
+    }
+    err = fs_write(to, data, file.size);
+    mem_free(data);
+    return err < 0 ? fs_errno(err) : 0;
+}
+
+/* user_string answers in one buffer, so each name is copied out of it
+   before the next is asked for. */
+static uint64_t sys_linkat(uint64_t olddir, uint64_t oldpath, uint64_t newdir) {
+    char a[FS_NAME_LEN], b[FS_NAME_LEN];
+    const char *from = at_path(olddir, user_string(oldpath), a, sizeof a);
+
+    if (from != NULL && from != a) {
+        strcpy(a, from);
+        from = a;
+    }
+    return link_copy(from, at_path(newdir, user_string(arg[3]), b, sizeof b));
+}
+
+static uint64_t sys_link(uint64_t from, uint64_t to, uint64_t c) {
+    uint64_t kept = arg[3], result;
+
     (void)c;
-    return ERR(EPERM);
+    arg[3] = to;
+    result = sys_linkat((uint64_t)AT_FDCWD, from, (uint64_t)AT_FDCWD);
+    arg[3] = kept;
+    return result;
 }
 
 /* A FIFO, though, is an empty file that says so in its mode: opened, it is
@@ -720,7 +1354,7 @@ static uint64_t sys_getrlimit(uint64_t resource, uint64_t out, uint64_t c) {
 
 static uint64_t sys_fstatfs(uint64_t fd, uint64_t out, uint64_t c) {
     (void)c;
-    return handle_of(fd) == NULL ? ERR(EBADF) : statfs_fill(out);
+    return handle_of(fd) == NULL ? ERR(EBADF) : statfs_fill(out, mount_of_fd(fd));
 }
 
 /* ---- symbolic links ------------------------------------------------------
@@ -759,6 +1393,15 @@ static uint64_t sys_readlinkat(uint64_t dirfd, uint64_t path, uint64_t buf) {
 
     if (name == NULL || !user_range(buf, size)) {
         return ERR(EFAULT);
+    }
+    char target[FS_NAME_LEN + 16];
+
+    if (proc_fd_target(name, target, sizeof target) != NULL) {
+        size_t n = strlen(target);
+
+        n = n < size ? n : size;
+        memcpy((void *)buf, target, n);
+        return n;                   /* a link's text: no NUL */
     }
     got = fs_readlink(name, (char *)buf, size);
     return got < 0 ? fs_errno(got) : (uint64_t)got;
@@ -820,6 +1463,16 @@ static unsigned folder_mode(uint64_t ino) {
            (entry.start & FS_MODE) != 0 ? entry.start & 07777 : 0755;
 }
 
+/* Linux's number for a device: what tells a program one from another. */
+static uint16_t rdev_of(unsigned which) {
+    for (unsigned i = 0; i < DEVICES; i++) {
+        if (devices[i].which == which) {
+            return devices[i].rdev;
+        }
+    }
+    return 0;
+}
+
 static void fill_stat(struct stat *out, uint64_t size, bool folder, uint32_t start) {
     memset(out, 0, sizeof *out);
     out->dev = 1;
@@ -866,11 +1519,23 @@ static uint64_t stat_of_handle(uint64_t fd, struct stat *st) {
         st->mode = S_IFSOCK | 0777;
         st->size = 0;
         st->blocks = 0;
+    } else if (h->start == MOD_MARK) {
+        uint32_t mode = S_IFCHR | 0620, rdev = 0;
+
+        if (ops_of(h) != NULL) {
+            ops_of(h)->stat(h, &mode, &rdev);
+        }
+        st->mode = mode;
+        st->rdev = rdev;
+        st->size = 0;
+        st->blocks = 0;
+        st->ino = DEV_INO + 0x100 + h->folder;
     } else if (h->start == DEV_MARK) {
         st->mode = S_IFCHR | 0666;
         st->size = 0;
         st->blocks = 0;
-        st->rdev = 0x0103;
+        st->ino = DEV_INO + h->folder;
+        st->rdev = rdev_of(h->folder);
     }
     return 0;
 }
@@ -902,7 +1567,27 @@ struct statx {
 
 #define STATX_BASIC 0x7ff
 
+static uint64_t statx_core(uint64_t dirfd, uint64_t path, uint64_t flags);
+
+/* statx, saying which mount too (STATX_MNT_ID), as a udev library asks. */
+#define STATX_MNT_ID 0x1000
+
 static uint64_t sys_statx(uint64_t dirfd, uint64_t path, uint64_t flags) {
+    uint64_t result = statx_core(dirfd, path, flags);
+    struct statx *out = (struct statx *)arg[4];
+    const char *given = user_string(path);
+
+    if (result == 0) {
+        char joined[FS_NAME_LEN];
+
+        out->mask |= STATX_MNT_ID;
+        out->rest[0] = given != NULL && given[0] == '\0' ? mount_of_fd(dirfd)
+                     : mount_named(at_path(dirfd, given, joined, sizeof joined));
+    }
+    return result;
+}
+
+static uint64_t statx_core(uint64_t dirfd, uint64_t path, uint64_t flags) {
     struct statx *out = (struct statx *)arg[4];
     char joined[FS_NAME_LEN];
     const char *given = user_string(path);
@@ -910,8 +1595,13 @@ static uint64_t sys_statx(uint64_t dirfd, uint64_t path, uint64_t flags) {
     struct fs_file file;
     bool folder = false;
 
+    char target[FS_NAME_LEN + 16];
+
     if (name == NULL || !user_range(arg[4], sizeof *out)) {
         return ERR(EINVAL);
+    }
+    if (proc_fd_target(name, target, sizeof target) != NULL) {
+        name = target;              /* /proc/self/fd/N: what it names */
     }
     /* An empty path is the descriptor itself - which is what a libc's fstat
        has become, so this is the common case rather than a corner of one. */
@@ -930,13 +1620,27 @@ static uint64_t sys_statx(uint64_t dirfd, uint64_t path, uint64_t flags) {
         out->ino = st.ino;
         out->size = st.size;
         out->blocks = (uint64_t)st.blocks;
+        out->rdev_major = (uint32_t)(st.rdev >> 8);
         out->rdev_minor = (uint32_t)(st.rdev & 0xFF);
         out->dev_minor = 1;
         return 0;
     }
     const struct proc_cmd *cmd = proc_command(name);
     enum dev which = dev_named(name);
+    uint32_t mmode, mrdev;
 
+    if (mod_named(name, &mmode, &mrdev)) {
+        memset(out, 0, sizeof *out);
+        out->mask = STATX_BASIC;
+        out->blksize = SECTOR_SIZE;
+        out->nlink = 1;
+        out->mode = (uint16_t)mmode;
+        out->ino = DEV_INO + 0x100 + (mrdev & 0xFF);
+        out->rdev_major = mrdev >> 8;
+        out->rdev_minor = mrdev & 0xFF;
+        out->dev_minor = 1;
+        return 0;
+    }
     if (cmd != NULL || proc_folder(name) || which != 0 || dev_folder(name)) {
         memset(out, 0, sizeof *out);
         out->mask = STATX_BASIC;
@@ -944,8 +1648,10 @@ static uint64_t sys_statx(uint64_t dirfd, uint64_t path, uint64_t flags) {
         out->nlink = 1;
         out->mode = (uint16_t)(which != 0 ? S_IFCHR | 0666 :
                                cmd != NULL ? S_IFREG | 0755 : S_IFDIR | 0755);
-        out->ino = PROC_INO;
+        out->ino = which != 0 ? DEV_INO + which : PROC_INO;
         out->size = cmd != NULL ? proc_read(cmd, 0, NULL, 0) : 0;
+        out->rdev_major = rdev_of(which) >> 8;
+        out->rdev_minor = rdev_of(which) & 0xFF;
         out->dev_minor = 1;
         return 0;
     }
@@ -1001,6 +1707,11 @@ static uint64_t sys_newfstatat(uint64_t dirfd, uint64_t path, uint64_t out) {
     if (name[0] == '\0') {
         return sys_fstat(dirfd, out, 0);
     }
+    char target[FS_NAME_LEN + 16];
+
+    if (proc_fd_target(name, target, sizeof target) != NULL) {
+        name = target;
+    }
     const struct proc_cmd *cmd = proc_command(name);
 
     if (cmd != NULL) {
@@ -1018,10 +1729,18 @@ static uint64_t sys_newfstatat(uint64_t dirfd, uint64_t path, uint64_t out) {
         ((struct stat *)out)->mode = S_IFREG | 0444;
         return 0;
     }
+    uint32_t mmode, mrdev;
+
+    if (mod_named(name, &mmode, &mrdev)) {
+        fill_stat((struct stat *)out, 0, false, DEV_INO + 0x100 + (mrdev & 0xFF));
+        ((struct stat *)out)->mode = mmode;
+        ((struct stat *)out)->rdev = mrdev;
+        return 0;
+    }
     if (dev_named(name) != 0) {
-        fill_stat((struct stat *)out, 0, false, PROC_INO);
+        fill_stat((struct stat *)out, 0, false, DEV_INO + dev_named(name));
         ((struct stat *)out)->mode = S_IFCHR | 0666;
-        ((struct stat *)out)->rdev = 0x0103;     /* what Linux calls /dev/null */
+        ((struct stat *)out)->rdev = rdev_of(dev_named(name));
         return 0;
     }
     if (dev_folder(name)) {
@@ -1127,12 +1846,25 @@ static uint64_t proc_dents(struct handle *h, uint64_t buf, uint64_t count) {
     return used;
 }
 
-/* /dev, from its table: names as the folder shows them, without "/dev/". */
+/* /dev, from its table: names as the folder shows them, without "/dev/" -
+   or /dev/input, with folder 2, and without "/dev/input/". /dev lists that
+   folder as one more entry past the table. */
 static uint64_t dev_dents(struct handle *h, uint64_t buf, uint64_t count) {
+    static const char input[] = "input/";
     uint64_t used = 0;
 
-    for (; h->offset < DEVICES; h->offset++) {
-        const char *name = devices[h->offset].name + sizeof "/dev/" - 1;
+    if (h->folder == 3) {
+        return 0;                   /* /dev/pts: its terminals are ipc/pty's, by number */
+    }
+    for (; h->offset <= DEVICES; h->offset++) {
+        const char *name = h->offset == DEVICES ? "input" :
+                           devices[h->offset].name + sizeof "/dev/" - 1;
+        bool inside = memcmp(name, input, sizeof input - 1) == 0;
+
+        if ((h->folder == 2) != inside || (h->folder == 2 && h->offset == DEVICES)) {
+            continue;
+        }
+        name += inside ? sizeof input - 1 : 0;
         size_t length = strlen(name);
         uint64_t reclen = (sizeof(struct dirent64) + length + 1 + 7) & ~7ull;
 
@@ -1144,7 +1876,7 @@ static uint64_t dev_dents(struct handle *h, uint64_t buf, uint64_t count) {
         out->ino = DEV_INO + h->offset + 1;
         out->off = (int64_t)(h->offset + 1);
         out->reclen = (uint16_t)reclen;
-        out->type = DT_CHR;
+        out->type = h->offset == DEVICES ? DT_DIR : DT_CHR;
         memcpy(out->name, name, length + 1);
         used += reclen;
     }
@@ -1235,9 +1967,13 @@ static uint64_t sys_sysinfo(uint64_t out, uint64_t b, uint64_t c) {
     return 0;
 }
 
+/* The system's name is Tuxlet, unless /etc/tuxlet/uname's first line says
+   otherwise - "Linux" for a program that will not run anywhere else. */
 static uint64_t sys_uname(uint64_t out, uint64_t b, uint64_t c) {
     static const char *const fields[] = { "Tuxlet", "tuxlet", "1", "1", "x86_64", "" };
     char *field = (char *)out;
+    struct fs_file file;
+    const char *name;
 
     (void)b;
     (void)c;
@@ -1247,6 +1983,14 @@ static uint64_t sys_uname(uint64_t out, uint64_t b, uint64_t c) {
     for (unsigned i = 0; i < 6; i++, field += 65) {
         memset(field, 0, 65);
         memcpy(field, fields[i], strlen(fields[i]));
+    }
+    if (fs_stat("/etc/tuxlet/uname", &file) == 0 && file.size > 0 &&
+        (name = fs_sector(file.start, 0)) != NULL) {
+        field = (char *)out;
+        memset(field, 0, 65);
+        for (unsigned i = 0; i < file.size && i < 64 && name[i] != '\n'; i++) {
+            field[i] = name[i];
+        }
     }
     return 0;
 }
@@ -1431,6 +2175,7 @@ static const uint16_t numbers[] = {
     SYS_TRUNCATE,
     SYS_POLL,
     SYS_PPOLL,
+    213, 291, 233, 232, 281, 441,       /* epoll_create, _create1, _ctl, _wait, _pwait, _pwait2 */
     SYS_FSTATFS,
     SYS_GETRLIMIT,
     SYS_SETRLIMIT,
@@ -1499,14 +2244,16 @@ static const syscall_fn handlers[] = {
     sys_pselect6,
     sys_renameat,
     sys_renameat,
-    sys_no_links,
+    sys_linkat,
     sys_symlinkat,
-    sys_no_links,
+    sys_link,
     sys_symlink,
     sys_mknodat,
     sys_truncate,
     sys_poll,
     sys_ppoll,
+    sys_epoll_create1, sys_epoll_create1, sys_epoll_ctl, sys_epoll_wait, sys_epoll_wait,
+    sys_epoll_pwait2,
     sys_fstatfs,
     sys_getrlimit,
     sys_ok,
@@ -1531,8 +2278,12 @@ static const syscall_fn handlers[] = {
 };
 
 static syscall_fn find(uint64_t number) {
-    if (number >= SYS_SETXATTR && number <= SYS_FREMOVEXATTR) {
-        return sys_no_xattr;        /* all twelve of them, one answer */
+    if ((number >= SYS_SETXATTR && number <= SYS_FREMOVEXATTR) ||
+        number == 303 || number == 304) {
+        /* All twelve xattr calls, and name_to_handle_at and open_by_handle_at:
+           a filesystem without them, as Linux says it - which is what has a
+           udev library fall back to finding its way by path. */
+        return sys_no_xattr;
     }
     for (unsigned i = 0; i < sizeof numbers / sizeof numbers[0]; i++) {
         if (numbers[i] == number) {

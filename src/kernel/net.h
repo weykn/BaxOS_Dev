@@ -116,6 +116,40 @@ struct net_ops {
 
 extern const struct net_ops *net;
 
+/* AF_UNIX sockets, once the ipc/unix module is in. A connected one is a
+ * socketpair end - the kernel's own pipes, read, written, polled and closed
+ * like any - so only one not connected yet is the module's: made, bound or
+ * listening, a SOCK_MARK descriptor with SOCK_UNIX in its offset and the
+ * module's number for it in folder. */
+struct unix_ops {
+    /* The handler for a syscall, if it is the module's: socket(AF_UNIX), or
+       a socket call on one of its descriptors or a socketpair end. */
+    syscall_fn (*syscall)(uint64_t number, uint64_t first);
+    void     (*hold)(int s);                /* one more descriptor on it */
+    void     (*drop)(int s);                /* one fewer: the last closes it */
+    unsigned (*ready)(int s);               /* NET_* bits */
+};
+
+extern const struct unix_ops *unix_sock;
+void unix_register(const struct unix_ops *ops);
+
+/* A socket descriptor, whichever module's it is: one more on it, one fewer,
+   and what it is ready for (NET_*). */
+void     sock_hold(const struct handle *h);
+void     sock_drop(const struct handle *h);
+unsigned sock_ready(const struct handle *h);
+
+/* Two connected socketpair ends, not yet anyone's descriptors - flags is
+   socket()'s, for O_NONBLOCK. False if there is no room. */
+bool pair_new(struct handle out[2], uint32_t flags);
+
+/* Lets go of a handle no descriptor holds: one queued and never taken. */
+void handle_close(struct handle *h);
+
+/* read and write on a descriptor, as the syscalls do them. */
+uint64_t fd_read(uint64_t fd, uint64_t buf, uint64_t count);
+uint64_t fd_write(uint64_t fd, uint64_t buf, uint64_t count);
+
 /* Called by the module as it starts, and with NULL as it goes. */
 void net_register(const struct net_ops *ops);
 

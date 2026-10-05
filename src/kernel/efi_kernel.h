@@ -28,6 +28,13 @@ uint64_t efi_epoch(void);
 uint64_t efi_uptime_ms(void);
 uint64_t efi_uptime_us(void);
 
+/* How fast that counter runs, ticks a second: the processor's own clock. */
+uint64_t efi_tsc_hz(void);
+
+/* The machine's name and version, as its SMBIOS system record has them;
+   "" where the firmware gives none. */
+const char *efi_machine(unsigned which);
+
 /* RAM free right now, as the firmware's memory map has it, in KiB. Only
    while the firmware is still running; mem_free_kib knows which to ask. */
 uint64_t efi_free_kib(void);

@@ -63,6 +63,8 @@ long sys_recv(int s, void *buf, size_t n);
 /* Runs path with argv, as a child, and answers its exit code - or a
    negated errno if it could not be started. */
 int run(const char *path, const char *const *argv);
+/* The same with extra NAME=value pairs in front of the environment, NULL-ended. */
+int run_env(const char *path, const char *const *argv, const char *const *extra);
 
 void *xalloc(size_t bytes);         /* zeroed; tells the user if there is none */
 void  xfree(void *p);

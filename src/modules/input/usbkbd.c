@@ -10,6 +10,7 @@
 
 #include "driver.h"
 #include "efi_kernel.h"
+#include "input.h"
 #include "module.h"
 #include "string.h"
 #include "usb.h"
@@ -106,8 +107,60 @@ static void type(uint8_t usage, uint8_t mods) {
     push(c);
 }
 
+/* Linux's number for each usage up to 0x65, and for the eight modifiers
+   in the report's first byte. */
+static const uint8_t keycode[0x66] = {
+      0,   0,   0,   0,  30,  48,  46,  32,  18,  33,  34,  35,  23,  36,  37,  38,
+     50,  49,  24,  25,  16,  19,  31,  20,  22,  47,  17,  45,  21,  44,   2,   3,
+      4,   5,   6,   7,   8,   9,  10,  11,  28,   1,  14,  15,  57,  12,  13,  26,
+     27,  43,  43,  39,  40,  41,  51,  52,  53,  58,  59,  60,  61,  62,  63,  64,
+     65,  66,  67,  68,  87,  88,  99,  70, 119, 110, 102, 104, 111, 107, 109, 106,
+    105, 108, 103,  69,  98,  55,  74,  78,  96,  79,  80,  81,  75,  76,  77,  71,
+     72,  73,  82,  83,  86, 127,
+};
+static const uint8_t modifier[8] = { 29, 42, 56, 125, 97, 54, 100, 126 };
+
+static bool holds(const uint8_t *r, uint8_t usage) {
+    for (unsigned j = 2; j < 8; j++) {
+        if (r[j] == usage) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The same report as evdev events: what went up, then what went down. */
+static void events(const uint8_t *was, const uint8_t *now) {
+    bool any = false;
+
+    for (unsigned i = 0; i < 8; i++) {
+        if (((was[0] ^ now[0]) >> i & 1) != 0) {
+            input_report(INPUT_KEYBOARD, EV_KEY, modifier[i], now[0] >> i & 1);
+            any = true;
+        }
+    }
+    for (unsigned j = 2; j < 8; j++) {
+        if (was[j] >= 4 && was[j] < sizeof keycode && !holds(now, was[j])) {
+            input_report(INPUT_KEYBOARD, EV_KEY, keycode[was[j]], 0);
+            any = true;
+        }
+    }
+    for (unsigned j = 2; j < 8; j++) {
+        if (now[j] >= 4 && now[j] < sizeof keycode && !holds(was, now[j])) {
+            input_report(INPUT_KEYBOARD, EV_KEY, keycode[now[j]], 1);
+            any = true;
+        }
+    }
+    if (any) {
+        input_report(INPUT_KEYBOARD, EV_SYN, 0, 0);
+    }
+}
+
 /* A report from keyboard k: each key down now that was not before. */
 static void report(unsigned k, const uint8_t *now) {
+    if (now[2] != 1) {              /* 1 in every slot: too many keys at once */
+        events(last[k], now);
+    }
     for (unsigned i = 2; i < 8; i++) {
         uint8_t usage = now[i];
         bool before = false;

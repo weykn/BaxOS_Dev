@@ -1,4 +1,4 @@
-/* input/ps2: the PS/2 keyboard.
+/* input/ps2: the PS/2 keyboard, and the mouse on the second port.
  *
  * The firmware's own keyboard driver, which empties the port on a timer, is
  * stopped, and every byte is read here instead - the way an operating system
@@ -16,6 +16,7 @@
 #include "driver.h"
 #include "efi.h"
 #include "efi_kernel.h"
+#include "input.h"
 #include "io.h"
 #include "mem.h"
 #include "module.h"
@@ -33,9 +34,12 @@
 #define CMD_READ_CONFIG  0x20
 #define CMD_WRITE_CONFIG 0x60
 #define CMD_ENABLE_KBD   0xAE
+#define CMD_ENABLE_AUX   0xA8
+#define CMD_WRITE_AUX    0xD4   /* the next data byte goes to the mouse */
 
 #define CONFIG_IRQS      0x03   /* interrupts, which nothing here takes */
 #define CONFIG_CLOCKS    0x30   /* set, they switch a port off */
+#define CONFIG_AUX_OFF   0x20   /* the second port's */
 #define CONFIG_TRANSLATE 0x40   /* hand over scancode set 1 */
 
 #define DEV_ENABLE   0xF4
@@ -43,12 +47,14 @@
 /* ACPI's name for a PS/2 keyboard, compressed the EISA way: PNP03xx. */
 #define EISA_PNP      0x41D0
 #define PNP_KEYBOARD  0x03
+#define PNP_MOUSE     0x0F      /* PNP0Fxx */
 
 static bool present;
+static bool mouse;              /* one answered on the second port */
 
 /* ---- stopping the firmware's drivers ------------------------------------ */
 
-/* Whether a handle's device path ends at a PS/2 keyboard. */
+/* Whether a handle's device path ends at a PS/2 keyboard or mouse. */
 static bool is_ps2(efi_handle handle) {
     struct efi_guid guid = EFI_DEVICE_PATH_GUID;
     struct efi_device_path *node;
@@ -64,7 +70,7 @@ static bool is_ps2(efi_handle handle) {
             uint32_t hid = *(uint32_t *)((uint8_t *)node + 4);
             unsigned kind = hid >> 24;      /* PNP0303 is 0x030341D0 */
 
-            if ((hid & 0xFFFF) == EISA_PNP && kind == PNP_KEYBOARD) {
+            if ((hid & 0xFFFF) == EISA_PNP && (kind == PNP_KEYBOARD || kind == PNP_MOUSE)) {
                 return true;
             }
         }
@@ -81,7 +87,7 @@ static bool is_ps2(efi_handle handle) {
    on a machine without one the ports read back as all ones. */
 static bool stop_firmware(void) {
     struct efi_boot_services *bs;
-    struct efi_guid guid = EFI_SIMPLE_TEXT_INPUT_GUID;
+    struct efi_guid guid = EFI_DEVICE_PATH_GUID;
     efi_handle *handles;
     efi_uintn count = 0;
     bool found = false;
@@ -164,7 +170,7 @@ static bool ps2_init(void) {
     if (config < 0) {
         config = CONFIG_TRANSLATE;
     }
-    config = (config & ~(CONFIG_IRQS | CONFIG_CLOCKS)) | CONFIG_TRANSLATE;
+    config = (config & ~(CONFIG_IRQS | CONFIG_CLOCKS)) | CONFIG_TRANSLATE | CONFIG_AUX_OFF;
     command(CMD_WRITE_CONFIG);
     data((uint8_t)config);
     command(CMD_ENABLE_KBD);
@@ -172,7 +178,19 @@ static bool ps2_init(void) {
     data(DEV_ENABLE);               /* the firmware may have left it quiet */
     (void)read_byte(false);
 
-    dbg("ps2: config %x\n", (uint64_t)config);
+    /* A controller with a second port turns its clock on when told to; one
+       without leaves the bit as it was. Then the mouse is asked to talk. */
+    command(CMD_ENABLE_AUX);
+    command(CMD_READ_CONFIG);
+    int aux = read_byte(false);
+
+    if (aux >= 0 && (aux & CONFIG_AUX_OFF) == 0) {
+        command(CMD_WRITE_AUX);
+        data(DEV_ENABLE);
+        mouse = read_byte(true) == 0xFA;
+    }
+
+    dbg("ps2: config %x mouse %u\n", (uint64_t)config, (uint64_t)mouse);
     return true;
 }
 
@@ -259,6 +277,32 @@ static const char *function_key(uint8_t code) {
          : code == 0x57 ? "\033[23~" : code == 0x58 ? "\033[24~" : NULL;
 }
 
+/* Linux's number for a key behind E0; set 1 numbers the rest the same as
+   Linux does, up to F12. */
+static unsigned extended_key(uint8_t key) {
+    switch (key) {
+    case 0x1C: return 96;           /* KEY_KPENTER */
+    case 0x1D: return 97;           /* KEY_RIGHTCTRL */
+    case 0x35: return 98;           /* KEY_KPSLASH */
+    case 0x37: return 99;           /* KEY_SYSRQ */
+    case 0x38: return 100;          /* KEY_RIGHTALT */
+    case 0x47: return 102;          /* KEY_HOME */
+    case 0x48: return 103;          /* KEY_UP */
+    case 0x49: return 104;          /* KEY_PAGEUP */
+    case 0x4B: return 105;          /* KEY_LEFT */
+    case 0x4D: return 106;          /* KEY_RIGHT */
+    case 0x4F: return 107;          /* KEY_END */
+    case 0x50: return 108;          /* KEY_DOWN */
+    case 0x51: return 109;          /* KEY_PAGEDOWN */
+    case 0x52: return 110;          /* KEY_INSERT */
+    case 0x53: return 111;          /* KEY_DELETE */
+    case 0x5B: return 125;          /* KEY_LEFTMETA */
+    case 0x5C: return 126;          /* KEY_RIGHTMETA */
+    case 0x5D: return 127;          /* KEY_COMPOSE */
+    default:   return 0;
+    }
+}
+
 static void key_byte(uint8_t code) {
     uint8_t key = code & ~SC_RELEASE;
     bool was_extended = extended;
@@ -267,6 +311,12 @@ static void key_byte(uint8_t code) {
     extended = code == SC_EXTENDED;
     if (extended) {
         return;
+    }
+    unsigned keycode = was_extended ? extended_key(key) : key <= 0x58 ? key : 0;
+
+    if (keycode != 0) {
+        input_report(INPUT_KEYBOARD, EV_KEY, keycode, (code & SC_RELEASE) == 0);
+        input_report(INPUT_KEYBOARD, EV_SYN, 0, 0);
     }
     if (key == SC_LSHIFT || key == SC_RSHIFT) {
         if (!was_extended) {        /* E0 2A is a fake shift some keys send */
@@ -318,6 +368,46 @@ static void key_byte(uint8_t code) {
     key_push(c);
 }
 
+/* ---- the mouse ---------------------------------------------------------- */
+
+static uint8_t  packet[3];
+static unsigned packet_n;
+static uint8_t  buttons;
+
+/* Three bytes a movement: buttons and signs, then x, then y - y counting
+   up, where the screen counts down. The first always has bit 3 set, which
+   is how a byte lost along the way is noticed. */
+static void mouse_byte(uint8_t byte) {
+    static const unsigned button[3] = { BTN_LEFT, BTN_RIGHT, BTN_MIDDLE };
+
+    if (packet_n == 0 && (byte & 0x08) == 0) {
+        return;
+    }
+    packet[packet_n++] = byte;
+    if (packet_n < 3) {
+        return;
+    }
+    packet_n = 0;
+    int dx = packet[1] - (packet[0] << 4 & 0x100);
+    int dy = packet[2] - (packet[0] << 3 & 0x100);
+
+    if ((packet[0] & 0xC0) == 0) {  /* not overflowed */
+        if (dx != 0) {
+            input_report(INPUT_MOUSE, EV_REL, REL_X, dx);
+        }
+        if (dy != 0) {
+            input_report(INPUT_MOUSE, EV_REL, REL_Y, -dy);
+        }
+    }
+    for (unsigned i = 0; i < 3; i++) {
+        if (((packet[0] ^ buttons) >> i & 1) != 0) {
+            input_report(INPUT_MOUSE, EV_KEY, button[i], packet[0] >> i & 1);
+        }
+    }
+    buttons = packet[0] & 7;
+    input_report(INPUT_MOUSE, EV_SYN, 0, 0);
+}
+
 static void ps2_poll(void) {
     if (!present) {
         return;
@@ -331,7 +421,9 @@ static void ps2_poll(void) {
         uint8_t byte = inb(PS2_DATA);
 
         if (!(status & STATUS_AUX)) {
-            key_byte(byte);         /* anything from the other port is nobody's */
+            key_byte(byte);
+        } else if (mouse) {
+            mouse_byte(byte);
         }
     }
 }

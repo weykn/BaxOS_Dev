@@ -24,7 +24,9 @@
  * go of rather than refusing the free - a few pages lost, never a crash. */
 
 #define PAGE  4096
-#define RUNS  64
+#define RUNS  512           /* a program at a fixed address hands its pages
+                                   back one by one, between other programs'
+                                   own: every hole is a run (8 KiB in all) */
 
 static struct run {
     uint64_t at, count;
@@ -51,6 +53,26 @@ static struct efi_boot_services *firmware(void) {
 static void run_remove(unsigned i) {
     memmove(&runs[i], &runs[i + 1], (run_count - i - 1) * sizeof runs[0]);
     run_count--;
+}
+
+/* Free pages the list had no room for, chained through their own first
+   word: nothing kept anywhere, so a free list that has filled loses nothing.
+   Only above the gigabyte a program at a fixed address can hide (FIXED_TOP
+   below): a page down there could be under one while it is written. */
+#define LOOSE_FLOOR (1ull << 30)
+
+static uint64_t loose, loose_count;
+
+static void loosen(uint64_t at, uint64_t count) {
+    for (uint64_t i = 0; i < count; i++, at += PAGE) {
+        if (at < LOOSE_FLOOR) {
+            dbg("mem: runs full, page %x lost\n", at);
+            continue;
+        }
+        *(uint64_t *)at = loose;
+        loose = at;
+        loose_count++;
+    }
 }
 
 /* Puts at .. at + count back, joined to whatever it touches. */
@@ -85,8 +107,10 @@ static void run_add(uint64_t at, uint64_t count) {
             }
         }
         if (runs[smallest].count >= count) {
-            return;                             /* this one is the smallest */
+            loosen(at, count);                  /* this one is the smallest */
+            return;
         }
+        loosen(runs[smallest].at, runs[smallest].count);
         run_remove(smallest);
         if (smallest < i) {
             i--;
@@ -119,13 +143,41 @@ static bool run_take(uint64_t page) {
 
 static uint64_t take(size_t count);
 
-/* Memory the disk cache holds is free memory lent out: before an allocation
-   fails, the cache gives some back, as Linux's page cache does. */
-uint64_t mem_pages(size_t count) {
-    uint64_t at;
+/* The gigabyte a program linked to a fixed address runs in. While one runs,
+   its own tables stand in for that stretch of the kernel's view of memory
+   (vm.c), so whatever the kernel keeps there reads as the program's pages
+   instead. On a machine with memory above it, the kernel keeps out. */
+#define FIXED_TOP (1ull << 30)
 
-    while ((at = take(count)) == 0 && disk_cache != NULL &&
-           disk_cache->shrink(count * PAGE) > 0) {
+static uint64_t floor_kept(void) {
+    return ours && efi_boot()->ram_kib > (FIXED_TOP >> 10) ? FIXED_TOP : 0;
+}
+
+/* Memory the disk cache holds is free memory lent out: before an allocation
+   fails - or lands where a program would hide it - the cache gives some
+   back, as Linux's page cache does. */
+uint64_t mem_pages(size_t count) {
+    for (;;) {
+        uint64_t at = take(count);
+
+        if ((at != 0 && at >= floor_kept()) || disk_cache == NULL ||
+            disk_cache->shrink(count * PAGE) == 0) {
+            return at;
+        }
+        if (at != 0) {
+            run_add(at, count);
+        }
+    }
+}
+
+/* Pages for the disk cache: only from above that gigabyte, where there is
+   memory there, so that lending it out never pushes the kernel below. */
+uint64_t mem_pages_lent(size_t count) {
+    uint64_t at = take(count);
+
+    if (at != 0 && at < floor_kept()) {
+        run_add(at, count);
+        return 0;
     }
     return at;
 }
@@ -136,6 +188,13 @@ static uint64_t take(size_t count) {
 
         return EFI_ERROR(firmware()->allocate_pages(EFI_ALLOCATE_ANY, EFI_LOADER_DATA,
                                                     count, &at)) ? 0 : at;
+    }
+    if (count == 1 && loose != 0) {
+        uint64_t at = loose;                    /* a page that missed the list */
+
+        loose = *(uint64_t *)at;
+        loose_count--;
+        return at;
     }
     for (unsigned i = run_count; i-- > 0;) {
         if (runs[i].count >= count) {
@@ -493,7 +552,7 @@ uint64_t mem_free_kib(void) {
         for (unsigned i = 0; i < run_count; i++) {
             pages += runs[i].count;
         }
-        return pages * 4;
+        return (pages + loose_count) * 4;
     }
     return efi_free_kib();
 }

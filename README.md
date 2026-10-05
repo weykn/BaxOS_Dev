@@ -11,7 +11,7 @@
 
 **Tuxlet OS** bridges the gap between educational bare-metal kernels and production operating systems. It implements an independent kernel, custom shell (`tsh`), and native filesystem layout, yet supports standard Linux system calls to run unmodified Debian packages natively.
 
-Designed to be hyper-lightweight, Tuxlet OS requires only **128 KiB of RAM** and **512 KiB of storage** for its core components.
+Designed to be hyper-lightweight, Tuxlet OS requires only **256 KiB of RAM** and **512 KiB of storage** for its core components.
 
 ---
 
@@ -19,10 +19,10 @@ Designed to be hyper-lightweight, Tuxlet OS requires only **128 KiB of RAM** and
 
 * **Linux ABI Compatibility:** Runs standard, uncompiled Linux programs natively via Linux-style socket calls and `/proc` hooks.
 * **Custom Modular Architecture:** Dedicated kernel, shell (`tsh`), and dynamic loadable modules (storage, input, networking, and debugging).
-* **UEFI Native:** Direct UEFI boot capabilities on x86-64 hardware and virtualized environments (QEMU).
+* **UEFI and BIOS:** One image boots on either firmware, on x86-64 hardware and in virtualized environments (QEMU).
 * **Embedded Package Manager:** Includes `tuxpac`, a dedicated tool for fetching, resolving, and installing Debian main repository packages.
 * **Scriptable Startup:** Simple, human-readable shell scripts (`/etc/tuxlet/boot`) control the initial boot sequence.
-* **Bare-Metal Takeover:** Ability to shut down UEFI runtime services to reclaim memory once essential drivers are initialized.
+* **Bare-Metal Takeover:** Ability to leave the firmware (UEFI or BIOS) behind to reclaim memory once essential drivers are initialized.
 
 ---
 
@@ -31,8 +31,8 @@ Designed to be hyper-lightweight, Tuxlet OS requires only **128 KiB of RAM** and
 | Resource | Minimum Requirement | Notes |
 | --- | --- | --- |
 | **CPU** | x86-64 | Standard 64-bit architecture |
-| **Firmware** | UEFI | Legacy BIOS is not supported |
-| **Memory** | **128 KiB** | System allocation (excluding UEFI runtime overhead) |
+| **Firmware** | UEFI or BIOS | The same image boots on both |
+| **Memory** | **256 KiB** | System allocation (excluding firmware overhead) |
 | **Disk** | **512 KiB** | Core system image size (excluding user files) |
 
 ---
@@ -45,7 +45,7 @@ Ensure you have the required build tools and target tools installed on your host
 
 * **Compiler & Toolchain:** `gcc`, `nasm`, `x86_64-w64-mingw32-gcc`
 * **Disk Utilities:** `mtools`, `gptfdisk`
-* **Emulator (Optional):** `qemu-system-x86_64` with `edk2-ovmf` (UEFI firmware image)
+* **Emulator (Optional):** `qemu-system-x86_64` with `edk2-ovmf` (UEFI firmware image) or SeaBIOS (bundled with QEMU, for `BOOT=bios`)
 
 ### Build Commands
 
@@ -58,6 +58,9 @@ make run
 
 # Boot QEMU with extended memory and networking enabled
 make run MEM=64M NET=e1000
+
+# Boot QEMU with BIOS (SeaBIOS) instead of UEFI
+make run BOOT=bios
 
 # Allocate 16 MiB of writeable free space on the target disk image
 make FREE=16M
@@ -76,7 +79,8 @@ make clean
 | Variable | Default | Allowed Values | Description |
 | --- | --- | --- | --- |
 | `MEM` | `39M` | Any valid QEMU memory size (e.g., `64M`, `1G`) | Sets RAM for the QEMU instance. |
-| `NET` | `none` | `none`, `e1000`, `rtl8139`, `virtio` | Network interface driver. Note: `virtio` requires `MEM=42M` minimum. |
+| `NET` | `none` | `none`, `e1000`, `rtl8139`, `virtio` | Network interface driver. |
+| `BOOT` | `uefi` | `uefi`, `bios` | Firmware for `make run`: OVMF (UEFI) or SeaBIOS (BIOS). The same image boots either way. |
 | `FREE` | `1M` | Size notation (e.g., `16M`, `100M`) | Extra unallocated disk space appended to the final image. |
 | `DEBUG` | *Off* | `1` | Enables verbose debug output to the QEMU debug port. |
 
@@ -163,15 +167,15 @@ Tuxlet includes a custom package manager located at `/usr/bin/tuxpac` that direc
 Repositories are defined in `/etc/tuxlet/mirror` (one entry per line):
 
 ```sh
-put /etc/tuxlet/mirror http://deb.debian.org/debian bookworm main
+put /etc/tuxlet/mirror http://deb.debian.org/debian trixie main
 ```
 
-**HTTPS Support:** To use `https://` mirrors, first install `curl` and `ca-certificates` via HTTP, then update your mirror file:
+**HTTPS Support:** To use `https://` mirrors, first install `curl` via HTTP (it brings `ca-certificates`), then update your mirror file:
 
 ```sh
 tuxpac -y
-tuxpac -s curl ca-certificates
-put /etc/tuxlet/mirror https://deb.debian.org/debian bookworm main
+tuxpac -s curl
+put /etc/tuxlet/mirror https://deb.debian.org/debian trixie main
 ```
 
 #### 2. Package Management Commands
@@ -180,6 +184,8 @@ put /etc/tuxlet/mirror https://deb.debian.org/debian bookworm main
 | --- | --- |
 | `tuxpac -y` | Sync local package indexes with configured mirrors |
 | `tuxpac -s <pkg>` | Install a package along with its required dependencies |
+| `tuxpac -e` | Install Debian essential packages |
+| `tuxpac -re` | Remove Debian essential packages |
 | `tuxpac -r <pkg>` | Remove a package and unneeded orphaned dependencies |
 | `tuxpac -n <pkg>` | Purge a package along with its configuration files |
 | `tuxpac -u [pkg]` | Upgrade a specific package or all installed software |
@@ -195,7 +201,7 @@ put /etc/tuxlet/mirror https://deb.debian.org/debian bookworm main
 
 ### Firmware Takeover
 
-Running `modman takeover` instructs Tuxlet OS to completely shut down UEFI Runtime Services, freeing up motherboard firmware memory for user space execution.
+Running `modman takeover` instructs Tuxlet OS to stop using the firmware - UEFI Runtime Services or BIOS interrupts - freeing up motherboard firmware memory for user space execution.
 
 ⚠️ **PRE-TAKEOVER CHECKLIST:**
 Before invoking takeover mode, ensure:

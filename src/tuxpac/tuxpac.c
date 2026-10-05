@@ -2,6 +2,8 @@
  *
  *   tuxpac -y              sync the package list
  *   tuxpac -s <pkg>...     install, with what they depend on
+ *   tuxpac -e              install Debian's essential packages
+ *   tuxpac -re             remove them, but for what other packages need
  *   tuxpac -r <pkg>        remove, with dependencies nothing else needs
  *   tuxpac -n <pkg>        the same, configuration files too
  *   tuxpac -u [pkg]        upgrade everything, or one
@@ -10,7 +12,7 @@
  *   tuxpac -i <pkg>        about one
  *
  * /etc/tuxlet/mirror has a line per source, as sources.list has them
- * ("deb" in front or not): http://deb.debian.org/debian bookworm main.
+ * ("deb" in front or not): http://deb.debian.org/debian trixie main.
  * An https:// one is fetched by /usr/bin/curl, so it works once curl and
  * ca-certificates are installed - over http.
  *
@@ -20,7 +22,13 @@
  * tree is resolved a level a pass. /var/lib/tuxpac/installed has a line per package installed,
  * <name>.list beside it the paths it put there ('*' before a conffile).
  *
- * Not done: versions in dependencies, maintainer scripts, signatures, zstd.
+ * Maintainer scripts run as dpkg runs them: each package's preinst, postinst,
+ * prerm and postrm are kept as <name>.<script> beside its list; preinst runs
+ * before its files go in, postinst once a command has unpacked everything
+ * it installs, and file and named triggers after that. /var/lib/dpkg/status
+ * says what is installed, so dpkg-query and the scripts that ask it agree.
+ *
+ * Not done: versions in dependencies, signatures, zstd.
  * Documentation, man pages and translations are not unpacked. */
 
 #include "tuxpac.h"
@@ -35,6 +43,8 @@
 #define CURL    "/usr/bin/curl"
 #define CERTS   "/usr/share/ca-certificates/mozilla"
 #define BUNDLE  "/etc/ssl/certs/ca-certificates.crt"
+#define STATUS  "/var/lib/dpkg/status"
+#define ALTS    "/usr/bin/update-alternatives"
 
 #define FBUF    65536               /* reading the disk, and downloads */
 #define NBUF    16384               /* the socket */
@@ -49,8 +59,9 @@
 #define POST    16384               /* a postinst, for its alternatives */
 #define PATH    256                 /* a path */
 
-/* Index fields, tab-separated. */
-enum { F_NAME, F_VER, F_MIRROR, F_SIZE, F_ISIZE, F_FILE, F_DEPS, F_PROV, F_DESC, FIELDS };
+/* Index fields, tab-separated. F_ESS is "e" for a package Debian marks
+   Essential - one every system is taken to have, never depended on. */
+enum { F_NAME, F_VER, F_MIRROR, F_SIZE, F_ISIZE, F_FILE, F_DEPS, F_PROV, F_DESC, F_ESS, FIELDS };
 
 static uint8_t      *fbuf, *nbuf;
 static struct source fsrc, nsrc;
@@ -437,7 +448,7 @@ static void close_url(const char *url, struct source *s) {
 /* ---- -y: the package list -------------------------------------------------- */
 
 static char r_name[128], r_ver[128], r_file[256], r_size[16], r_isize[16];
-static char r_deps[3072], r_prov[1024], r_desc[160];
+static char r_deps[3072], r_prov[1024], r_desc[160], r_ess[8];
 static unsigned   r_mirror;
 static uint32_t   r_count, linelen, ixlen;
 static struct out ix;
@@ -506,7 +517,8 @@ static void deps_add(char *to, size_t cap, const char *v) {
 static void record_end(void) {
     if (r_name[0] != '\0' && r_file[0] != '\0') {
         char m[2] = { (char)('0' + r_mirror), '\0' };
-        const char *f[FIELDS] = { r_name, r_ver, m, r_size, r_isize, r_file, r_deps, r_prov, r_desc };
+        const char *f[FIELDS] = { r_name, r_ver, m, r_size, r_isize, r_file, r_deps, r_prov, r_desc,
+                                  strcmp(r_ess, "yes") == 0 ? "e" : "" };
 
         for (unsigned i = 0; i < FIELDS; i++) {
             ix_put(f[i]);
@@ -515,7 +527,7 @@ static void record_end(void) {
         r_count++;
     }
     r_name[0] = r_ver[0] = r_file[0] = r_size[0] = r_isize[0] = '\0';
-    r_deps[0] = r_prov[0] = r_desc[0] = '\0';
+    r_deps[0] = r_prov[0] = r_desc[0] = r_ess[0] = '\0';
 }
 
 static const char *field(const char *l, const char *name) {
@@ -547,6 +559,8 @@ static void record_line(void) {
         deps_add(r_deps, sizeof r_deps, v);
     } else if ((v = field(line, "Provides:")) != NULL) {
         deps_add(r_prov, sizeof r_prov, v);
+    } else if ((v = field(line, "Essential:")) != NULL) {
+        take(r_ess, sizeof r_ess, v);
     }
 }
 
@@ -726,6 +740,8 @@ static bool db_load(void) {
     return true;
 }
 
+static void status_write(void);
+
 /* Writes it back, gone ones left out and extra added, and reads it again. */
 static bool db_save(const char *extra) {
     size_t n = extra != NULL ? strlen(extra) : 0;
@@ -761,7 +777,11 @@ static bool db_save(const char *extra) {
     if (err != 0) {
         fail("tuxpac: " DB ": %s\n", errstr(err));
     }
-    return err == 0 && db_load();
+    if (err != 0 || !db_load()) {
+        return false;
+    }
+    status_write();
+    return true;
 }
 
 static int find_inst(const char *name, uint32_t n) {
@@ -905,14 +925,11 @@ static bool match(char *l, uint32_t at) {
     return true;
 }
 
-/* What a package needs that Debian does not say, every Debian system
-   having it: the terminal descriptions the terminal libraries read, and
-   the commands a shell's own scripts run. */
+/* What a package needs that Debian does not say: curl only recommends the
+   certificates, and https - which tuxpac itself fetches through curl -
+   fails without them. */
 static const char *const implied[][2] = {
-    { "libtinfo6", "ncurses-base" },
-    { "libslang2", "ncurses-base" },
-    { "fish",      "coreutils" },
-    { "bash",      "coreutils" },
+    { "curl", "ca-certificates" },
 };
 
 /* Turns the wants into the plan, the packages to install, pulling in what
@@ -991,7 +1008,7 @@ static bool resolve(void) {
 /* ---- unpacking ------------------------------------------------------------- */
 
 enum { CONTROL = 1, DATA };
-enum { K_SKIP, K_FILE, K_NAME, K_LINK, K_CONF, K_POST };
+enum { K_SKIP, K_FILE, K_NAME, K_LINK, K_CONF, K_POST, K_SCRIPT };
 
 static struct {
     uint8_t  hdr[512];
@@ -1010,6 +1027,15 @@ static char     conf[CONF], post[POST];
 static uint32_t conf_len, post_len;
 static char    *list;
 static uint32_t list_len, list_cap;
+static const char *unpacking;       /* the package whose scripts are being kept */
+
+/* The maintainer scripts dpkg keeps, and the triggers file. */
+static const char *const scripts[] = { "preinst", "postinst", "prerm", "postrm", "triggers" };
+
+/* Where package pkg's script is kept. */
+static void script_path(char *out, const char *pkg, const char *script) {
+    format(out, LIB "/%s.%s", pkg, script);
+}
 
 /* Unpacked by nobody's choice on a small machine. */
 static const char *const skipped[] = {
@@ -1155,8 +1181,24 @@ static void tar_entry(void) {
     if (tar.mode == CONTROL) {
         if (strcmp(path, "/conffiles") == 0) {
             tar.kind = K_CONF;
-        } else if (strcmp(path, "/postinst") == 0) {
-            tar.kind = K_POST;
+            return;
+        }
+        for (unsigned i = 0; i < sizeof scripts / sizeof scripts[0]; i++) {
+            char sp[PATH];
+
+            if (strcmp(path + 1, scripts[i]) != 0 || strlen(unpacking) + 32 > sizeof sp) {
+                continue;
+            }
+            script_path(sp, unpacking, scripts[i]);
+            mkdirs(LIB);
+            tar.fd = (int)sys_open(sp, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+            tar.kind = strcmp(scripts[i], "postinst") == 0 ? K_POST : K_SCRIPT;
+            if (tar.fd < 0) {
+                tar.kind = K_SKIP;
+            } else if (size == 0) {
+                sys_close(tar.fd);
+                tar.fd = -1;
+            }
         }
         return;
     }
@@ -1239,6 +1281,9 @@ static void tar_entry(void) {
 
 static char     elves[8192], wanted_libs[4096];     /* ELF files unpacked; libraries they need */
 static uint32_t elves_len, wanted_len;
+static char     unpacked[16384];        /* packages this command unpacked: name, then
+                                           the version replaced or "-", a line each */
+static uint32_t unpacked_len;
 
 static void add_line(char *to, uint32_t *len, uint32_t cap, const char *what) {
     uint32_t n = (uint32_t)strlen(what);
@@ -1389,11 +1434,18 @@ static bool tar_sink(const uint8_t *d, uint32_t n) {
                     conf[conf_len++] = (char)d[i];
                 }
                 conf[conf_len] = '\0';
-            } else if (tar.kind == K_POST) {
-                for (uint32_t i = 0; i < k && post_len < POST - 1; i++) {
+            } else if (tar.kind == K_POST || tar.kind == K_SCRIPT) {
+                for (uint32_t i = 0; tar.kind == K_POST && i < k && post_len < POST - 1; i++) {
                     post[post_len++] = (char)d[i];
                 }
                 post[post_len] = '\0';
+                if (tar.fd >= 0 && sys_write(tar.fd, d, k) != (long)k) {
+                    tar.failed++;
+                }
+                if (tar.left == k && tar.fd >= 0) {
+                    sys_close(tar.fd);
+                    tar.fd = -1;
+                }
             }
             tar.left -= k;
         } else if (tar.pad > 0) {
@@ -1529,6 +1581,7 @@ static void ca_bundle(void) {
 }
 
 static bool unpack_members(const char *pkg, char *h, char *member);
+static char upgrading_from[VER + 1];    /* the version an upgrade replaces, "" for none */
 
 /* ---- alternatives ---------------------------------------------------------- *
  *
@@ -1599,6 +1652,88 @@ static void alternatives(void) {
     }
 }
 
+/* ---- maintainer scripts ----------------------------------------------------
+ *
+ * As dpkg runs them: the script, its arguments, and the variables dpkg sets.
+ * Nobody is there to answer a question, so debconf takes its defaults. A
+ * script that fails is said to have, and the rest carries on. */
+
+static bool run_script(const char *pkg, const char *script, const char *a1, const char *a2,
+                       const char *a3) {
+    static char sp[PATH], ev_pkg[160], ev_name[48];
+    const char *argv[] = { sp, a1, a2, a3, NULL };
+    const char *env[] = { ev_pkg, ev_name, "DPKG_MAINTSCRIPT_ARCH=amd64", "DPKG_ROOT=",
+                          "DPKG_ADMINDIR=/var/lib/dpkg", "DPKG_RUNNING_VERSION=1.22.21",
+                          "DEBIAN_FRONTEND=noninteractive", NULL };
+    int code;
+
+    if (strlen(pkg) + 32 > sizeof sp) {
+        return false;
+    }
+    script_path(sp, pkg, script);
+    if (!exists(sp)) {
+        return true;                /* none: nothing to do */
+    }
+    /* The program it is a script for - /bin/sh, mostly - may be in this
+       very command, not unpacked yet: then, as when debootstrap lays the
+       first packages down, there is nothing to run it with. */
+    uint32_t size;
+    char *head = load(sp, &size);
+
+    if (head != NULL && head[0] == '#' && head[1] == '!') {
+        char *interp = head + 2;
+
+        while (*interp == ' ' || *interp == '\t') {
+            interp++;
+        }
+
+        interp[span(interp, " \t\n")] = '\0';
+        if (!exists(interp)) {
+            xfree(head);
+            return true;
+        }
+    }
+    xfree(head);
+    format(ev_pkg, "DPKG_MAINTSCRIPT_PACKAGE=%s", pkg);
+    format(ev_name, "DPKG_MAINTSCRIPT_NAME=%s", script);
+    if ((code = run_env(sp, argv, env)) != 0) {
+        fail("tuxpac: %s: %s failed (%u)\n", pkg, script, (unsigned)(code < 0 ? -code : code));
+        return false;
+    }
+    return true;
+}
+
+static void scripts_drop(const char *pkg) {
+    char sp[PATH];
+
+    for (unsigned i = 0; i < sizeof scripts / sizeof scripts[0] && strlen(pkg) + 32 < sizeof sp; i++) {
+        script_path(sp, pkg, scripts[i]);
+        sys_unlink(sp);
+    }
+}
+
+/* /var/lib/dpkg/status: a paragraph per package installed, as dpkg-query
+   reads it - what tells a script asking dpkg that its package is there. */
+static void status_write(void) {
+    struct out o;
+
+    mkdirs("/var/lib/dpkg/info");
+    mkdirs("/var/lib/dpkg/updates");
+    mkdirs("/var/lib/dpkg/alternatives");
+    mkdirs("/etc/alternatives");
+    out_open(&o, STATUS);
+    for (uint32_t i = 0; i < ndb && o.err == 0; i++) {
+        if (db[i].gone) {
+            continue;
+        }
+        format(tmp, "Package: %s\nStatus: install ok installed\nPriority: optional\n"
+                    "Section: misc\nMaintainer: tuxpac\nArchitecture: amd64\nVersion: %s\n"
+                    "Description: installed by tuxpac\n\n", db[i].name, db[i].ver);
+        out_put(&o, tmp, (uint32_t)strlen(tmp));
+    }
+    out_close(&o);
+}
+
 /* The downloaded package into place, and its list of paths beside the
    index. */
 static bool unpack(const char *pkg) {
@@ -1610,7 +1745,6 @@ static bool unpack(const char *pkg) {
     if (!ok) {
         return false;
     }
-    alternatives();
     for (char *c = elves; c < elves + elves_len; c += span(c, "\n") + 1) {
         c[span(c, "\n")] = '\0';
         elf_needed(c);
@@ -1645,6 +1779,8 @@ static bool unpack_members(const char *pkg, char *h, char *member) {
     conf_len = post_len = list_len = 0;
     post[0] = '\0';
     conf[0] = '\0';
+    unpacking = pkg;
+    scripts_drop(pkg);              /* an upgrade's are the new version's */
 
     for (uint32_t at = 8; at + 60 <= deb_size;) {
         src_file(&fsrc, deb, at, at + 60);
@@ -1666,6 +1802,12 @@ static bool unpack_members(const char *pkg, char *h, char *member) {
         uint8_t mode = memcmp_n(member, "control.tar", 11) ? CONTROL :
                        memcmp_n(member, "data.tar", 8) ? DATA : 0;
 
+        if (mode == DATA) {
+            /* Before its files go in, as dpkg runs it: a new install, or
+               an upgrade from the version there. */
+            run_script(pkg, "preinst", upgrading_from[0] != '\0' ? "upgrade" : "install",
+                       upgrading_from[0] != '\0' ? upgrading_from : NULL, NULL);
+        }
         if (mode != 0) {
             if (!untar(pkg, member, at, at + size, mode)) {
                 return false;
@@ -1765,6 +1907,10 @@ static bool install(uint32_t off, char flag) {
 
     int k = find_inst(f[F_NAME], (uint32_t)strlen(f[F_NAME]));
 
+    upgrading_from[0] = '\0';
+    if (k >= 0 && strlen(db[k].ver) <= VER) {
+        strcpy(upgrading_from, db[k].ver);
+    }
     if (k >= 0 && strcmp(db[k].ver, f[F_VER]) != 0) {
         print("upgrade %s %s -> %s\n", f[F_NAME], db[k].ver, f[F_VER]);
     } else {
@@ -1795,7 +1941,158 @@ static bool install(uint32_t off, char flag) {
     p = cat(p, f[F_PROV]);
     *p++ = '\n';
     *p = '\0';
+    /* Its name, and the version it replaced: lines that repeat, so not
+       add_line, which keeps one of each. */
+    if (unpacked_len + strlen(f[F_NAME]) + VER + 4 < sizeof unpacked) {
+        char *u = cat(unpacked + unpacked_len, f[F_NAME]);
+
+        *u++ = '\n';
+        u = cat(u, upgrading_from[0] != '\0' ? upgrading_from : "-");
+        *u++ = '\n';
+        *u = '\0';
+        unpacked_len = (uint32_t)(u - unpacked);
+    }
     return db_save(entry);
+}
+
+/* ---- configuring ---------------------------------------------------------- *
+ *
+ * Once everything a command installs is unpacked, as dpkg does it: each
+ * package's postinst configure, what is depended on first - and then the
+ * triggers: a package interested in a folder hears that something was put
+ * in it (fontconfig, of fonts), and one interested in a name hears when a
+ * package activates it (libc-bin, of ldconfig). */
+
+/* Past the spaces and tabs at s. */
+static char *blanks_past(char *s) {
+    while (*s == ' ' || *s == '\t') {
+        s++;
+    }
+    return s;
+}
+
+/* Whether path p - a list line, with its '*' or '/' - is name or under it. */
+static bool under(const char *p, const char *name, uint32_t n) {
+    p += *p == '*';
+    return memcmp_n(p, name, n) && (p[n] == '\0' || p[n] == '/' || p[n] == '\n');
+}
+
+/* Whether any package unpacked this time put a file under name, or - for a
+   name that is not a path - activates it. */
+static bool touched(const char *name, uint32_t n) {
+    char lp[PATH], pkg[160];
+
+    for (char *c = unpacked; c < unpacked + unpacked_len;) {
+        uint32_t len = span(c, "\n"), size;
+        char *t;
+
+        if (len < sizeof pkg) {
+            memcpy(pkg, c, len);
+            pkg[len] = '\0';
+            format(lp, LIB "/%s.%s", pkg, *name == '/' ? "list" : "triggers");
+            if ((t = load(lp, &size)) != NULL) {
+                for (char *l = t; *l != '\0'; l += span(l, "\n"), l += *l == '\n') {
+                    char *what = blanks_past(l + span(l, " \t"));
+                    if (*name == '/' ? under(l, name, n)
+                                     : memcmp_n(l, "activate", 8) &&
+                                       same(what, span(what, " \t\n"), name, n)) {
+                        xfree(t);
+                        return true;
+                    }
+                }
+                xfree(t);
+            }
+        }
+        c += len + 1;
+        c += span(c, "\n") + 1;    /* past its version line */
+    }
+    return false;
+}
+
+static void triggers(void) {
+    char tp[PATH], names[1024];
+
+    for (uint32_t i = 0; i < ndb; i++) {
+        uint32_t size, len = 0;
+        char *t;
+
+        if (db[i].gone || strlen(db[i].name) + 32 > sizeof tp) {
+            continue;
+        }
+        script_path(tp, db[i].name, "triggers");
+        if ((t = load(tp, &size)) == NULL) {
+            continue;
+        }
+        names[0] = '\0';
+        for (char *l = t; *l != '\0'; l += span(l, "\n"), l += *l == '\n') {
+            char *what = blanks_past(l + span(l, " \t"));
+            uint32_t n = span(what, " \t\n");
+
+            if (memcmp_n(l, "interest", 8) && n > 0 && len + n + 2 < sizeof names &&
+                touched(what, n)) {
+                if (len > 0) {
+                    names[len++] = ' ';
+                }
+                memcpy(names + len, what, n);
+                names[len += n] = '\0';
+            }
+        }
+        xfree(t);
+        if (len > 0) {
+            run_script(db[i].name, "postinst", "triggered", names, NULL);
+        }
+    }
+}
+
+/* postinst configure for each package unpacked, in the order they went in;
+   with no update-alternatives on the disk yet, what one would have made is
+   made from the script's own lines. */
+static void configure(void) {
+    char sp[PATH];
+
+    for (char *c = unpacked; c < unpacked + unpacked_len;) {
+        char *name = c, *old;
+
+        c += span(c, "\n");
+        *c++ = '\0';
+        old = c;
+        c += span(c, "\n");
+        *c++ = '\0';
+        if (!exists(ALTS) && strlen(name) + 32 < sizeof sp) {
+            uint32_t size;
+            char *t;
+
+            script_path(sp, name, "postinst");
+            if ((t = load(sp, &size)) != NULL) {
+                post_len = size < POST - 1 ? size : POST - 1;
+                memcpy(post, t, post_len);
+                post[post_len] = '\0';
+                xfree(t);
+                format(sp, LIB "/%s.list", name);
+                if ((t = load(sp, &size)) != NULL) {
+                    xfree(list);
+                    list = t;
+                    list_len = list_cap = size;
+                    alternatives();
+                    write_file(sp, list, list_len);
+                }
+            }
+        }
+        if (strlen(name) + 32 < sizeof sp) {
+            script_path(sp, name, "postinst");
+            if (exists(sp)) {
+                print("configure %s\n", name);
+            }
+        }
+        run_script(name, "postinst", "configure", strcmp(old, "-") != 0 ? old : NULL, NULL);
+    }
+    for (char *c = unpacked; c < unpacked + unpacked_len; c++) {
+        if (*c == '\0') {
+            *c = '\n';             /* back as lines, for the triggers */
+        }
+    }
+    triggers();
+    unpacked_len = 0;
 }
 
 /* A want for the package of each library needed and not on the disk. */
@@ -1848,9 +2145,11 @@ static void get(char *args, bool upgrade) {
         }
         for (uint32_t i = nplan; i-- > 0;) {
             if (!install(w->plan[i].off, w->plan[i].flag)) {
+                configure();
                 return;
             }
         }
+        configure();
         nwants = wused = nplan = nused = from = to = 0;
         if (!want_missing()) {
             return;
@@ -1858,7 +2157,61 @@ static void get(char *args, bool upgrade) {
     }
 }
 
+/* -e: every package the list marks Essential and is not installed, asked
+   for as -s would ask - the ones Debian's packages count on without
+   saying so. */
+static char     essential[2048];
+static uint32_t essential_len;
+
+static bool essential_each(char *l, uint32_t at) {
+    char *f[FIELDS];
+    uint32_t n;
+
+    (void)at;
+    split(l, f, FIELDS);
+    n = (uint32_t)strlen(f[F_NAME]);
+    if (f[F_ESS][0] == 'e' && find_inst(f[F_NAME], n) < 0 &&
+        !listed(essential, f[F_NAME], n) && essential_len + n + 2 < sizeof essential) {
+        if (essential_len > 0) {
+            essential[essential_len++] = ',';
+        }
+        memcpy(essential + essential_len, f[F_NAME], n + 1);
+        essential_len += n;
+    }
+    return true;
+}
+
+static void get_essential(void) {
+    if (!db_load() || !scan(essential_each)) {
+        return;
+    }
+    if (essential_len == 0) {
+        print("tuxpac: nothing essential to install\n");
+        return;
+    }
+    for (char *c = essential; *c != '\0'; c++) {
+        *c = *c == ',' ? ' ' : *c;
+    }
+    get(essential, false);
+}
+
 /* ---- removing -------------------------------------------------------------- */
+
+/* /bin, /sbin, /lib and /lib64: the links into /usr that merged_usr makes.
+   A package may list them too - base-files does - but they are tuxpac's,
+   and every program's loader is reached through one. */
+static bool top_link(const char *p) {
+    static const char *const dirs[] = { "/bin", "/sbin", "/lib", "/lib64" };
+
+    for (unsigned i = 0; i < 4; i++) {
+        size_t n = strlen(dirs[i]);
+
+        if (memcmp_n(p, dirs[i], n) && (p[n] == '\0' || (p[n] == '/' && p[n + 1] == '\0'))) {
+            return true;
+        }
+    }
+    return false;
+}
 
 static void remove_files(const char *pkg, bool purge) {
     char lp[PATH];
@@ -1886,7 +2239,7 @@ static void remove_files(const char *pkg, bool purge) {
             if (purge) {
                 sys_unlink(p + 1);
             }
-        } else if (*p != '\0') {
+        } else if (*p != '\0' && !top_link(p)) {
             size_t n = strlen(p);
 
             if (n > 1 && p[n - 1] == '/') {
@@ -1961,7 +2314,53 @@ static void cmd_remove(char *args, bool purge) {
     for (uint32_t i = 0; i < ndb; i++) {
         if (!db[i].gone && !db[i].mark) {
             print("remove %s\n", db[i].name);
+            run_script(db[i].name, "prerm", "remove", NULL, NULL);
             remove_files(db[i].name, purge);
+            run_script(db[i].name, "postrm", "remove", NULL, NULL);
+            if (purge) {
+                run_script(db[i].name, "postrm", "purge", NULL, NULL);
+            }
+            scripts_drop(db[i].name);
+            db[i].gone = true;
+        }
+    }
+    db_save(NULL);
+}
+
+/* -re: the essential packages count as pulled in rather than asked for,
+   so that the ones nothing else needs go - with what only they needed. */
+static bool unessential_each(char *l, uint32_t at) {
+    char *f[FIELDS];
+    int k;
+
+    (void)at;
+    split(l, f, FIELDS);
+    if (f[F_ESS][0] == 'e' && (k = find_inst(f[F_NAME], (uint32_t)strlen(f[F_NAME]))) >= 0) {
+        db[k].flag = 'a';
+    }
+    return true;
+}
+
+static void remove_essential(void) {
+    bool *kept;
+
+    if (!db_load() || (kept = xalloc(ndb + 1)) == NULL) {
+        return;
+    }
+    /* What is kept now goes only if the essential packages were all that
+       kept it: a package nothing lists as a dependency stays as it is. */
+    mark(ndb);
+    for (uint32_t i = 0; i < ndb; i++) {
+        kept[i] = db[i].mark || db[i].flag == 'm';
+    }
+    if (!scan(unessential_each)) {
+        return;
+    }
+    mark(ndb);
+    for (uint32_t i = 0; i < ndb; i++) {
+        if (!db[i].gone && !db[i].mark && kept[i]) {
+            print("remove %s\n", db[i].name);
+            remove_files(db[i].name, false);
             db[i].gone = true;
         }
     }
@@ -2088,6 +2487,10 @@ int main(int argc, char **argv) {
         sync();
     } else if (c == 's' && *args != '\0') {
         get(args, false);
+    } else if (c == 'e' && *args == '\0') {
+        get_essential();
+    } else if (strcmp(op, "-re") == 0 && *args == '\0') {
+        remove_essential();
     } else if (c == 'u') {
         get(args, true);
     } else if ((c == 'r' || c == 'n') && *args != '\0') {
@@ -2108,7 +2511,7 @@ int main(int argc, char **argv) {
     } else if (c == 'i' && *args != '\0') {
         cmd_info(str_word(&args));
     } else {
-        fail("usage: tuxpac -s|-r|-n|-i <package>, -u [package], -y, -f <text>, -q [text]\n");
+        fail("usage: tuxpac -s|-r|-n|-i <package>, -u [package], -e, -re, -y, -f <text>, -q [text]\n");
     }
     return status;
 }

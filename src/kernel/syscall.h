@@ -53,8 +53,7 @@
    shell is a quarter of what it costs. */
 
 /* Linux's numbers, and Linux's arguments. Only the handful the machine can
-   actually answer are here: there is one process, no devices but the screen
-   and the keyboard, and files are read-only to a program. */
+   actually answer are here. */
 enum {
     SYS_READ       = 0,     /* (fd, buf, count): a line typed at fd 0, or a file */
     SYS_WRITE      = 1,     /* (fd, text, length): prints to the screen */
@@ -68,7 +67,7 @@ enum {
     SYS_BRK        = 12,    /* (addr): moves or reports the heap's end */
     SYS_IOCTL      = 16,    /* (fd, request, argument) */
     SYS_WRITEV     = 20,    /* (fd, iovec *, count) */
-    SYS_GETPID     = 39,    /* (): there is only ever one */
+    SYS_GETPID     = 39,
     SYS_SYSINFO    = 99,    /* (struct sysinfo *): uptime, and the RAM */
 
     /* The rest of what a program off a Linux system asks for before it does
@@ -177,6 +176,7 @@ enum {
     SYS_CHDIR      = 80,    /* (path): a program moving the working folder */
     SYS_FCHDIR     = 81,    /* (fd): the same, by a folder already open */
     SYS_DUP3       = 292,
+    SYS_CLOSE_RANGE = 436,  /* (first, last, flags) */
     SYS_UMASK      = 95,
     SYS_GETTIMEOFDAY = 96,  /* (struct timeval *, struct timezone *) */
     SYS_TIME       = 201,   /* (time_t *) */
@@ -185,6 +185,7 @@ enum {
     SYS_GETPGRP    = 111,
     SYS_SETSID     = 112,
     SYS_GETPGID    = 121,
+    SYS_GETSID     = 124,
     SYS_READLINK   = 89,    /* (path, buf, size): a link's target, no NUL */
     SYS_SIGALTSTACK = 131,
     SYS_GETRESUID  = 118,   /* (uid_t *, uid_t *, uid_t *) */
@@ -192,9 +193,8 @@ enum {
     SYS_SELECT     = 23,    /* (nfds, read, write, except, timeval *) */
     SYS_PSELECT6   = 270,   /* the same, with a timespec and a signal mask */
 
-    /* Starting a program, the way a Linux shell starts one. There is no
-       scheduler here, so fork runs its child to the end before it answers -
-       see syscall.c, which is where that is made to work. */
+    /* Starting a program, the way a Linux shell starts one: fork makes a
+       process that runs beside its parent (syscall.c). */
     SYS_FORK       = 57,
     SYS_VFORK      = 58,
     SYS_CLONE3     = 435,   /* (struct clone_args *, size) */
@@ -248,10 +248,12 @@ enum {
 #define O_WRONLY  0x01
 #define O_RDWR    0x02
 #define O_CREAT   0x40
+#define O_EXCL    0x80     /* with O_CREAT: fail if it is there already */
 #define O_TRUNC   0x200
 #define O_APPEND  0x400
 #define O_NONBLOCK 0x800
 #define O_NOFOLLOW 0x20000  /* a link at the end of the path is ELOOP */
+#define O_CLOEXEC  0x80000  /* the descriptor goes at execve: O_, SOCK_, EFD_ and EPOLL_ alike */
 /* A file with no name, made in the folder the path names: what a program
    that wants a scratch buffer of its own asks for. */
 #define O_TMPFILE 0x410000
@@ -289,12 +291,15 @@ struct handle {
                                    folder; O_NONBLOCK and the type (<< 16) in
                                    offset; size, how long a read waits in ms,
                                    0 for ever */
+#define SOCK_UNIX 0x40000000u   /* in its offset: ipc/unix's, not the network's */
 
 /* What a syscall handler outside syscall.c needs: the descriptor fd, or
    NULL; the lowest free one, made to hold h, or -EMFILE; whether a program's
    pointer and size stay in its memory; the arguments past the third; and
    waiting - Ctrl-C ending the program, and the wait counted idle. */
 struct handle *handle_of(uint64_t fd);
+#define HANDLE_CLOEXEC 2u       /* in a handle's used: closed at execve */
+void fd_cloexec(uint64_t fd, bool on);
 uint64_t give_handle(struct handle h);
 bool     user_range(uint64_t addr, uint64_t size);
 uint64_t *syscall_args(void);
@@ -311,22 +316,25 @@ void syscall_init(void);
    PROGRAM_EINVAL. */
 int program_load(const struct fs_file *file, uint64_t *entry);
 
-/* Loads and runs the program at path, following a "#!" line - what the
-   shell does. Returns its exit code, or a negative code if it could not be
-   started. */
+/* Loads and runs the program at path as a process of its own, following a
+   "#!" line - what the shell does - and waits for it. Returns its exit code,
+   or a negative code if it could not be started. */
 int program_start(const char *path, unsigned argc, const char *const *argv,
                   unsigned envc, const char *const *envv);
 
-/* Runs a loaded program until it exits, and returns its exit code. envc of 0
-   gives it the machine's own environment, which is what the first program
-   gets; fresh says to hand it a clean terminal and nothing open but the
-   console, which is what everything but an execve wants. */
-/* Whether a program is running: what a kernel command called from one
-   finds, rather than one the kernel's own shell ran. */
+/* Whether the running thread is a program's: what a kernel command called
+   from one finds, rather than one the kernel's own shell ran. */
 bool program_running(void);
 
-int program_run(uint64_t entry, unsigned argc, const char *const *argv,
-                unsigned envc, const char *const *envv, bool fresh);
+/* A process, for `mem top`: the index'th one running, false past the last.
+   bytes is all it costs: its memory and tables, its record, and its
+   threads' kernel stacks. */
+struct process_info {
+    int      pid, ppid;
+    uint64_t bytes;
+    char     name[20];
+};
+bool process_info(unsigned index, struct process_info *out);
 
 /* What the window's page tables cost, and what a running program has
    borrowed for itself, for the `mem` command. */

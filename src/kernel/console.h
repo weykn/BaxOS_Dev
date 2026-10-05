@@ -39,6 +39,10 @@ bool console_ready(void);
 #define CONSOLE_FORCE 9
 int console_signal(void);
 
+/* Whether what is typed reaches the terminal: off while a program reads
+   the keyboard as evdev events (KDSKBMODE K_OFF). */
+void console_keys(bool on);
+
 /* The settings, as Linux's tcgetattr and tcsetattr pass them. size is how
    much of them the program asked for or handed over. */
 void console_get(void *out, size_t size);

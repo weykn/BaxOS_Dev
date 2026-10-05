@@ -15,6 +15,7 @@
 /* count contiguous pages, page-aligned, not zeroed. Returns the address, or
    0 if there is no run that long. */
 uint64_t mem_pages(size_t count);
+uint64_t mem_pages_lent(size_t count);  /* the disk cache's: above the fixed-address gigabyte */
 void     mem_pages_free(uint64_t at, size_t count);
 
 /* The same, all of it below limit: for a device that can only reach the

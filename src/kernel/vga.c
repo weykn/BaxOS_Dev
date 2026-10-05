@@ -122,7 +122,12 @@ static volatile uint32_t *row(unsigned y) {
 
 /* Draws n pixels of the screen's scan line y, from x on. Everything that
    draws comes through here. */
+static bool lent;                       /* a program has the screen */
+
 static void emit(unsigned x, unsigned y, const uint32_t *px, unsigned n) {
+    if (lent) {
+        return;
+    }
     if (xmap == NULL) {
         volatile uint32_t *line = row(y) + x;
 
@@ -302,6 +307,31 @@ static bool parse_size(const char *s, unsigned *w, unsigned *h) {
 
 uint64_t vga_framebuffer_end(void) {
     return (uint64_t)fb + (uint64_t)fb_pitch * real_h * 4;
+}
+
+static void repaint(void);
+
+void vga_screen(struct vga_screen *out) {
+    *out = (struct vga_screen){ (uint64_t)fb, real_w, real_h, fb_pitch, red_first };
+}
+
+bool vga_lent(void) {
+    return lent;
+}
+
+void vga_lend(bool on) {
+    if (lent == on) {
+        return;
+    }
+    lent = on;
+    if (!on) {
+        for (unsigned y = 0; y < real_h; y++) {
+            for (unsigned x = 0; x < real_w; x++) {
+                row(y)[x] = 0;
+            }
+        }
+        repaint();
+    }
 }
 
 /* Takes the framebuffer the firmware is using now. */
@@ -774,13 +804,18 @@ static void set_graphics(void) {
 
 /* Blanks from the cursor to the end of the line, or the whole screen. */
 static void erase(char what) {
-    if (what == 'J' && (param_count == 0 || params[0] == 2)) {
+    if (what == 'J' && param_count > 0 && params[0] >= 2) {
         vga_clear();
         return;
     }
     size_t first = cursor, last = cursor + (width - cursor % width);
 
-    if (what == 'J') {
+    /* With no parameter, from the cursor on: a line editor sends that
+       before every prompt. */
+    if (what == 'J' && param_count > 0 && params[0] == 1) {
+        first = 0;
+        last = cursor + 1;
+    } else if (what == 'J') {
         last = cells;
     } else if (param_count > 0 && params[0] == 1) {
         first = cursor - cursor % width;
@@ -1124,6 +1159,21 @@ void vga_capture(char *buf, size_t max) {
 
 void vga_capture_end(void) {
     capture = NULL;
+}
+
+/* Text whose escape sequences are the point - clear's - kept even when
+   captured, where colour would be dropped. */
+void vga_raw(const char *text) {
+    if (capture == NULL) {
+        while (*text != '\0') {
+            vga_putc(*text++);
+        }
+        return;
+    }
+    for (; *text != '\0' && capture_len + 1 < capture_max; text++) {
+        capture[capture_len++] = *text;
+    }
+    capture[capture_len] = '\0';
 }
 
 void vga_putc(char c) {

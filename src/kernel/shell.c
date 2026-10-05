@@ -334,7 +334,8 @@ static NOINLINE void tsh_run(unsigned argc, char **argv) {
     if (code < 0) {
         failed = true;
         tsh_fail("", argv[0], code == FS_ENOENT ? "not found" :
-                              code == PROGRAM_EINVAL ? "not a program" : fs_error(code));
+                              code == PROGRAM_EINVAL ? "not a program" :
+                              code == PROGRAM_ENOINTERP ? "loader not found" : fs_error(code));
     }
 }
 

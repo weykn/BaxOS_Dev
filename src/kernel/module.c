@@ -5,6 +5,7 @@
 #include "driver.h"
 #include "efi_kernel.h"
 #include "fs.h"
+#include "input.h"
 #include "linux.h"
 #include "mem.h"
 #include "net.h"
@@ -68,6 +69,30 @@ void disk_cache_register(const struct disk_cache *c) {
     disk_cache = c;
 }
 
+const struct unix_ops *unix_sock;
+
+const struct file_ops *file_ops[FILE_OPS];
+
+unsigned files_register(const struct file_ops *ops, unsigned slot) {
+    if (ops == NULL) {
+        if (slot >= 1 && slot <= FILE_OPS) {
+            file_ops[slot - 1] = NULL;
+        }
+        return 0;
+    }
+    for (unsigned i = 0; i < FILE_OPS; i++) {
+        if (file_ops[i] == NULL) {
+            file_ops[i] = ops;
+            return i + 1;
+        }
+    }
+    return 0;
+}
+
+void unix_register(const struct unix_ops *ops) {
+    unix_sock = ops;
+}
+
 void tracer_register(const struct tracer *t) {
     tracer = t;
 }
@@ -82,7 +107,7 @@ static const struct {
     X(str_word),
     X(kprintf), X(ksprintf), X(vga_putc), X(vga_puts), X(vga_set_color),
     X(efi_boot), X(efi_seconds), X(efi_uptime_ms), X(efi_uptime_us),
-    X(mem_pages), X(mem_pages_below), X(mem_pages_free), X(mem_alloc), X(mem_free),
+    X(mem_pages), X(mem_pages_lent), X(mem_pages_below), X(mem_pages_free), X(mem_alloc), X(mem_free),
     X(mem_ours), X(efi_gone), X(efi_pci), X(usb_host), X(usb_host_register),
     X(keyboards), X(memcmp), X(gpt_find), X(pci_next_class), X(pci_memory),
     X(fs_stat), X(fs_sector), X(fs_read_many), X(fs_write), X(fs_error),
@@ -99,10 +124,12 @@ static const struct {
     X(event_ready), X(file_ino), X(fs_errno), X(fs_file), X(fs_folder_at),
     X(fs_get_stats), X(fs_inside), X(fs_list), X(fs_lstat), X(fs_readlink), X(fs_rename),
     X(fs_set_mode), X(fs_symlink), X(is_console), X(is_fifo), X(linux_register),
-    X(mem_get_stats), X(net), X(now_running), X(pipe_left), X(pipe_of), X(proc_at),
+    X(mem_get_stats), X(net), X(process_times), X(pipe_left), X(pipe_of), X(proc_at),
     X(proc_command), X(proc_folder), X(proc_net_name), X(proc_read), X(readable),
     X(realtime_ms), X(realtime_us), X(self_us), X(user_string), X(user_us), X(vga_height),
-    X(vga_pixel_height), X(vga_pixel_width), X(vga_width), X(writer_names),
+    X(vga_pixel_height), X(vga_pixel_width), X(vga_width), X(process_writers),
+    X(input_report), X(input_ready), X(input_keys), X(input_clock), X(console_keys),
+    X(graphics_take), X(thread_id), X(proc_fd_target), X(fs_cwd), X(fd_cloexec), X(files_register), X(file_ops), X(signal_pgrp), X(process_ids), X(ops_named), X(buffer_open), X(pipe_data), X(unix_register), X(pair_new), X(handle_close), X(fd_read), X(fd_write), X(sock_ready), X(tty_foreground), X(tty_set_foreground), X(vga_screen), X(vga_lend), X(vga_lent),
 #ifdef DEBUG
     X(dbg),
 #endif

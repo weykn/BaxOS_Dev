@@ -48,11 +48,25 @@ long sys_getdents(int fd, void *buf, size_t n)        { return SC(217, fd, buf, 
 static char **environ;
 
 int run(const char *path, const char *const *argv) {
-    long pid = SC(57, 0, 0, 0);     /* fork */
+    return run_env(path, argv, NULL);
+}
+
+int run_env(const char *path, const char *const *argv, const char *const *extra) {
+    static const char *envp[96];
+    unsigned n = 0;
+    long pid;
     int st = 0;
 
+    for (unsigned i = 0; extra != NULL && extra[i] != NULL && n < 32; i++) {
+        envp[n++] = extra[i];
+    }
+    for (unsigned i = 0; environ != NULL && environ[i] != NULL && n < 95; i++) {
+        envp[n++] = environ[i];
+    }
+    envp[n] = NULL;
+    pid = SC(57, 0, 0, 0);          /* fork */
     if (pid == 0) {
-        SC(59, path, argv, environ);
+        SC(59, path, argv, envp);
         SC(231, 127, 0, 0);         /* exit_group: execve failed */
     }
     if (pid < 0) {

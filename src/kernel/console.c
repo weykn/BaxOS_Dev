@@ -104,6 +104,14 @@ static int      signalled;          /* SIGINT or SIGQUIT, typed and not yet take
 static unsigned unread_intr;
 static uint64_t last_read;
 
+/* KDSKBMODE K_OFF: keys still reach /dev/input, but none is typed here -
+   only the three Ctrl-Cs that end a program get through. */
+static bool keys_off;
+
+void console_keys(bool on) {
+    keys_off = !on;
+}
+
 static void gather(void) {
     char c;
 
@@ -113,6 +121,8 @@ static void gather(void) {
         if (unread_intr >= FORCE_AFTER && efi_uptime_ms() - last_read >= FORCE_IDLE) {
             signalled = CONSOLE_FORCE;
             typed_n = 0;
+        } else if (keys_off) {
+            continue;
         } else if ((settings.lflag & ISIG) != 0 && (c == VINTR || c == VQUIT)) {
             signalled = c == VINTR ? 2 : 3;
             typed_n = 0;
@@ -128,7 +138,7 @@ static char take_key(void) {
     while (typed_n == 0 && signalled == 0) {
         /* While other threads can run, the wait is theirs as well as the
            keyboard's. */
-        if (thread_alone()) {
+        if (thread_only()) {
             __asm__ volatile("pause");
         } else {
             thread_yield();

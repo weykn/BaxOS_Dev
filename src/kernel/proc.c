@@ -1,4 +1,5 @@
 #include "proc.h"
+#include "share.h"
 
 #include <stdint.h>
 
@@ -197,9 +198,59 @@ static void cmd_font(char *args) {
 /* What the OS itself uses, out of the RAM it has - which, as on Linux, is
    the machine's less what the firmware keeps for good. "mem all" is all of
    the machine's, the firmware's share counted in. */
+/* mem top: every process, biggest first. */
+#define TOP_MAX 32
+
+static void mem_top(void) {
+    struct process_info p[TOP_MAX];
+    unsigned n = 0;
+    uint64_t total = 0;
+
+    while (n < TOP_MAX && process_info(n, &p[n])) {
+        total += p[n++].bytes;
+    }
+    for (unsigned i = 1; i < n; i++) {
+        for (unsigned j = i; j > 0 && p[j].bytes > p[j - 1].bytes; j--) {
+            struct process_info swap = p[j];
+
+            p[j] = p[j - 1];
+            p[j - 1] = swap;
+        }
+    }
+    color(COL_DIM);
+    kprintf("    pid      KiB  program\n");
+    for (unsigned i = 0; i < n; i++) {
+        color(COL_TEXT);
+        put_right((unsigned)p[i].pid, 7);
+        put_right((unsigned)((p[i].bytes + 1023) / 1024), 9);
+        color(COL_DIM);
+        kprintf("  %s\n", p[i].name[0] != '\0' ? p[i].name : "?");
+    }
+    /* Libraries' pages, mapped by every program that has them and counted
+       once, here rather than in each. */
+    size_t common = shared_bytes();
+
+    color(COL_TEXT);
+    put_right((unsigned)((common + 1023) / 1024), 16);
+    color(COL_DIM);
+    kprintf("  shared\n");
+    total += common;
+    color(COL_TEXT);
+    put_right((unsigned)((total + 1023) / 1024), 16);
+    color(COL_DIM);
+    kprintf("  in all\n");
+    color(COL_TEXT);
+}
+
 static void cmd_mem(char *args) {
     struct mem_stats m;
-    bool all = strcmp(str_word(&args), "all") == 0;
+    const char *word = str_word(&args);
+    bool all = strcmp(word, "all") == 0;
+
+    if (strcmp(word, "top") == 0) {
+        mem_top();
+        return;
+    }
 
     mem_get_stats(&m);
     uint32_t ours = m.kernel_kib * 1024 + m.window;
@@ -218,7 +269,8 @@ static void cmd_mem(char *args) {
         uint32_t firmware = m.used_kib * 1024 > lent ? m.used_kib * 1024 - lent : 0;
         uint32_t kept = m.firmware_kib * 1024;
 
-        usage_bar("memory", m.used_kib, m.ram_kib, "KiB");
+        /* The cache is free memory lent out until asked for: not in use. */
+        usage_bar("memory", m.used_kib - m.disk_cache / 1024, m.ram_kib, "KiB");
         PART("firmware (kept)", kept);
         if (firmware > kept) {
             PART(mem_ours() ? "other" : "firmware (live)", firmware - kept);
@@ -271,9 +323,95 @@ static void cmd_reboot(char *args) {
     efi_restart();
 }
 
+/* The terminal's own clear, so it clears whichever screen this prints on:
+   the console, or an xterm's window. */
 static void cmd_clear(char *args) {
     (void)args;
-    vga_clear();
+    vga_raw("\x1b[H\x1b[2J\x1b[3J");
+}
+
+/* ---- Linux's files about the machine ----------------------------------------
+ *
+ * What a program off a Linux system reads to say what it runs on - neofetch,
+ * free, uptime - made when it is opened, from what the kernel knows. */
+
+static void cpu_name(char *vendor, char *brand) {
+    uint32_t r[12];
+
+    __asm__ volatile("cpuid" : "=a"(r[3]), "=b"(r[0]), "=c"(r[2]), "=d"(r[1]) : "a"(0));
+    memcpy(vendor, r, 12);          /* EBX, EDX, ECX: "GenuineIntel" */
+    vendor[12] = '\0';
+    brand[0] = '\0';
+    __asm__ volatile("cpuid" : "=a"(r[0]), "=b"(r[1]), "=c"(r[2]), "=d"(r[3]) : "a"(0x80000000));
+    if (r[0] < 0x80000004) {
+        return;
+    }
+    for (uint32_t leaf = 0; leaf < 3; leaf++) {
+        __asm__ volatile("cpuid" : "=a"(r[leaf * 4]), "=b"(r[leaf * 4 + 1]),
+                         "=c"(r[leaf * 4 + 2]), "=d"(r[leaf * 4 + 3]) : "a"(0x80000002 + leaf));
+    }
+    const char *s = (const char *)r;
+    unsigned n = 0;
+
+    while (*s == ' ') {
+        s++;                        /* some pad it on the left */
+    }
+    while (n < 47 && s + n < (const char *)r + 48 && s[n] != '\0') {
+        brand[n] = s[n];
+        n++;
+    }
+    brand[n] = '\0';
+}
+
+size_t proc_linux(const char *path, char *out, size_t max) {
+    static const char *const names[] = {
+        "/proc/uptime", "/proc/meminfo", "/proc/cpuinfo",
+        "/sys/devices/virtual/dmi/id/product_name", "/sys/devices/virtual/dmi/id/product_version",
+        "/sys/class/drm/card0/modes",
+    };
+    char text[512], *p = text;
+    unsigned which = 0;
+
+    while (which < sizeof names / sizeof names[0] && strcmp(path, names[which]) != 0) {
+        which++;
+    }
+    if (which == sizeof names / sizeof names[0]) {
+        return (size_t)-1;
+    }
+    if (out == NULL) {
+        return 0;
+    }
+    if (which == 0) {
+        uint64_t ms = efi_uptime_ms();
+
+        ksprintf(p, "%u.%02u %u.%02u\n", (unsigned)(ms / 1000), (unsigned)(ms / 10 % 100),
+                 (unsigned)(ms / 1000), (unsigned)(ms / 10 % 100));
+    } else if (which == 1) {
+        struct mem_stats m;
+
+        mem_get_stats(&m);
+        ksprintf(p, "MemTotal: %u kB\nMemFree: %u kB\nMemAvailable: %u kB\n"
+                 "Buffers: 0 kB\nCached: %u kB\nShmem: 0 kB\nSReclaimable: 0 kB\n"
+                 "SwapTotal: 0 kB\nSwapFree: 0 kB\n",
+                 m.total_kib, m.free_kib, m.free_kib + m.disk_cache / 1024, m.disk_cache / 1024);
+    } else if (which == 2) {
+        char vendor[13], brand[48];
+
+        cpu_name(vendor, brand);
+        ksprintf(p, "processor\t: 0\nvendor_id\t: %s\nmodel name\t: %s\n"
+                 "cpu MHz\t\t: %u.000\ncpu cores\t: 1\n\n",
+                 vendor, brand, (unsigned)(efi_tsc_hz() / 1000000));
+    } else if (which == 5) {
+        ksprintf(p, "%ux%u\n", vga_pixel_width(), vga_pixel_height());
+    } else if (efi_machine(which - 3)[0] != '\0') {
+        ksprintf(p, "%s\n", efi_machine(which - 3));
+    } else {
+        text[0] = '\0';
+    }
+    size_t len = strlen(text);
+
+    memcpy(out, text, len < max ? len : max);
+    return len;
 }
 
 /* ---- the table ----------------------------------------------------------- */
@@ -282,7 +420,7 @@ static const struct proc_cmd commands[] = {
     { "mode",   "[size]",            cmd_mode   },
     { "scale",  "[size|off]",        cmd_scale  },
     { "font",   "[size]",            cmd_font   },
-    { "mem",    "[all]",             cmd_mem    },
+    { "mem",    "[all|top]",         cmd_mem    },
     { "modman", "[enable|disable <module>|auto <category>|takeover]", module_command },
     { "clear",  "",                  cmd_clear },
     { "echo",   "[text]",            cmd_echo },

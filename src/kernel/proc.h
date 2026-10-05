@@ -51,6 +51,12 @@ void proc_print(const char *text);
    it once its script is through. */
 void proc_greet(void);
 
+/* One of Linux's files about the machine - /proc/uptime, /proc/meminfo,
+   /proc/cpuinfo, the DMI name, the screen's mode - made now into out, as
+   much as fits in max. Returns its length, or (size_t)-1 if path is not
+   one; out may be NULL to ask only that. */
+size_t proc_linux(const char *path, char *out, size_t max);
+
 /* A labelled bar of used out of total, in unit, as `mem` draws one - for the
    commands modules bring. */
 void usage_bar(const char *label, unsigned used, unsigned total, const char *unit);

@@ -6,15 +6,15 @@
 #include "string.h"
 
 #define MSR_FS_BASE   0xC0000100
-#define THREADS       16            /* at once, over every process */
-#define LEVELS        16            /* programs inside programs */
-#define STACK_PAGES   4             /* a thread's kernel stack, with the
+#define THREADS       64            /* at once, over every process */
+#define STACK_PAGES   (THREAD_STACK_BYTES / 4096)  /* a thread's kernel stack, with the
                                        thread itself at the bottom of it */
 
 struct thread {
     uint64_t ksp;                   /* its kernel stack, while it is not running */
     uint8_t *bottom;                /* the lowest byte of that stack */
-    unsigned level;                 /* the process: how deep it is */
+    void    *proc;                  /* its process (syscall.c's), NULL for the kernel */
+    bool     leader;                /* the one whose end is the process's */
     int      tid;
     bool     dead;                  /* ended; its stack goes at the next switch */
     bool     woken;
@@ -27,7 +27,18 @@ struct thread {
     uint64_t fs_base, kernel_rsp, args[6];
     struct user_regs *frame;
     struct user_regs regs;          /* where a new one starts */
+    /* Its x87 and SSE registers, while another thread has the processor: a
+       program's memcpy keeps things in them across a syscall, as it may. */
+    uint8_t  fpu[512] __attribute__((aligned(16)));
 };
+
+static void fpu_save(struct thread *t) {
+    __asm__ volatile("fxsave64 %0" : "=m"(t->fpu));
+}
+
+static void fpu_load(const struct thread *t) {
+    __asm__ volatile("fxrstor64 %0" : : "m"(t->fpu));
+}
 
 extern uint8_t tss[];
 extern struct user_regs *user_frame;
@@ -37,12 +48,16 @@ extern __attribute__((noreturn)) void user_exit(int code);
 extern void thread_switch(uint64_t *save, uint64_t to);
 uint64_t *syscall_args(void);
 
+/* syscall.c's side of a process: what changes hands between two, and what
+   is left of one whose last thread has ended. */
+void process_switch(void *from, void *to);
+void process_finished(int code);
+int  process_pid(void *proc);
+
 static struct thread first = { .bottom = (uint8_t *)stack_bottom, .tid = 1 };
 static struct thread *all[THREADS] = { &first };
 static struct thread *current = &first;
-static struct thread *leaders[LEVELS] = { &first };
-static unsigned level;
-static int next_tid = 1000;
+static int next_tid = 2;            /* pids and tids alike: one counter, no clash */
 
 static uint64_t rdmsr(uint32_t msr) {
     uint32_t low, high;
@@ -77,17 +92,24 @@ static void switch_to(struct thread *next) {
     prev->kernel_rsp = *kernel_rsp();
     prev->frame = user_frame;
     memcpy(prev->args, syscall_args(), sizeof prev->args);
+    if (prev->proc != next->proc) {
+        process_switch(prev->proc, next->proc);
+    }
     current = next;
     wrmsr(MSR_FS_BASE, next->fs_base);
     *kernel_rsp() = next->kernel_rsp;
     user_frame = next->frame;
     memcpy(syscall_args(), next->args, sizeof next->args);
+    fpu_save(prev);
     thread_switch(&prev->ksp, next->ksp);
+    fpu_load(current);              /* back: this thread's own again */
     reap();
 }
 
-/* The next of the process's threads after this one, or NULL. */
-static struct thread *next_one(void) {
+/* The next thread after this one, of any process - or, with mine, of this
+   one only - or NULL. Every thread waiting calls thread_yield in its wait, so
+   going round all of them is what lets every process get on. */
+static struct thread *next_one(bool mine) {
     unsigned at = 0;
 
     while (all[at] != current) {
@@ -96,15 +118,25 @@ static struct thread *next_one(void) {
     for (unsigned n = 1; n < THREADS; n++) {
         struct thread *t = all[(at + n) % THREADS];
 
-        if (t != NULL && !t->dead && t->level == level) {
+        if (t != NULL && !t->dead && (!mine || t->proc == current->proc)) {
             return t;
         }
     }
     return NULL;
 }
 
+/* The thread that ends proc's life, or NULL. */
+static struct thread *leader_of(void *proc) {
+    for (unsigned i = 0; i < THREADS; i++) {
+        if (all[i] != NULL && !all[i]->dead && all[i]->leader && all[i]->proc == proc) {
+            return all[i];
+        }
+    }
+    return NULL;
+}
+
 void thread_yield(void) {
-    struct thread *next = next_one();
+    struct thread *next = next_one(false);
 
     if (next != NULL) {
         switch_to(next);
@@ -120,11 +152,19 @@ uint64_t *thread_sigmask(void) {
 }
 
 bool thread_alone(void) {
-    return next_one() == NULL;
+    return next_one(true) == NULL;
+}
+
+bool thread_only(void) {
+    return next_one(false) == NULL;
 }
 
 int thread_id(void) {
-    return current == leaders[level] ? 1 : current->tid;
+    return current->leader && current->proc != NULL ? process_pid(current->proc) : current->tid;
+}
+
+int thread_new_id(void) {
+    return next_tid++;
 }
 
 uint64_t thread_stack_left(const void *here) {
@@ -135,6 +175,7 @@ uint64_t thread_stack_left(const void *here) {
 static void thread_start(void) {
     struct thread *t = current;
 
+    fpu_load(t);
     reap();
     user_resume(&t->regs, 0);       /* back here once it calls exit */
     if (t->clear_tid != 0) {
@@ -142,12 +183,27 @@ static void thread_start(void) {
         thread_wake(t->clear_tid, 1, 0, 0);
     }
     t->dead = true;
-    switch_to(next_one() != NULL ? next_one() : leaders[level]);
+    switch_to(next_one(false));     /* there is always one: the kernel's own */
     for (;;) {
     }
 }
 
-int thread_create(const struct user_regs *regs, uint64_t rsp, uint64_t fs, uint64_t clear_tid) {
+/* Where a forked process's first thread starts, and what it does once the
+   process has ended. */
+static void process_entry(void) {
+    struct thread *t = current;
+
+    fpu_load(t);
+    reap();
+    process_finished(user_resume(&t->regs, 0));
+    t->dead = true;
+    switch_to(next_one(false));
+    for (;;) {
+    }
+}
+
+static struct thread *thread_new(void *proc, bool leader, const struct user_regs *regs,
+                                 uint64_t rsp, uint64_t fs, uint64_t sigmask, void (*entry)(void)) {
     unsigned slot = 1;
     uint64_t base;
 
@@ -156,51 +212,86 @@ int thread_create(const struct user_regs *regs, uint64_t rsp, uint64_t fs, uint6
         slot++;
     }
     if (slot == THREADS || (base = mem_pages(STACK_PAGES)) == 0) {
-        return -11;                 /* EAGAIN */
+        return NULL;
     }
     struct thread *t = (struct thread *)base;
     uint64_t *sp = (uint64_t *)(base + STACK_PAGES * 4096);
 
     *t = (struct thread){
-        .bottom = (uint8_t *)(t + 1), .level = level, .tid = next_tid++,
-        .sigmask = current->sigmask,    /* as the thread starting it has them */
-        .clear_tid = clear_tid, .fs_base = fs, .kernel_rsp = *kernel_rsp(),
+        .bottom = (uint8_t *)(t + 1), .proc = proc, .leader = leader, .tid = next_tid++,
+        .sigmask = sigmask, .fs_base = fs,
+        /* Its syscalls land at the top of its own stack. */
+        .kernel_rsp = base + STACK_PAGES * 4096 - 64,
         .regs = *regs,
     };
     t->regs.rsp = rsp;
-    *--sp = 0;                      /* thread_start's return address: none */
-    *--sp = (uint64_t)thread_start; /* where thread_switch's ret goes */
+    fpu_save(t);                    /* it starts with its creator's, as on Linux */
+    sp = (uint64_t *)(base + STACK_PAGES * 4096 - 64);
+    *--sp = 0;                      /* the entry's return address: none */
+    *--sp = (uint64_t)entry;        /* where thread_switch's ret goes */
     sp -= 6;                        /* the six registers it pops */
     memset(sp, 0, 6 * 8);
     t->ksp = (uint64_t)sp;
     all[slot] = t;
+    return t;
+}
+
+int thread_create(const struct user_regs *regs, uint64_t rsp, uint64_t fs, uint64_t clear_tid) {
+    struct thread *t = thread_new(current->proc, false, regs, rsp, fs, current->sigmask,
+                                  thread_start);
+
+    if (t == NULL) {
+        return -11;                 /* EAGAIN */
+    }
+    t->clear_tid = clear_tid;
     return t->tid;
 }
 
+bool thread_spawn(void *proc, const struct user_regs *regs, uint64_t fs, uint64_t sigmask) {
+    return thread_new(proc, true, regs, regs->rsp, fs, sigmask, process_entry) != NULL;
+}
+
 /* Every thread of the process but this one ends where it waits. */
-static void end_others(void) {
+void thread_end_others(void) {
     for (unsigned i = 1; i < THREADS; i++) {
-        if (all[i] != NULL && all[i] != current && all[i]->level == level) {
+        if (all[i] != NULL && all[i] != current && all[i]->proc == current->proc) {
             all[i]->dead = true;
         }
     }
     reap();
 }
 
-void thread_enter(void) {
-    leaders[++level] = current;
-    current->level = level;
+void *thread_adopt(void *proc) {
+    void *was = current->proc;
+
+    current->proc = proc;
+    current->leader = true;
+    return was;
 }
 
-void thread_leave(void) {
-    end_others();
-    current->level = --level;
+void thread_disown(void *was) {
+    thread_end_others();
+    current->leader = false;
+    current->proc = was;
+}
+
+unsigned thread_count(void *proc) {
+    unsigned n = 0;
+
+    for (unsigned i = 0; i < THREADS; i++) {
+        n += all[i] != NULL && !all[i]->dead && all[i]->proc == proc;
+    }
+    return n;
+}
+
+void *thread_process(void) {
+    return current->proc;
 }
 
 void process_exit(int code) {
-    struct thread *leader = leaders[level];
+    struct thread *leader = leader_of(current->proc);
 
-    if (current != leader) {
+    if (leader != NULL && current != leader) {
         /* The leader is waiting somewhere, in the kernel: it ends the
            process from there, on its own stack. */
         leader->exiting = true;
@@ -208,12 +299,12 @@ void process_exit(int code) {
         current->dead = true;
         switch_to(leader);
     }
-    end_others();
+    thread_end_others();
     user_exit(code);
 }
 
 void thread_exit(int code) {
-    if (current == leaders[level]) {
+    if (current->leader) {
         while (!thread_alone()) {   /* the process lasts as long as they do */
             thread_yield();
         }
@@ -236,7 +327,7 @@ int thread_wake(uint64_t addr, int n, uint64_t addr2, int move) {
     for (unsigned i = 0; i < THREADS; i++) {
         struct thread *t = all[i];
 
-        if (t == NULL || t->dead || t->level != level || t->futex != addr || addr == 0) {
+        if (t == NULL || t->dead || t->proc != current->proc || t->futex != addr || addr == 0) {
             continue;
         }
         if (woke < n) {

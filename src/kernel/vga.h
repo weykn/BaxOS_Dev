@@ -96,6 +96,20 @@ void vga_firmware_gone(void);
 /* Past the end of the framebuffer, for what has to be mapped. */
 uint64_t vga_framebuffer_end(void);
 
+/* The framebuffer as it really is, for /dev/fb0: where, how big, bytes a
+   scan line, and whether red is the low byte of a pixel rather than blue. */
+struct vga_screen {
+    uint64_t base;
+    unsigned width, height, pitch;
+    bool     red_first;
+};
+void vga_screen(struct vga_screen *out);
+
+/* A program drawing on the screen itself (KDSETMODE): on, nothing of the
+   console's is drawn; off, the screen is cleared and the console redrawn. */
+void vga_lend(bool on);
+bool vga_lent(void);
+
 /* Puts the console back on screen if the firmware has taken the mode over.
    Everything that waits for a key calls this. */
 void vga_follow(void);
@@ -106,6 +120,7 @@ void vga_follow(void);
    output somewhere other than the screen; it does not nest. */
 void vga_capture(char *buf, size_t max);
 void vga_capture_end(void);
+void vga_raw(const char *text);     /* escapes kept, even captured */
 
 void vga_set_color(enum vga_color fg, enum vga_color bg);
 

@@ -15,6 +15,7 @@
 #include "driver.h"
 #include "vga.h"
 #include "bios.h"
+#include "share.h"
 
 /* The kernel's side of the firmware.
  *
@@ -120,12 +121,108 @@ done:
     return found;
 }
 
+/* ---- the machine's name ----------------------------------------------------
+ *
+ * SMBIOS's system record (type 1) says what the machine is, which Linux
+ * shows as /sys/devices/virtual/dmi/id. Its entry point is in a firmware
+ * table on UEFI and in the BIOS area otherwise; the record is copied at
+ * boot, since the firmware's memory may not stay. */
+
+static char machine[2][48];             /* product name, version */
+
+static const uint8_t smbios_guid[16] = { 0x31, 0x2D, 0x9D, 0xEB, 0x88, 0x2D, 0xD3, 0x11,
+                                         0x9A, 0x16, 0x00, 0x90, 0x27, 0x3F, 0xC1, 0x4D };
+static const uint8_t smbios3_guid[16] = { 0x44, 0x15, 0xFD, 0xF2, 0x94, 0x97, 0x2C, 0x4A,
+                                          0x99, 0x2E, 0xE5, 0xBB, 0xCF, 0x20, 0xE3, 0x94 };
+
+/* String n of a record: they follow its formatted part, from one. */
+static void smbios_copy(char *to, const uint8_t *record, const uint8_t *end, uint8_t n) {
+    const char *s = (const char *)record + record[1];
+    unsigned i = 0;
+
+    while (n > 1 && (const uint8_t *)s < end && *s != '\0') {
+        s += strlen(s) + 1;
+        n--;
+    }
+    while (n == 1 && i < sizeof machine[0] - 1 && (const uint8_t *)s + i < end &&
+           s[i] >= ' ' && s[i] < 0x7F) {
+        to[i] = s[i];
+        i++;
+    }
+    to[i] = '\0';
+}
+
+/* An entry point is one if its bytes add up to nothing: the anchor alone
+   can turn up anywhere in the BIOS. */
+static bool smbios_entry(const uint8_t *at) {
+    unsigned length = memcmp(at, "_SM3_", 5) == 0 ? at[6]
+                    : memcmp(at, "_SM_", 4) == 0 ? at[5] : 0;
+    uint8_t sum = 0;
+
+    for (unsigned i = 0; i < length && length <= 32; i++) {
+        sum += at[i];
+    }
+    return length >= 0x18 && length <= 32 && sum == 0;
+}
+
+static void smbios_read(void) {
+    const uint8_t *entry = NULL;
+    uint64_t base = 0;
+    uint32_t size = 0;
+
+    if (bios()) {
+        for (uint64_t at = 0xF0000; at < 0x100000 && entry == NULL; at += 16) {
+            if (smbios_entry((const uint8_t *)at)) {
+                entry = (const uint8_t *)at;
+            }
+        }
+    } else {
+        const struct { uint8_t guid[16]; const uint8_t *table; } *t = boot->system->configuration;
+
+        for (efi_uintn i = 0; i < boot->system->table_entries; i++) {
+            if (memcmp(t[i].guid, smbios3_guid, 16) == 0 ||
+                (entry == NULL && memcmp(t[i].guid, smbios_guid, 16) == 0)) {
+                entry = t[i].table;
+            }
+        }
+    }
+    if (entry == NULL || !smbios_entry(entry)) {
+        return;
+    }
+    if (memcmp(entry, "_SM3_", 5) == 0) {
+        memcpy(&size, entry + 12, 4);
+        memcpy(&base, entry + 16, 8);
+    } else {
+        memcpy(&size, entry + 0x16, 2);
+        memcpy(&base, entry + 0x18, 4);
+    }
+    const uint8_t *at = (const uint8_t *)base, *end = at + size;
+
+    while (at + 4 <= end && at[0] != 127 && at[1] >= 4) {
+        if (at[0] == 1 && at[1] >= 8) {
+            smbios_copy(machine[0], at, end, at[5]);
+            smbios_copy(machine[1], at, end, at[6]);
+            return;
+        }
+        at += at[1];
+        while (at + 1 < end && (at[0] | at[1]) != 0) {
+            at++;
+        }
+        at += 2;
+    }
+}
+
+const char *efi_machine(unsigned which) {
+    return which < 2 ? machine[which] : "";
+}
+
 void efi_init(struct boot_info *info) {
     kept = *info;
     boot = &kept;
     if (bios()) {
         bios_init(boot);
     }
+    smbios_read();
 }
 
 const struct boot_info *efi_boot(void) {
@@ -433,6 +530,7 @@ int ata_write_many(uint32_t lba, unsigned count, const void *buffer) {
     if (disk_cache != NULL) {
         disk_cache->written(lba, count, buffer);
     }
+    shared_written(lba, count);     /* pages mapped from there are out of date */
     if (disk_base != 0) {
         return disk_driver->write(disk_base + lba, count, buffer);
     }
@@ -516,6 +614,11 @@ uint64_t efi_uptime_ms(void) {
         }
     }
     return (now - boot->started) * 1000 / ticks_per_second;
+}
+
+uint64_t efi_tsc_hz(void) {
+    efi_uptime_ms();                    /* calibrates, the first time */
+    return ticks_per_second;
 }
 
 /* The same in microseconds, for what is over in a fraction of one - a

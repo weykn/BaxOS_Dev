@@ -54,6 +54,9 @@
 #define EAFNOSUPPORT    97
 #define EOPNOTSUPP      95
 #define ENOTSOCK        88
+#define ENOTCONN        107
+#define ECONNREFUSED    111
+#define EADDRINUSE      98
 
 #define FOLDER_MARK  0xFFFFFFFFu
 #define WRITE_MARK   0xFFFFFFFEu    /* a file open for writing */
@@ -62,7 +65,51 @@
 #define PROC_MARK    0xFFFFFFFBu    /* one of the commands in it */
 #define PIPE_MARK    0xFFFFFFFAu    /* one end of a pipe */
 #define DEV_MARK     0xFFFFFFF9u    /* one of the made-up files in /dev */
-#define FIRST_MARK   SOCK_MARK      /* below this, a start is a sector */
+#define MOD_MARK     0xFFFFFFF7u    /* a module's own: its files slot in size */
+#define FIRST_MARK   MOD_MARK       /* below this, a start is a sector */
+
+/* Files a module makes under /dev - ipc/pty's /dev/ptmx and /dev/pts/N. A
+ * descriptor on one is MOD_MARK, with the module's slot in size; folder and
+ * offset are the module's own, except that O_NONBLOCK in offset is the
+ * descriptor's. The kernel reads, writes, polls, duplicates and closes it
+ * through these. */
+struct file_ops {
+    const char *prefix;             /* the names it answers, under /dev/ */
+    /* A descriptor on name - what follows /dev/ - or a negated errno. */
+    uint64_t (*open)(const char *name, uint64_t flags);
+    /* Whether name is one, and what stat says it is. */
+    bool     (*named)(const char *name, uint32_t *mode, uint32_t *rdev);
+    uint64_t (*read)(struct handle *h, uint64_t buf, uint64_t count);
+    uint64_t (*write)(struct handle *h, uint64_t buf, uint64_t count);
+    uint64_t (*ioctl)(struct handle *h, uint64_t request, uint64_t arg);
+    unsigned (*ready)(struct handle *h);    /* NET_IN, NET_OUT, NET_HUP: as a socket's */
+    void     (*hold)(struct handle *h);     /* one more descriptor on it */
+    void     (*drop)(struct handle *h);     /* one fewer */
+    void     (*stat)(struct handle *h, uint32_t *mode, uint32_t *rdev);
+};
+
+#define FILE_OPS 4
+extern const struct file_ops *file_ops[FILE_OPS];
+
+/* A module's files coming and going: the slot it has, one-based, or 0 if
+   there is none - and with NULL, giving slot up. */
+unsigned files_register(const struct file_ops *ops, unsigned slot);
+
+/* The ops a MOD_MARK descriptor is the module's through, or NULL. */
+static inline const struct file_ops *ops_of(const struct handle *h) {
+    return h != NULL && h->start == MOD_MARK && h->size >= 1 && h->size <= FILE_OPS
+         ? file_ops[h->size - 1] : NULL;
+}
+
+/* A module's /dev name: the ops it is under, or NULL; leaf is what follows
+   "/dev/". */
+const struct file_ops *ops_named(const char *path, const char **leaf);
+
+/* Sends sig to every process in group pgid: a terminal's Ctrl-C. */
+void signal_pgrp(int pgid, int sig);
+
+/* The running process's pid, group and session. */
+void process_ids(int *pid, int *pgid, int *sid);
 
 /* Where a made-up file's number starts, clear of any real one: those are
    sector numbers, and the disk is far smaller than this. */
@@ -71,14 +118,18 @@
 
 enum dev {
     DEV_NULL = 1, DEV_ZERO, DEV_FULL, DEV_RANDOM, DEV_TTY,
+    DEV_FB,                         /* the screen, /dev/fb0 */
+    DEV_EVENT0,                     /* the keyboard and the mouse, as evdev: */
+    DEV_EVENT1,                     /* DEV_EVENT0 + INPUT_* */
 };
 
 struct device {
     const char *name;
     enum dev    which;
+    uint16_t    rdev;               /* Linux's number for it, major << 8 | minor */
 };
 
-#define DEVICES 10
+#define DEVICES 15
 extern const struct device devices[DEVICES];
 
 /* A pipe handle's size says which end it is. An eventfd is a pipe with no
@@ -90,6 +141,12 @@ extern const struct device devices[DEVICES];
 #define PIPE_PAIR  4                /* an AF_UNIX socketpair end: it reads its
                                        own pipe and writes the other's, whose
                                        slot is in offset from bit 16 */
+#define PIPE_BUFFER 5               /* a buffer a module keeps its own state in:
+                                       an epoll set's list (compat/linux) */
+
+/* A descriptor on a fresh buffer of bytes, zeroed, which goes with the last
+   descriptor on it; or a negated errno. */
+uint64_t buffer_open(uint32_t bytes);
 
 /* The running program's time, in microseconds (syscall.c). */
 struct times {
@@ -100,14 +157,17 @@ struct times {
     uint64_t children_user, children_sys;   /* and what of it was which */
 };
 
-extern struct times now_running;
+/* The running process's, through these: every process has its own. */
+struct times *process_times(void);
+#define now_running (*process_times())
 
 /* What a TCGETS hands over, and what the one carrying the line speeds does. */
 #define TERMIOS_OLD 36
 #define TERMIOS_NEW 44
 
 #define WRITERS 4
-extern char writer_names[WRITERS][FS_NAME_LEN];
+char (*process_writers(void))[FS_NAME_LEN];
+#define writer_names (process_writers())
 
 /* The working directory, for a relative path in the *at calls. */
 #define AT_FDCWD (-100)
@@ -136,12 +196,16 @@ const char  *at_path(uint64_t dirfd, const char *name, char *out, size_t max);
 uint64_t     fs_errno(int err);
 bool         is_console(uint64_t fd);
 struct pipe *pipe_of(const struct handle *h);
+void        *pipe_data(const struct handle *h);     /* a PIPE_BUFFER's bytes, or NULL */
 uint32_t     pipe_left(const struct pipe *p);
 bool         readable(const struct handle *h);
 bool         event_ready(const struct handle *h);
 enum dev     dev_named(const char *name);
-bool         dev_folder(const char *name);
+unsigned     dev_folder(const char *name);  /* 1 /dev, 2 /dev/input, 3 /dev/pts, 0 none */
 const char  *proc_net_name(const char *path);
+/* /proc/self/fd/N, and /proc/<own pid>/fd/N: the path descriptor N is open
+   on, into out (at least FS_NAME_LEN + 16 bytes) - or NULL for any other name. */
+const char  *proc_fd_target(const char *name, char *out, size_t max);
 uint32_t     file_ino(const char *name, bool follow);
 bool         is_fifo(const struct fs_file *file);
 uint64_t     self_us(void);
@@ -149,6 +213,14 @@ uint64_t     user_us(void);
 uint64_t     realtime_us(void);
 uint64_t     realtime_ms(void);
 uint64_t     deliverable(void);         /* the signal to be handled, or 0 */
+
+/* A program taking the screen or the input devices for itself: they are
+   given back when it ends (syscall.c). */
+void graphics_take(void);
+
+/* The terminal's foreground group: where Ctrl-C goes (TIOCGPGRP/TIOCSPGRP). */
+int  tty_foreground(void);
+void tty_set_foreground(int pgid);
 
 #define LINUX_MODULE "compat/linux"
 

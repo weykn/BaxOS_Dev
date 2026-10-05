@@ -154,7 +154,7 @@ static int slot(void) {
         }
         for (unsigned i = 0; i < st->room; i++) {
             if (st->lines[i].data == NULL) {
-                uint64_t at = mem_pages(LINE_PAGES);
+                uint64_t at = mem_pages_lent(LINE_PAGES);
 
                 if (at == 0) {
                     break;

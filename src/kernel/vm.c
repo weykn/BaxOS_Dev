@@ -1,4 +1,5 @@
 #include "vm.h"
+#include "share.h"
 
 #include "debug.h"
 #include "efi.h"
@@ -8,9 +9,14 @@
 
 /* x86-64 paging, four levels of it: a virtual address is four nine-bit
  * indexes and an offset, and each level holds physical addresses of the next.
- * Only one slot of the top level is ours per region, which is half a terabyte
- * of address space - far more than anything here will use, and free, which is
- * what matters: nothing of the firmware's is anywhere near it. */
+ * One slot of the top level is the programs', which is half a terabyte of
+ * address space - far more than anything here will use, and free, which is
+ * what matters: nothing of the firmware's is anywhere near it.
+ *
+ * Every process has its own tables under that slot, and the slot points at
+ * whichever process is running: a switch is one entry rewritten, so a
+ * process costs its own tables and nothing more - no top table of its own,
+ * no copy of the kernel's mappings to keep in step. */
 
 #define PRESENT 0x001
 #define WRITE   0x002
@@ -21,22 +27,7 @@
 #define ENTRIES   512
 #define SLOT_SIZE (1ull << 39)      /* what one top-level entry covers */
 
-/* Programs inside programs. One more than the deepest nesting allowed, since
-   the outermost region is a level too. */
-#define LEVELS 5
-
-/* Pages a forked child may change before its parent can no longer be put
-   back exactly. A child that has not started a program of its own is a few
-   lines of a shell's own code - a dozen or so pages - so this is far more
-   than one ever touches. */
-#define UNDO_MAX 512
-
-/* One page the child wrote to, and what was under it. copy is a page holding
-   what the parent had there; zero means the parent had nothing there, and
-   the page goes away again. */
-struct undo {
-    uint64_t at, copy;
-};
+#define SPACES 32                   /* processes at once */
 
 /* Pages are bought from the firmware a chunk at a time rather than one at a
    time. A call to firmware costs about the same whatever it is for, and a C
@@ -60,29 +51,10 @@ struct chunk {
     uint64_t pages;                 /* what was asked for, to give back */
 };
 
-static struct level {
-    uint64_t base;              /* the region's first address */
-    unsigned slot;              /* its slot in the top-level table */
-    uint64_t bought;            /* taken from the firmware for it, chunks and
-                                   all - which is what it really costs, not
-                                   what it has been handed so far */
-    uint64_t tables;            /* its own top-level table, bought on its own */
-    uint64_t chunks;            /* the last chunk bought, 0 for none */
-    uint64_t next, left;        /* the next page in it, and how many are left */
-    uint64_t grow;              /* how big the next chunk should be */
-    uint64_t spare;             /* pages given back, chained through their
-                                   first word, to hand out again */
-    struct undo *undo;          /* what it has changed since a fork, if any */
-    unsigned  undo_count;
-    bool      undo_full;        /* more than the log could hold */
-
-    /* Low memory, for a program linked to run at a fixed address: the range
-       it may use, and a page listing the page table for each two megabytes
-       of it, which stand in for the firmware's own mapping while it runs. */
-    uint64_t  low_start, low_end;
-    uint64_t *low_tables;
-    uint64_t  low_owned;        /* pages it has at their own address */
-} levels[LEVELS];
+static struct space *spaces[SPACES];    /* every one there is */
+static struct space *cur;               /* the one the slot points at */
+static unsigned slot;                   /* the programs' slot, once taken */
+static uint64_t region;                 /* where it starts */
 
 /* ---- low memory ------------------------------------------------------------
  *
@@ -103,6 +75,9 @@ static struct level {
 
 #define LOW_LIMIT (1ull << 30)      /* the gigabyte one page directory covers */
 #define OWNED     0x200             /* an entry whose page is at its own address */
+#define DEVICE    0x400             /* an entry for a device's memory: nobody's to give back */
+#define SHARED    0x800             /* a file's page every process has in common (share.c):
+                                       read-only, copied on the first write */
 
 static uint64_t *low_pd;            /* the firmware's directory for it */
 static uint64_t *low_orig;          /* what that said before anything changed it -
@@ -110,7 +85,6 @@ static uint64_t *low_orig;          /* what that said before anything changed it
                                        say two megabytes one to one */
 static uint64_t  low_fixed;         /* pages bought for those two, for good */
 
-static unsigned depth;          /* levels[depth] is the one in use */
 
 /* Pages from mem.c: the firmware's while it is running, the kernel's own
    after. EFI_SUCCESS or not, as the callers were written for. */
@@ -155,8 +129,23 @@ static uint64_t *pml4(void) {
 /* One page of memory for a table, or for the program: one the region has
    already bought where there is one, and a fresh chunk of them where there is
    not. Cleared before it is used for anything. */
-static uint64_t *page_from(struct level *level) {
+static uint64_t *page_from(struct space *level) {
     uint64_t at;
+
+    /* Once memory is the kernel's, a page is one call and nothing to hand
+       back but itself: one at a time, and back the moment it is let go, so
+       what a process has is what it holds now rather than the most it ever
+       did. Chunks are for while the firmware still owns memory, where every
+       call is a trip to it - and a region that started on them stays on
+       them. */
+    if (level->chunks == 0 && mem_ours()) {
+        if ((at = mem_pages(1)) == 0) {
+            return NULL;
+        }
+        level->bought += VM_PAGE;
+        memset((void *)at, 0, VM_PAGE);
+        return (uint64_t *)at;
+    }
 
     if (level->spare != 0) {
         at = level->spare;
@@ -195,7 +184,12 @@ static uint64_t *page_from(struct level *level) {
 }
 
 /* Gives one back to the region it came from, to be handed out again. */
-static void page_back(struct level *level, uint64_t at) {
+static void page_back(struct space *level, uint64_t at) {
+    if (level->chunks == 0) {
+        mem_pages_free(at, 1);
+        level->bought -= VM_PAGE;
+        return;
+    }
     *(uint64_t *)at = level->spare;
     level->spare = at;
 }
@@ -213,7 +207,7 @@ static uint64_t table_page(void) {
 
 /* Hands every chunk the region bought back to the firmware. Everything in
    them goes with it, so nothing may still be mapped when this runs. */
-static void chunks_back(struct level *level) {
+static void chunks_back(struct space *level) {
     uint64_t chunk = level->chunks;
 
     while (chunk != 0) {
@@ -226,37 +220,20 @@ static void chunks_back(struct level *level) {
     level->chunks = level->next = level->left = level->spare = level->grow = 0;
 }
 
-/* Claims a free top-level slot and points it at a table of its own. */
-static bool slot_take(struct level *level) {
+/* Claims a free top-level slot for programs, the first time one is wanted. */
+static bool slot_init(void) {
     uint64_t *top = pml4();
 
     /* The lower half of the address space, which is where a program may run,
        is the first 256 slots. The firmware maps what the machine has at the
        bottom of it; a slot it leaves alone is ours. */
-    for (unsigned i = 1; i < 256; i++) {
-        uint64_t *pdpt;
-        uint64_t cr0;
-
-        if (top[i] & PRESENT) {
-            continue;
+    for (unsigned i = 1; slot == 0 && i < 256; i++) {
+        if (!(top[i] & PRESENT)) {
+            slot = i;
+            region = (uint64_t)i * SLOT_SIZE;
         }
-        /* The region's own table is bought on its own rather than out of a
-           chunk: the chunks are handed back whenever the region is emptied,
-           and this has to outlive that. */
-        pdpt = (uint64_t *)table_page();
-        if (pdpt == NULL) {
-            return false;
-        }
-        cr0 = write_protect_off();
-        top[i] = (uint64_t)pdpt | PRESENT | WRITE | USER;
-        write_protect_back(cr0);
-        level->tables = VM_PAGE;
-        level->slot = i;
-        level->base = (uint64_t)i * SLOT_SIZE;
-        flush_tlb();
-        return true;
     }
-    return false;
+    return slot != 0;
 }
 
 /* What the directory says for the two megabytes at i when no program has
@@ -329,7 +306,7 @@ static bool low_setup(void) {
 
 /* Puts level's tables for its low range in the directory, or takes them out
    again for what the firmware had there. */
-static void low_apply(struct level *level, bool on) {
+static void low_apply(struct space *level, bool on) {
     uint64_t cr0;
 
     if (level->low_tables == NULL) {
@@ -345,12 +322,15 @@ static void low_apply(struct level *level, bool on) {
     flush_tlb();
 }
 
-/* Whether a program underneath has the page at addr at its own address, and
-   so whether this one may have a page there without hiding anyone's. */
+/* Whether another process has the page at addr at its own address, and so
+   whether this one may have a page there without hiding anyone's. */
 static bool low_below(uint64_t addr) {
-    for (unsigned i = 0; i < depth; i++) {
-        struct level *l = &levels[i];
+    for (unsigned i = 0; i < SPACES; i++) {
+        struct space *l = spaces[i];
 
+        if (l == NULL || l == cur) {
+            continue;
+        }
         if (l->low_tables != NULL && addr >= l->low_start && addr < l->low_end) {
             uint64_t table = l->low_tables[addr >> 21];
 
@@ -363,11 +343,11 @@ static bool low_below(uint64_t addr) {
 }
 
 bool vm_low(uint64_t start, uint64_t end) {
-    struct level *level = &levels[depth];
+    struct space *level = cur;
 
     start &= ~(uint64_t)(VM_PAGE - 1);
     end = (end + VM_PAGE - 1) & ~(uint64_t)(VM_PAGE - 1);
-    if (level->base == 0 || level->low_tables != NULL || start < (2ull << 20) ||
+    if (level == NULL || level->low_tables != NULL || start < (2ull << 20) ||
         end > LOW_LIMIT || start >= end || !low_setup() ||
         (level->low_tables = page_from(level)) == NULL) {
         return false;
@@ -384,10 +364,8 @@ bool vm_low_used(void) {
 void vm_move(uint64_t *top, uint64_t *pd) {
     uint64_t *old = pml4();
 
-    for (unsigned i = 0; i < LEVELS; i++) {
-        if (levels[i].base != 0) {
-            top[levels[i].slot] = old[levels[i].slot];
-        }
+    if (slot != 0) {
+        top[slot] = old[slot];
     }
     if (low_pd == NULL) {
         return;
@@ -408,36 +386,34 @@ void vm_move(uint64_t *top, uint64_t *pd) {
 }
 
 void vm_firmware_view(bool on) {
-    if (low_pd != NULL) {
-        low_apply(&levels[depth], !on);
+    if (low_pd != NULL && cur != NULL) {
+        low_apply(cur, !on);
     }
 }
 
 size_t vm_fixed_tables(void) {
-    return (size_t)low_fixed + (levels[0].base != 0 ? VM_PAGE : 0);
+    return (size_t)low_fixed;
 }
 
 bool vm_start(void) {
-    if (levels[depth].base != 0) {
-        return true;
-    }
-    return slot_take(&levels[depth]);
+    return cur != NULL;
 }
 
 uint64_t vm_base(void) {
-    return levels[depth].base;
+    return cur != NULL ? region : 0;
 }
 
 uint64_t vm_end(void) {
-    uint64_t base = levels[depth].base;
-
-    return base == 0 ? 0 : base + SLOT_SIZE;
+    return cur != NULL ? region + SLOT_SIZE : 0;
 }
 
 bool vm_holds(uint64_t addr, uint64_t size) {
-    struct level *level = &levels[depth];
-    uint64_t base = level->base;
+    struct space *level = cur;
+    uint64_t base = vm_base();
 
+    if (level == NULL) {
+        return false;
+    }
     if (level->low_tables != NULL && addr >= level->low_start && addr <= level->low_end &&
         size <= level->low_end - addr) {
         return true;
@@ -445,10 +421,9 @@ bool vm_holds(uint64_t addr, uint64_t size) {
     return base != 0 && addr >= base && addr <= vm_end() && size <= vm_end() - addr;
 }
 
-/* Walks down to the entry for addr, making the tables on the way if make is
-   set. Returns NULL if there is none, or if one could not be made. */
-static uint64_t *entry_for(uint64_t addr, bool make) {
-    struct level *level = &levels[depth];
+/* Walks down to space level's entry for addr, making the tables on the way
+   if make is set. Returns NULL if there is none, or if one could not be made. */
+static uint64_t *entry_in(struct space *level, uint64_t addr, bool make) {
 
     if (addr < LOW_LIMIT) {
         uint64_t *pt;
@@ -464,16 +439,18 @@ static uint64_t *entry_for(uint64_t addr, bool make) {
             }
             level->low_tables[addr >> 21] = (uint64_t)pt;
             level->tables += VM_PAGE;
-            cr0 = write_protect_off();
-            low_pd[addr >> 21] = (uint64_t)pt | PRESENT | WRITE | USER;
-            write_protect_back(cr0);
-            flush_tlb();
+            if (level == cur) {
+                cr0 = write_protect_off();
+                low_pd[addr >> 21] = (uint64_t)pt | PRESENT | WRITE | USER;
+                write_protect_back(cr0);
+                flush_tlb();
+            }
         }
         pt = (uint64_t *)level->low_tables[addr >> 21];
         return &pt[(addr >> 12) & (ENTRIES - 1)];
     }
 
-    uint64_t *table = table_at(pml4()[level->slot]);
+    uint64_t *table = level->pdpt;
     unsigned index[3] = {
         (unsigned)(addr >> 30) & (ENTRIES - 1),
         (unsigned)(addr >> 21) & (ENTRIES - 1),
@@ -497,33 +474,12 @@ static uint64_t *entry_for(uint64_t addr, bool make) {
     return &table[index[2]];
 }
 
-/* Notes that the page at addr is about to change, keeping what is under it
-   if there is anything - which is what lets vm_undo_end put it back. */
-static void undo_note(struct level *level, uint64_t addr, bool mapped) {
-    struct undo *entry;
-
-    if (level->undo_count == UNDO_MAX) {
-        level->undo_full = true;
-        return;
-    }
-    entry = &level->undo[level->undo_count];
-    entry->at = addr;
-    entry->copy = 0;
-    if (mapped) {
-        uint64_t *copy = page_from(level);
-
-        if (copy == NULL) {
-            level->undo_full = true;
-            return;
-        }
-        memcpy(copy, (const void *)addr, VM_PAGE);
-        entry->copy = (uint64_t)copy;
-    }
-    level->undo_count++;
+static uint64_t *entry_for(uint64_t addr, bool make) {
+    return entry_in(cur, addr, make);
 }
 
 bool vm_fault(uint64_t addr) {
-    struct level *level = &levels[depth];
+    struct space *level = cur;
     uint64_t page = addr & ~(uint64_t)(VM_PAGE - 1);
     uint64_t *at;
     uint64_t *fresh;
@@ -535,19 +491,28 @@ bool vm_fault(uint64_t addr) {
     if (at == NULL) {
         return false;
     }
-    if (*at & PRESENT) {
-        if (*at & WRITE) {
-            return true;            /* someone else got there first */
+    if ((*at & (PRESENT | SHARED)) == (PRESENT | SHARED)) {
+        /* A write to a page every process has: this one gets its own - the
+           page itself, if nobody else has it any more. */
+        uint64_t common = *at & ADDR;
+
+        if (level->chunks == 0 && page >= LOW_LIMIT && shared_take(common)) {
+            *at = common | PRESENT | WRITE | USER;
+            level->bought += VM_PAGE;
+            __asm__ volatile("invlpg (%0)" : : "r"(page) : "memory");
+            return true;
         }
-        /* Write-protected for a fork: the parent's page is copied aside and
-           the child gets the original to scribble on. */
-        if (level->undo == NULL) {
-            return false;           /* not ours to make writable */
+        if ((fresh = page_from(level)) == NULL) {
+            return false;
         }
-        undo_note(level, page, true);
-        *at |= WRITE;
+        memcpy(fresh, (const void *)page, VM_PAGE);
+        *at = (uint64_t)fresh | PRESENT | WRITE | USER;
         __asm__ volatile("invlpg (%0)" : : "r"(page) : "memory");
+        shared_drop(common);
         return true;
+    }
+    if (*at & PRESENT) {
+        return (*at & WRITE) != 0;  /* someone else got there first, or not ours */
     }
     if (page < LOW_LIMIT) {
         /* The page at its own address, so that nothing else is hidden -
@@ -562,9 +527,6 @@ bool vm_fault(uint64_t addr) {
                    (fresh = page_from(level)) == NULL) {
             return false;           /* someone's, and in use: not to be hidden */
         }
-        if (level->undo != NULL) {
-            undo_note(level, page, false);
-        }
         *at = (uint64_t)fresh | PRESENT | WRITE | USER | owned;
         __asm__ volatile("invlpg (%0)" : : "r"(page) : "memory");
         memset((void *)page, 0, VM_PAGE);
@@ -573,9 +535,6 @@ bool vm_fault(uint64_t addr) {
     fresh = page_from(level);
     if (fresh == NULL) {
         return false;
-    }
-    if (level->undo != NULL) {
-        undo_note(level, page, false);
     }
     *at = (uint64_t)fresh | PRESENT | WRITE | USER;
     __asm__ volatile("invlpg (%0)" : : "r"(page) : "memory");
@@ -590,6 +549,20 @@ bool vm_mapped(uint64_t addr) {
     }
     at = entry_for(addr, false);
     return at != NULL && (*at & PRESENT) != 0;
+}
+
+bool vm_map_shared(uint64_t addr, uint64_t page) {
+    uint64_t *at;
+
+    /* Not under a program at a fixed address: its pages are the ones at their
+       own address there, or ones nothing else could be hiding (vm_fault). */
+    if (addr < LOW_LIMIT || !vm_holds(addr, VM_PAGE) || (at = entry_for(addr, true)) == NULL ||
+        (*at & PRESENT)) {
+        return false;
+    }
+    *at = page | PRESENT | USER | SHARED;
+    __asm__ volatile("invlpg (%0)" : : "r"(addr) : "memory");
+    return true;
 }
 
 bool vm_reserve(uint64_t addr, uint64_t size) {
@@ -609,7 +582,14 @@ bool vm_reserve(uint64_t addr, uint64_t size) {
 
 /* Hands back the page an entry maps: to the machine if it was one at its own
    address, to the region's spares otherwise. */
-static void low_page_back(struct level *level, uint64_t entry) {
+static void low_page_back(struct space *level, uint64_t entry) {
+    if (entry & DEVICE) {
+        return;
+    }
+    if (entry & SHARED) {
+        shared_drop(entry & ADDR);
+        return;
+    }
     if (entry & OWNED) {
         mem_give_page(entry & ADDR);
         level->low_owned--;
@@ -618,13 +598,34 @@ static void low_page_back(struct level *level, uint64_t entry) {
     }
 }
 
+bool vm_map_device(uint64_t addr, uint64_t phys, uint64_t size) {
+    struct space *level = cur;
+
+    if (!vm_holds(addr, size)) {
+        return false;
+    }
+    for (uint64_t off = 0; off < size; off += VM_PAGE) {
+        uint64_t *at = entry_for(addr + off, true);
+
+        if (at == NULL) {
+            return false;
+        }
+        if (*at & PRESENT) {
+            low_page_back(level, *at);
+        }
+        *at = (phys + off) | PRESENT | WRITE | USER | DEVICE;
+    }
+    flush_tlb();
+    return true;
+}
+
 void vm_release(uint64_t addr, uint64_t size) {
-    struct level *level = &levels[depth];
+    struct space *level = cur;
     uint64_t first = (addr + VM_PAGE - 1) & ~(uint64_t)(VM_PAGE - 1);
     uint64_t last = (addr + size) & ~(uint64_t)(VM_PAGE - 1);
 
-    if (!vm_holds(addr, size) || level->undo != NULL) {
-        return;                     /* nothing goes back while a fork is out */
+    if (!vm_holds(addr, size)) {
+        return;
     }
     for (uint64_t page = first; page < last; page += VM_PAGE) {
         uint64_t *at = entry_for(page, false);
@@ -639,8 +640,8 @@ void vm_release(uint64_t addr, uint64_t size) {
 
 /* Runs visit over every mapped page of the region, handing it the entry and
    the address it covers. */
-static void walk(struct level *level, void (*visit)(uint64_t *at, uint64_t addr)) {
-    uint64_t *pdpt = table_at(pml4()[level->slot]);
+static void walk(struct space *level, void (*visit)(uint64_t *at, uint64_t addr)) {
+    uint64_t *pdpt = level->pdpt;
 
     if (level->low_tables != NULL) {
         for (uint64_t i = level->low_start >> 21; i <= (level->low_end - 1) >> 21; i++) {
@@ -670,7 +671,7 @@ static void walk(struct level *level, void (*visit)(uint64_t *at, uint64_t addr)
             pt = table_at(pd[j]);
             for (unsigned k = 0; k < ENTRIES; k++) {
                 if (pt[k] & PRESENT) {
-                    visit(&pt[k], level->base + ((uint64_t)i << 30) +
+                    visit(&pt[k], region + ((uint64_t)i << 30) +
                                   ((uint64_t)j << 21) + ((uint64_t)k << 12));
                 }
             }
@@ -678,80 +679,17 @@ static void walk(struct level *level, void (*visit)(uint64_t *at, uint64_t addr)
     }
 }
 
-static void unprotect(uint64_t *at, uint64_t addr) {
-    (void)addr;
-    *at |= WRITE;
-}
-
-static void protect(uint64_t *at, uint64_t addr) {
-    (void)addr;
-    *at &= ~(uint64_t)WRITE;
-}
-
-bool vm_undo_begin(void) {
-    struct level *level = &levels[depth];
-    void *block = NULL;
-
-    if (level->base == 0 || level->undo != NULL) {
-        return false;               /* one fork out at a time in a region */
-    }
-    if ((block = mem_alloc(UNDO_MAX * sizeof(struct undo))) == NULL) {
-        return false;
-    }
-    level->undo = block;
-    level->undo_count = 0;
-    level->undo_full = false;
-    walk(level, protect);
-    flush_tlb();
-    return true;
-}
-
-void vm_undo_end(bool restore) {
-    struct level *level = &levels[depth];
-    struct undo *log = level->undo;
-
-    if (log == NULL) {
-        return;
-    }
-    /* Taken down before anything is put back: restoring writes to the very
-       pages that are protected, and the fault handler must not treat those
-       writes as the child's. */
-    level->undo = NULL;
-    for (unsigned i = 0; i < level->undo_count; i++) {
-        uint64_t *at = entry_for(log[i].at, false);
-
-        if (restore && log[i].copy != 0) {
-            memcpy((void *)log[i].at, (const void *)log[i].copy, VM_PAGE);
-        }
-        if (restore && log[i].copy == 0 && at != NULL && (*at & PRESENT)) {
-            low_page_back(level, *at);              /* the parent had none */
-            *at = 0;
-            continue;
-        }
-        if (log[i].copy != 0) {
-            page_back(level, log[i].copy);
-        }
-    }
-    if (level->undo_full) {
-        dbg("fork: more pages changed than could be kept\n");
-    }
-    walk(level, unprotect);
-    flush_tlb();
-    mem_free(log);
-}
-
 /* Empties the region: every page it lent the program goes back onto its own
    free list, and the tables describing them with it. With whole set the
    region itself goes too, and every chunk it ever bought is handed to the
    firmware - which is one call per megabyte rather than one per page. */
-static void level_empty(struct level *level, bool whole) {
-    uint64_t *pdpt;
+static void level_empty(struct space *level, bool whole) {
+    uint64_t *pdpt = level->pdpt;
 
-    if (level->base == 0) {
-        return;
-    }
     if (level->low_tables != NULL) {
-        low_apply(level, false);
+        if (level == cur) {
+            low_apply(level, false);
+        }
         for (uint64_t i = level->low_start >> 21; i <= (level->low_end - 1) >> 21; i++) {
             uint64_t *pt = (uint64_t *)level->low_tables[i];
 
@@ -769,7 +707,6 @@ static void level_empty(struct level *level, bool whole) {
         level->low_tables = NULL;
         level->low_start = level->low_end = 0;
     }
-    pdpt = table_at(pml4()[level->slot]);
     for (unsigned i = 0; i < ENTRIES; i++) {
         uint64_t *pd;
 
@@ -785,9 +722,12 @@ static void level_empty(struct level *level, bool whole) {
             }
             pt = table_at(pd[j]);
             for (unsigned k = 0; k < ENTRIES; k++) {
-                if (pt[k] & PRESENT) {
+                if ((pt[k] & (PRESENT | DEVICE | SHARED)) == (PRESENT | SHARED)) {
+                    shared_drop(pt[k] & ADDR);
+                } else if ((pt[k] & (PRESENT | DEVICE)) == PRESENT) {
                     page_back(level, pt[k] & ADDR);
                 }
+                pt[k] = 0;
             }
             page_back(level, pd[j] & ADDR);
             pd[j] = 0;
@@ -801,80 +741,154 @@ static void level_empty(struct level *level, bool whole) {
        an idle machine holds none of what the program had. */
     chunks_back(level);
     if (whole) {
-        uint64_t cr0 = write_protect_off();
-
-        pml4()[level->slot] = 0;
-        write_protect_back(cr0);
         pages_back_to_firmware((uint64_t)pdpt, 1);
-        *level = (struct level){ 0 };
+        level->pdpt = NULL;
     }
     flush_tlb();
 }
 
 void vm_reset(void) {
-    struct level *level = &levels[depth];
-
-    if (level->undo != NULL) {
-        vm_undo_end(false);         /* whatever forked it is gone */
+    if (cur != NULL) {
+        level_empty(cur, false);
     }
-    /* The outermost region goes whole, its top table too: an idle machine
-       holds none of it, and the next program takes it again (vm_start). */
-    level_empty(level, depth == 0);
 }
 
-bool vm_push(void) {
-    if (depth + 1 >= LEVELS) {
+bool vm_space_new(struct space *s) {
+    unsigned i = 0;
+
+    *s = (struct space){ 0 };
+    while (i < SPACES && spaces[i] != NULL) {
+        i++;
+    }
+    if (i == SPACES || !slot_init() || (s->pdpt = (uint64_t *)table_page()) == NULL) {
         return false;
     }
-    low_apply(&levels[depth], false);   /* the one underneath is put away */
-    depth++;
-    levels[depth] = (struct level){ 0 };
-    if (!slot_take(&levels[depth])) {
-        depth--;
-        low_apply(&levels[depth], true);
+    spaces[i] = s;
+    return true;
+}
+
+void vm_space_use(struct space *s) {
+    uint64_t cr0;
+
+    if (s == cur) {
+        return;
+    }
+    if (cur != NULL) {
+        low_apply(cur, false);
+    }
+    cr0 = write_protect_off();
+    pml4()[slot] = s != NULL ? (uint64_t)s->pdpt | PRESENT | WRITE | USER : 0;
+    write_protect_back(cr0);
+    cur = s;
+    if (s != NULL) {
+        low_apply(s, true);
+    }
+    flush_tlb();
+}
+
+struct space *vm_space(void) {
+    return cur;
+}
+
+void vm_space_free(struct space *s) {
+    if (s->pdpt == NULL) {
+        return;
+    }
+    level_empty(s, true);
+    for (unsigned i = 0; i < SPACES; i++) {
+        if (spaces[i] == s) {
+            spaces[i] = NULL;
+        }
+    }
+    if (s == cur) {
+        vm_space_use(NULL);
+    }
+}
+
+/* ---- fork ---------------------------------------------------------------
+ *
+ * The child gets a copy of every page the parent has, at the same address,
+ * in tables of its own: the two then run side by side, each changing only
+ * its own. A page is a page whoever asks, so only what the parent has
+ * actually touched is copied - a shell is a megabyte or two of it, and the
+ * copy goes again the moment the child starts a program of its own. The
+ * screen, mapped by a program drawing on it, is shared rather than copied. */
+
+static struct space *fork_to;
+static bool fork_failed;
+
+static void fork_page(uint64_t *at, uint64_t addr) {
+    uint64_t *to, *page;
+
+    if (fork_failed || (to = entry_in(fork_to, addr, true)) == NULL) {
+        fork_failed = true;
+        return;
+    }
+    if (*at & DEVICE) {
+        *to = *at;
+        return;
+    }
+    /* The parent's own page, where it is one at a time: shared from now on,
+       read-only to both, until one of them writes (vm_fault). */
+    if (!(*at & SHARED) && addr >= LOW_LIMIT && cur->chunks == 0 && fork_to->chunks == 0 &&
+        shared_adopt(*at & ADDR)) {
+        *at = (*at & ADDR) | PRESENT | USER | SHARED;
+        cur->bought -= VM_PAGE;
+    }
+    if (*at & SHARED) {
+        *to = *at;                  /* the same page, counted once more */
+        shared_hold(*at & ADDR);
+        return;
+    }
+    if ((page = page_from(fork_to)) == NULL) {
+        fork_failed = true;
+        return;
+    }
+    memcpy(page, (const void *)addr, VM_PAGE);
+    *to = (uint64_t)page | PRESENT | WRITE | USER;
+}
+
+bool vm_fork(struct space *child) {
+    if (cur == NULL || !vm_space_new(child)) {
+        return false;
+    }
+    if (cur->low_tables != NULL) {
+        child->low_start = cur->low_start;
+        child->low_end = cur->low_end;
+        if ((child->low_tables = page_from(child)) == NULL) {
+            vm_space_free(child);
+            return false;
+        }
+    }
+    fork_to = child;
+    fork_failed = false;
+    walk(cur, fork_page);
+    flush_tlb();                    /* the parent's pages it now shares are read-only */
+    if (fork_failed) {
+        vm_space_free(child);
         return false;
     }
     return true;
 }
 
-void vm_pop(void) {
-    if (depth == 0) {
-        return;
-    }
-    if (levels[depth].undo != NULL) {
-        vm_undo_end(false);
-    }
-    level_empty(&levels[depth], true);
-    depth--;
-    low_apply(&levels[depth], true);
-}
-
-unsigned vm_level(void) {
-    return depth;
-}
-
-void vm_unwind(unsigned to) {
-    while (depth > to) {
-        vm_pop();
-    }
-}
-
 size_t vm_memory(void) {
     size_t total = 0;
 
-    for (unsigned i = 0; i <= depth; i++) {
-        total += (size_t)levels[i].bought + (size_t)levels[i].low_owned * VM_PAGE;
+    for (unsigned i = 0; i < SPACES; i++) {
+        if (spaces[i] != NULL) {
+            total += (size_t)spaces[i]->bought + (size_t)spaces[i]->low_owned * VM_PAGE;
+        }
     }
-    return total;
+    return total + shared_bytes();
 }
 
-/* Only each region's top table: the rest are out of its chunks, and so are
-   already in vm_memory. The first region's is counted with vm_fixed_tables. */
+/* Only each process's top table for the slot: the rest are out of its
+   chunks, and so are already in vm_memory. */
 size_t vm_tables(void) {
     size_t total = 0;
 
-    for (unsigned i = 1; i <= depth; i++) {
-        total += levels[i].base != 0 ? VM_PAGE : 0;
+    for (unsigned i = 0; i < SPACES; i++) {
+        total += spaces[i] != NULL ? VM_PAGE : 0;
     }
     return total;
 }

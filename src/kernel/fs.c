@@ -89,8 +89,10 @@ static unsigned table_sectors(uint32_t size) {
     return sectors_for(size * (unsigned)sizeof(struct fs_file));
 }
 
-/* FNV-1a over the first n bytes of a name, case folded as names are
-   matched. Never zero. */
+/* FNV-1a over the first n bytes of a name, case folded - which is how disks
+   made when names matched either way were indexed, so they still find
+   everything; names that differ only in case share a hash and are told
+   apart by name_cmp. Never zero. */
 static uint32_t hash_of(const char *name, size_t n) {
     uint32_t h = 0x811C9DC5u;
 
@@ -454,17 +456,20 @@ static char lower(char c) {
     return c >= 'A' && c <= 'Z' ? (char)(c + ('a' - 'A')) : c;
 }
 
+/* Names match exactly, as on Linux: Makefile and makefile are two files,
+   and a program making a temporary file trusts that a name with one letter
+   in another case is free. */
 static int name_cmp(const char *a, const char *b) {
-    while (*a != '\0' && lower(*a) == lower(*b)) {
+    while (*a != '\0' && *a == *b) {
         a++;
         b++;
     }
-    return (int)(uint8_t)lower(*a) - (int)(uint8_t)lower(*b);
+    return (int)(uint8_t)*a - (int)(uint8_t)*b;
 }
 
 static bool starts_with(const char *name, const char *prefix) {
     while (*prefix != '\0') {
-        if (lower(*name++) != lower(*prefix++)) {
+        if (*name++ != *prefix++) {
             return false;
         }
     }
@@ -1114,6 +1119,10 @@ int fs_chdir(const char *path) {
 
 const char *fs_cwd(void) {
     return cwd;
+}
+
+void fs_cwd_set(const char *dir) {
+    strcpy(cwd, dir);
 }
 
 const char *fs_inside(const char *folder, const char *name) {

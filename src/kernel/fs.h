@@ -124,6 +124,10 @@ int fs_chdir(const char *path);
 
 /* The working directory: "" at the root, else "docs/" - no leading slash,
    always a trailing one. */
+/* Where we are, put straight back as fs_cwd gave it: what a process
+   switch does, with no looking anything up. */
+void fs_cwd_set(const char *dir);
+
 const char *fs_cwd(void);
 
 /* The part of a whole path that lies directly inside folder - which is ""
