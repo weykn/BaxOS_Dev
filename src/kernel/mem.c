@@ -55,11 +55,17 @@ static void run_remove(unsigned i) {
     run_count--;
 }
 
-/* Free pages the list had no room for, chained through their own first
-   word: nothing kept anywhere, so a free list that has filled loses nothing.
-   Only above the gigabyte a program at a fixed address can hide (FIXED_TOP
-   below): a page down there could be under one while it is written. */
+/* Single pages, chained through their own first word: what processes are
+   made of, taken and given back one at a time in no order at all. Kept apart
+   from the list of runs, they cannot break it into thousands of pieces - and
+   a list that overflowed lost pages, a fixed-address program's among them.
+   It is filled sixteen at a time from the top run, and also takes what the
+   list ever has no room for. Only pages above the gigabyte a program at a
+   fixed address can hide (FIXED_TOP below): one down there could be under
+   such a program while its first word is written. */
 #define LOOSE_FLOOR (1ull << 30)
+
+#define LOOSE_FILL  16
 
 static uint64_t loose, loose_count;
 
@@ -99,14 +105,21 @@ static void run_add(uint64_t at, uint64_t count) {
         return;
     }
     if (run_count == RUNS) {
-        unsigned smallest = 0;
+        /* The smallest run goes onto the loose chain - one above the
+           gigabyte if there is one, since only those can be chained: a low
+           page with nowhere to go would be lost. */
+        unsigned smallest = RUNS;
 
-        for (unsigned j = 1; j < RUNS; j++) {
-            if (runs[j].count < runs[smallest].count) {
+        for (unsigned j = 0; j < RUNS; j++) {
+            bool high = runs[j].at >= LOOSE_FLOOR;
+            bool best_high = smallest < RUNS && runs[smallest].at >= LOOSE_FLOOR;
+
+            if (smallest == RUNS || (high && !best_high) ||
+                (high == best_high && runs[j].count < runs[smallest].count)) {
                 smallest = j;
             }
         }
-        if (runs[smallest].count >= count) {
+        if (at >= LOOSE_FLOOR && (runs[smallest].at < LOOSE_FLOOR || runs[smallest].count >= count)) {
             loosen(at, count);                  /* this one is the smallest */
             return;
         }
@@ -162,6 +175,9 @@ uint64_t mem_pages(size_t count) {
 
         if ((at != 0 && at >= floor_kept()) || disk_cache == NULL ||
             disk_cache->shrink(count * PAGE) == 0) {
+            if (ours && at != 0 && at < (64u << 20)) {
+                dbg("mem: %u pages at %x for %p\n", (uint64_t)count, at, __builtin_return_address(0));
+            }
             return at;
         }
         if (at != 0) {
@@ -189,25 +205,57 @@ static uint64_t take(size_t count) {
         return EFI_ERROR(firmware()->allocate_pages(EFI_ALLOCATE_ANY, EFI_LOADER_DATA,
                                                     count, &at)) ? 0 : at;
     }
+    if (count == 1 && loose == 0) {
+        for (unsigned i = run_count; i-- > 0;) {
+            if (runs[i].count >= LOOSE_FILL && runs[i].at + runs[i].count * PAGE >
+                LOOSE_FLOOR + LOOSE_FILL * PAGE) {
+                runs[i].count -= LOOSE_FILL;    /* off the top end, as below */
+                uint64_t at = runs[i].at + runs[i].count * PAGE;
+
+                if (runs[i].count == 0) {
+                    run_remove(i);
+                }
+                if (at < LOOSE_FLOOR) {
+                    run_add(at, LOOSE_FILL);    /* straddles the floor: as it was */
+                    break;
+                }
+                loosen(at, LOOSE_FILL);
+                break;
+            }
+        }
+    }
     if (count == 1 && loose != 0) {
-        uint64_t at = loose;                    /* a page that missed the list */
+        uint64_t at = loose;
 
         loose = *(uint64_t *)at;
         loose_count--;
         return at;
     }
-    for (unsigned i = run_count; i-- > 0;) {
-        if (runs[i].count >= count) {
-            runs[i].count -= count;             /* off the top end of it */
-            uint64_t at = runs[i].at + runs[i].count * PAGE;
+    for (bool drained = false;; drained = true) {
+        for (unsigned i = run_count; i-- > 0;) {
+            if (runs[i].count >= count) {
+                runs[i].count -= count;         /* off the top end of it */
+                uint64_t at = runs[i].at + runs[i].count * PAGE;
 
-            if (runs[i].count == 0) {
-                run_remove(i);
+                if (runs[i].count == 0) {
+                    run_remove(i);
+                }
+                return at;
             }
-            return at;
+        }
+        if (drained || loose_count == 0) {
+            return 0;
+        }
+        /* Nothing that long: the single pages go back into runs, where
+           neighbours join up again, for as long as the list has room. */
+        while (loose != 0 && run_count < RUNS - 1) {
+            uint64_t at = loose;
+
+            loose = *(uint64_t *)at;
+            loose_count--;
+            run_add(at, 1);
         }
     }
-    return 0;
 }
 
 static uint64_t take_below(size_t count, uint64_t limit);
@@ -272,6 +320,10 @@ void mem_give_page(uint64_t page) {
 void mem_pages_free(uint64_t at, size_t count) {
     if (!ours) {
         firmware()->free_pages(at, count);
+        return;
+    }
+    if (count == 1 && at >= LOOSE_FLOOR) {
+        loosen(at, 1);                      /* back with the single pages */
         return;
     }
     run_add(at, count);

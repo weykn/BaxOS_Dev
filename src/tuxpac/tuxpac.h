@@ -20,6 +20,7 @@ struct source {
     uint32_t (*fill)(struct source *s);
     uint32_t  at, end;              /* a file: bytes at..end left of it */
     int       fd;                   /* the file or the socket */
+    uint64_t  left;                 /* a response: body bytes still to come, or ~0 to the close */
 };
 
 uint8_t src_byte(struct source *s);

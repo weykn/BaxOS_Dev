@@ -52,6 +52,10 @@ static uint64_t sys_clone(uint64_t flags, uint64_t stack, uint64_t parent_tid);
 static uint64_t sys_clone3(uint64_t args, uint64_t size, uint64_t c);
 static uint64_t sys_rt_sigtimedwait(uint64_t set, uint64_t info, uint64_t timeout);
 static uint64_t sys_timer_create(uint64_t clock, uint64_t event, uint64_t id);
+static uint64_t sys_timer_delete(uint64_t id, uint64_t b, uint64_t c);
+static uint64_t sys_alarm(uint64_t seconds, uint64_t b, uint64_t c);
+static uint64_t sys_getitimer(uint64_t which, uint64_t value, uint64_t c);
+static uint64_t sys_setitimer(uint64_t which, uint64_t value, uint64_t old);
 static uint64_t sys_timer_settime(uint64_t id, uint64_t flags, uint64_t spec);
 static uint64_t sys_timer_gettime(uint64_t id, uint64_t spec, uint64_t c);
 static uint64_t sys_wait4(uint64_t pid, uint64_t status, uint64_t options);
@@ -59,6 +63,13 @@ static uint64_t sys_pipe(uint64_t out, uint64_t b, uint64_t c);
 static uint64_t sys_pipe2(uint64_t out, uint64_t flags, uint64_t c);
 static uint64_t sys_eventfd(uint64_t count, uint64_t b, uint64_t c);
 static uint64_t sys_eventfd2(uint64_t count, uint64_t flags, uint64_t c);
+static uint64_t sys_inotify_init1(uint64_t flags, uint64_t b, uint64_t c);
+static uint64_t sys_memfd_create(uint64_t name, uint64_t flags, uint64_t c);
+static uint64_t sys_getuid(uint64_t a, uint64_t b, uint64_t c);
+static uint64_t sys_geteuid(uint64_t a, uint64_t b, uint64_t c);
+static uint64_t sys_getgid(uint64_t a, uint64_t b, uint64_t c);
+static uint64_t sys_getegid(uint64_t a, uint64_t b, uint64_t c);
+static uint64_t sys_inotify_add_watch(uint64_t fd, uint64_t path, uint64_t mask);
 static uint64_t sys_socketpair(uint64_t domain, uint64_t type, uint64_t c);
 static uint64_t sys_getrandom(uint64_t buf, uint64_t length, uint64_t flags);
 static bool fits(uint64_t addr, uint64_t size);
@@ -74,7 +85,7 @@ static uint64_t started_phent, started_phnum;
 
 /* In syscall_entry.asm. */
 void syscall_entry(void);
-extern const char trap_stubs[];     /* one 16-byte stub per exception vector */
+extern const char trap_stubs[];     /* one 32-byte stub per exception vector */
 extern uint64_t user_cs, user_ss;   /* ring 3's selectors, for the iretq frame */
 void page_fault_entry(void);
 int  user_enter(uint64_t entry, uint64_t stack);
@@ -153,7 +164,7 @@ const char *user_string(uint64_t addr) {
  * ever one program. */
 
 #define SIGNALS  32                 /* 1 to 31, as Linux numbers them */
-#define PROCESSES 32
+#define PROCESSES 128
 #define SIGNALLED 0x1000            /* an exit code that is a signal's, in its low bits */
 #define SIGPIPE  13
 
@@ -173,17 +184,27 @@ struct process {
     bool     borrowed;              /* a vfork's child, in its parent's memory */
     int      status;                /* as wait4 reports it, once ended */
     struct space own, *space;
-    struct handle files[PROGRAM_FILES];
-    char     writers[WRITERS][FS_NAME_LEN];
+    struct handle *files;           /* its descriptors, mem_alloc'd: a page's */
+    uint32_t files_room;            /* worth to start, doubled when full */
+    struct handle *files_old;       /* the table before it grew, kept to the
+                                       syscall's end: a caller may still hold
+                                       a pointer into it */
     char     cwd[FS_NAME_LEN];
-    uint64_t brk, map;
+    uint64_t brk, map, map_high;
     struct times times;
     struct sig_action actions[SIGNALS];
     uint64_t signals;               /* 1 << each signal sent and not yet acted on */
     int      chld_pid, chld_code;   /* what SIGCHLD's siginfo says */
+    uint64_t ofd_touched[PROGRAM_FILES / 64];  /* descriptors whose shared
+                                       position this syscall loaded, to write back */
     struct mapping *maps;           /* the file mappings owed, mem_alloc'd: a */
     unsigned maps_room;             /* program with Mesa in it has hundreds */
     char     name[TRACE_NAME];      /* the program it runs, as debug/trace names it */
+    char     exe[FS_NAME_LEN];      /* and its whole path, links followed: /proc/self/exe */
+    struct creds cred;              /* who it runs as: inherited, kept across execve */
+    char    *cmdline;               /* its arguments, each ending in a NUL, as
+                                       /proc/<pid>/cmdline gives them: mem_alloc'd */
+    uint32_t cmdline_len;
 };
 
 _Static_assert(sizeof(struct process) <= 4096 - 16, "a process is one page");
@@ -197,11 +218,15 @@ static int fg_pgrp;                 /* the group the keyboard's signals go to */
 struct process;
 static void signal_to(struct process *p, uint64_t sig);
 
+#define FIRST_FILES   ((4096 - 16) / sizeof(struct handle))   /* a page's worth */
 #define handles       (proc->files)
+#define file_room     (proc->files_room)
+#define TOUCHED(fd)   (proc->ofd_touched[(fd) / 64] & 1ull << ((fd) % 64))
 #define on_signal     (proc->actions)
 #define pending       (proc->signals)
 #define program_break (proc->brk)
 #define program_map   (proc->map)
+#define program_map_high (proc->map_high)
 #define mappings      (proc->maps)
 #define map_room      (proc->maps_room)
 #define child_pid     (proc->chld_pid)
@@ -211,11 +236,6 @@ struct times *process_times(void) {
     return proc != NULL ? &proc->times : &kernel_times;
 }
 
-char (*process_writers(void))[FS_NAME_LEN] {
-    static char none[WRITERS][FS_NAME_LEN];
-
-    return proc != NULL ? proc->writers : none;
-}
 
 int process_pid(void *p) {
     return ((struct process *)p)->pid;
@@ -237,6 +257,32 @@ void process_switch(void *from, void *to) {
 
 /* The program the running process now runs, for its calls' log: the last
    part of its path, /usr/bin/ls logging as ls. */
+/* Its arguments as /proc/<pid>/cmdline gives them, kept as it starts. */
+#define CMDLINE_MAX 1024
+
+static void process_cmdline(unsigned argc, const char *const *argv) {
+    uint32_t n = 0;
+
+    for (unsigned i = 0; i < argc && n < CMDLINE_MAX; i++) {
+        n += (uint32_t)strlen(argv[i]) + 1;
+    }
+    n = n < CMDLINE_MAX ? n : CMDLINE_MAX;
+    mem_free(proc->cmdline);
+    proc->cmdline_len = 0;
+    if (n == 0 || (proc->cmdline = mem_alloc(n)) == NULL) {
+        proc->cmdline = NULL;
+        return;
+    }
+    for (unsigned i = 0; i < argc && proc->cmdline_len < n; i++) {
+        uint32_t k = (uint32_t)strlen(argv[i]) + 1;
+
+        k = k < n - proc->cmdline_len ? k : n - proc->cmdline_len;
+        memcpy(proc->cmdline + proc->cmdline_len, argv[i], k);
+        proc->cmdline_len += k;
+    }
+    proc->cmdline[n - 1] = '\0';
+}
+
 static void process_named(const char *path) {
     const char *base = path;
 
@@ -269,6 +315,9 @@ static void proc_free(struct process *p) {
         }
     }
     mem_free(p->maps);
+    mem_free(p->files);
+    mem_free(p->files_old);
+    mem_free(p->cmdline);
     mem_free(p);
 }
 
@@ -289,6 +338,13 @@ static struct process *proc_new(void) {
 
     if (p != NULL) {
         memset(p, 0, sizeof *p);
+        if ((p->files = mem_alloc(FIRST_FILES * sizeof *p->files)) == NULL) {
+            procs[slot] = NULL;
+            mem_free(p);
+            return NULL;
+        }
+        memset(p->files, 0, FIRST_FILES * sizeof *p->files);
+        p->files_room = FIRST_FILES;
         p->pid = thread_new_id();
         procs[slot] = p;
     }
@@ -313,6 +369,144 @@ bool process_info(unsigned index, struct process_info *out) {
         return true;
     }
     return false;
+}
+
+/* /proc/<pid>/..., or /proc/self/...: the process, and what follows - NULL
+   if path names no live process. */
+static struct process *proc_path(const char *path, const char **rest) {
+    unsigned pid = 0;
+    const char *p;
+
+    if (path == NULL || memcmp(path, "/proc/", 6) != 0) {
+        return NULL;
+    }
+    p = path + 6;
+    if (memcmp(p, "self", 4) == 0 && (p[4] == '/' || p[4] == '\0')) {
+        pid = proc != NULL ? (unsigned)proc->pid : 0;
+        p += 4;
+    } else {
+        if (*p < '1' || *p > '9') {
+            return NULL;
+        }
+        for (; *p >= '0' && *p <= '9'; p++) {
+            pid = pid * 10 + (unsigned)(*p - '0');
+        }
+    }
+    if (*p != '/' && *p != '\0') {
+        return NULL;
+    }
+    struct process *found = proc_find((int)pid);
+
+    *rest = *p == '/' ? p + 1 : p;
+    return found;
+}
+
+int proc_pid_folder(const char *name, uint32_t *uid, uint32_t *gid) {
+    const char *rest;
+    struct process *p = proc_path(name, &rest);
+
+    if (p == NULL || *rest != '\0') {
+        return 0;
+    }
+    *uid = p->cred.euid;
+    *gid = p->cred.egid;
+    return p->pid;
+}
+
+int proc_pid_at(unsigned index) {
+    for (unsigned i = 0; i < PROCESSES; i++) {
+        if (procs[i] != NULL && index-- == 0) {
+            return procs[i]->pid;
+        }
+    }
+    return 0;
+}
+
+/* What ps, top and pkill read of a process: stat, status, statm, cmdline
+   and comm. Times are in Linux's clock ticks, 100 a second. */
+size_t process_file(const char *path, char *out, size_t max) {
+    const char *rest;
+    struct process *p = proc_path(path, &rest);
+    char text[640];
+    size_t len;
+
+    /* The machine's: every live process's time, and the rest idle. */
+    if (path != NULL && (strcmp(path, "/proc/stat") == 0 || strcmp(path, "/proc/loadavg") == 0)) {
+        uint64_t busy = 0, user = 0, now = efi_uptime_us();
+        unsigned live = 0, last = 0;
+
+        if (out == NULL) {
+            return 0;
+        }
+        for (unsigned i = 0; i < PROCESSES; i++) {
+            if (procs[i] != NULL) {
+                user += procs[i]->times.user;
+                busy += procs[i]->times.user + procs[i]->times.sys;
+                live++;
+                last = (unsigned)procs[i]->pid > last ? (unsigned)procs[i]->pid : last;
+            }
+        }
+        busy = busy < now ? busy : now;
+        if (path[6] == 'l') {
+            ksprintf(text, "0.00 0.00 0.00 1/%u %u\n", live, last);
+        } else {
+            unsigned u = (unsigned)(user / 10000), y = (unsigned)((busy - user) / 10000),
+                     idle = (unsigned)((now - busy) / 10000);
+
+            ksprintf(text, "cpu  %u 0 %u %u 0 0 0 0 0 0\ncpu0 %u 0 %u %u 0 0 0 0 0 0\n"
+                     "intr 0\nctxt 0\nbtime %u\nprocesses %u\nprocs_running 1\nprocs_blocked 0\n",
+                     u, y, idle, u, y, idle, (unsigned)((realtime_us() - now) / 1000000), last, 0);
+        }
+        len = strlen(text);
+        memcpy(out, text, len < max ? len : max);
+        return len < max ? len : max;
+    }
+    if (p == NULL || (strcmp(rest, "stat") != 0 && strcmp(rest, "status") != 0 &&
+                      strcmp(rest, "statm") != 0 && strcmp(rest, "cmdline") != 0 &&
+                      strcmp(rest, "comm") != 0)) {
+        return (size_t)-1;
+    }
+    if (out == NULL) {
+        return 0;
+    }
+    uint64_t pages = 1 + thread_count(p) * (THREAD_STACK_BYTES / VM_PAGE);
+    const char *state = p->zombie ? "Z" : p == proc ? "R" : "S";
+
+    if (!p->borrowed && p->space != NULL) {
+        pages += p->space->bought / VM_PAGE + p->space->low_owned + 1;
+    }
+    if (strcmp(rest, "cmdline") == 0) {
+        len = p->cmdline_len < max ? p->cmdline_len : max;
+        if (p->cmdline != NULL) {
+            memcpy(out, p->cmdline, len);
+        }
+        return p->cmdline != NULL ? len : 0;
+    }
+    if (strcmp(rest, "comm") == 0) {
+        ksprintf(text, "%s\n", p->name);
+    } else if (strcmp(rest, "statm") == 0) {
+        ksprintf(text, "%u %u 0 0 0 %u 0\n", (unsigned)pages, (unsigned)pages, (unsigned)pages);
+    } else if (strcmp(rest, "status") == 0) {
+        ksprintf(text, "Name:\t%s\nUmask:\t0022\nState:\t%s\nTgid:\t%u\nNgid:\t0\nPid:\t%u\n"
+                 "PPid:\t%u\nTracerPid:\t0\nUid:\t%u\t%u\t%u\t%u\nGid:\t%u\t%u\t%u\t%u\n"
+                 "VmSize:\t%u kB\nVmRSS:\t%u kB\nThreads:\t%u\n",
+                 p->name, state, (unsigned)p->pid, (unsigned)p->pid, (unsigned)p->ppid,
+                 p->cred.uid, p->cred.euid, p->cred.suid, p->cred.euid,
+                 p->cred.gid, p->cred.egid, p->cred.sgid, p->cred.egid,
+                 (unsigned)(pages * 4), (unsigned)(pages * 4), thread_count(p));
+    } else {
+        ksprintf(text, "%u (%s) %s %u %u %u 0 -1 4194304 0 0 0 0 %u %u %u %u 20 0 %u 0 %u %u %u "
+                 "18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+                 (unsigned)p->pid, p->name, state, (unsigned)p->ppid, (unsigned)p->pgid,
+                 (unsigned)p->sid, (unsigned)(p->times.user / 10000),
+                 (unsigned)(p->times.sys / 10000), (unsigned)(p->times.children_user / 10000),
+                 (unsigned)(p->times.children_sys / 10000), thread_count(p),
+                 (unsigned)(p->times.started / 10000), (unsigned)(pages * VM_PAGE),
+                 (unsigned)pages);
+    }
+    len = strlen(text);
+    memcpy(out, text, len < max ? len : max);
+    return len < max ? len : max;
 }
 
 /* Whether any program at all is still running. */
@@ -411,13 +605,279 @@ const struct file_ops *ops_named(const char *path, const char **leaf) {
     return NULL;
 }
 
+/* ---- shared positions ----------------------------------------------------
+ *
+ * On Linux an open file's position belongs to the opening, not to each
+ * descriptor: dup and fork share it. `cmd > log 2>&1` writes stdout and
+ * stderr one after the other, and `{ a; b; } > out` has b go on where a
+ * stopped. So a file's position and size live here, shared by every copy of
+ * its descriptor, counted; a syscall loads them into the descriptor when it
+ * picks it up, and they are written back when the syscall ends. A file read
+ * or written never waits half way, so nothing else runs in between. */
+
+#define OFDS 512
+
+/* The memory of a file opened for writing and mapped MAP_SHARED: pages of
+   share.c's, one per page of the file, counted once here and once more by
+   each mapping of them - so every process mapping it, by a descriptor passed
+   to it or its own, has the same memory, and it lasts while any of them
+   does. Chromium's processes, and Firefox's, talk through it. */
+struct mobj {
+    uint32_t refs;                  /* the open files that have it */
+    uint32_t room;
+    uint64_t *frame;                /* room of them, 0 where nothing is yet */
+};
+
+static struct ofd {
+    uint32_t refs, offset, size;
+    struct mobj *mem;
+    char *name;                     /* a file open for writing: what it is written back to */
+} ofds[OFDS];
+
+/* The name a file open for writing goes back to - kept with the open file,
+   not the process, so every descriptor of it has it: a dup's, a fork's, one
+   passed to another process. */
+const char *write_name(const struct handle *h) {
+    return h != NULL && h->ofd != 0 && ofds[h->ofd - 1].name != NULL ? ofds[h->ofd - 1].name : "";
+}
+
+/* Whether h's bytes are memory, not the disk: a memory file, or a file open
+   for writing whose name has since been deleted - kept, as Linux keeps it,
+   for as long as anything has it open. Chromium shares memory that way. */
+static bool mem_backed(const struct handle *h) {
+    return h->start == MEM_MARK ||
+           (h->start == WRITE_MARK && h->ofd != 0 && ofds[h->ofd - 1].name == NULL &&
+            ofds[h->ofd - 1].mem != NULL);
+}
+
+static void ofd_drop(struct handle *h);
+static uint64_t with_cloexec(uint64_t fd, bool on);
+
+static struct mobj *mobj_new(void) {
+    struct mobj *m = mem_alloc(sizeof *m);
+
+    if (m != NULL) {
+        *m = (struct mobj){ .refs = 1 };
+    }
+    return m;
+}
+
+static void mobj_free(struct mobj *m) {
+    if (m != NULL && --m->refs == 0) {
+        for (uint32_t i = 0; i < m->room; i++) {
+            if (m->frame[i] != 0) {
+                shared_drop(m->frame[i]);
+            }
+        }
+        mem_free(m->frame);
+        mem_free(m);
+    }
+}
+
+/* Page index of m, made (empty) if it is not there yet and make is set; 0 if
+   it is not, or there is no memory for it. */
+static uint64_t mobj_page(struct mobj *m, uint32_t index, bool make) {
+    if (index >= m->room) {
+        if (!make) {
+            return 0;
+        }
+        uint32_t room = m->room == 0 ? 16 : m->room;
+
+        while (room <= index) {
+            room *= 2;
+        }
+        uint64_t *more = mem_alloc(room * sizeof *more);
+
+        if (more == NULL) {
+            return 0;
+        }
+        memset(more, 0, room * sizeof *more);
+        if (m->frame != NULL) {
+            memcpy(more, m->frame, m->room * sizeof *more);
+            mem_free(m->frame);
+        }
+        m->frame = more;
+        m->room = room;
+    }
+    if (m->frame[index] == 0 && make) {
+        uint64_t page = mem_pages(1);
+
+        if (page == 0) {
+            return 0;
+        }
+        memset((void *)page, 0, PAGE_SIZE);
+        if (!shared_adopt(page)) {
+            mem_pages_free(page, 1);
+            return 0;
+        }
+        m->frame[index] = page;
+    }
+    return m->frame[index];
+}
+
+/* A memory file's bytes in and out, at its position. */
+static uint64_t mem_io(struct handle *h, uint64_t buf, uint64_t count, bool in) {
+    struct mobj *m = h->ofd != 0 ? ofds[h->ofd - 1].mem : NULL;
+    uint64_t done = 0;
+
+    if (m == NULL || !user_range(buf, count)) {
+        return ERR(m == NULL ? EBADF : EFAULT);
+    }
+    if (!in) {
+        count = h->offset < h->size ? (count < h->size - h->offset ? count : h->size - h->offset) : 0;
+    }
+    while (done < count) {
+        uint64_t at = (uint64_t)h->offset + done;
+        uint64_t k = PAGE_SIZE - at % PAGE_SIZE;
+        uint64_t page = mobj_page(m, (uint32_t)(at / PAGE_SIZE), in);
+
+        k = k < count - done ? k : count - done;
+        if (in && page == 0) {
+            break;                  /* no memory: as far as it got */
+        }
+        if (in) {
+            memcpy((char *)page + at % PAGE_SIZE, (const char *)buf + done, k);
+        } else if (page != 0) {
+            memcpy((char *)buf + done, (const char *)page + at % PAGE_SIZE, k);
+        } else {
+            memset((char *)buf + done, 0, k);
+        }
+        done += k;
+    }
+    h->offset += (uint32_t)done;
+    if (in && h->offset > h->size) {
+        h->size = h->offset;
+    }
+    return done;
+}
+
+/* memfd_create: a file that is only memory - shared, mapped, passed. What
+   Chromium and Firefox share their memory through on Linux. */
+#define MFD_CLOEXEC 1
+
+static uint64_t sys_memfd_create(uint64_t name, uint64_t flags, uint64_t c) {
+    unsigned slot = OFDS;
+    struct mobj *m;
+
+    (void)name;
+    (void)c;
+    for (unsigned i = 0; i < OFDS && slot == OFDS; i++) {
+        slot = ofds[i].refs == 0 ? i : slot;
+    }
+    if (slot == OFDS || (m = mobj_new()) == NULL) {
+        return ERR(slot == OFDS ? ENFILE : ENOMEM);
+    }
+    ofds[slot] = (struct ofd){ 1, 0, 0, m, NULL };
+
+    struct handle h = { .start = MEM_MARK, .ofd = slot + 1 };
+    uint64_t fd = give_handle(h);
+
+    if ((int64_t)fd < 0) {
+        ofd_drop(&h);
+        return fd;
+    }
+    return with_cloexec(fd, (flags & MFD_CLOEXEC) != 0);
+}
+
+/* /proc/self/fd/N opened again, N a memory file: another open file of the
+   same memory - Chromium's read-only view of what it shares. */
+static uint64_t mem_reopen(const struct handle *of) {
+    unsigned slot = OFDS;
+
+    for (unsigned i = 0; i < OFDS && slot == OFDS; i++) {
+        slot = ofds[i].refs == 0 ? i : slot;
+    }
+    if (slot == OFDS) {
+        return ERR(ENFILE);
+    }
+    struct ofd *was = &ofds[of->ofd - 1];
+
+    /* A file on the disk, deleted as like as not, that is shared as memory:
+       its memory made now if it has none yet, so both views have the same. */
+    if (was->mem == NULL && (was->mem = mobj_new()) == NULL) {
+        return ERR(ENOMEM);
+    }
+    was->mem->refs++;
+    ofds[slot] = (struct ofd){ 1, 0, was->size, was->mem, NULL };
+
+    struct handle h = { .start = MEM_MARK, .ofd = slot + 1, .size = was->size };
+    uint64_t fd = give_handle(h);
+
+    if ((int64_t)fd < 0) {
+        ofd_drop(&h);
+    }
+    return fd;
+}
+
+static bool ofd_kind(const struct handle *h) {
+    return h->start == WRITE_MARK || h->start < FIRST_MARK;
+}
+
+static void ofd_hold(const struct handle *h) {
+    if (h->ofd != 0) {
+        ofds[h->ofd - 1].refs++;
+    }
+}
+
+static void ofd_drop(struct handle *h) {
+    if (h->ofd != 0 && ofds[h->ofd - 1].refs > 0 && --ofds[h->ofd - 1].refs == 0) {
+        mobj_free(ofds[h->ofd - 1].mem);    /* what is still mapped keeps its pages */
+        ofds[h->ofd - 1].mem = NULL;
+        mem_free(ofds[h->ofd - 1].name);
+        ofds[h->ofd - 1].name = NULL;
+    }
+    h->ofd = 0;
+}
+
+/* Back from the descriptors this syscall used to the positions they share. */
+static void ofd_sync(void) {
+    if (proc == NULL) {
+        return;
+    }
+    if (proc->files_old != NULL) {
+        mem_free(proc->files_old);  /* nobody is holding on to it now */
+        proc->files_old = NULL;
+    }
+    for (unsigned word = 0; word < PROGRAM_FILES / 64; word++) {
+        for (unsigned fd = word * 64; proc->ofd_touched[word] != 0 && fd < word * 64 + 64; fd++) {
+            struct handle *h = &handles[fd];
+
+            if (TOUCHED(fd) && fd < file_room && h->used != 0 && h->ofd != 0) {
+                ofds[h->ofd - 1].offset = h->offset;
+                ofds[h->ofd - 1].size = h->size;
+            }
+        }
+        proc->ofd_touched[word] = 0;
+    }
+}
+
 struct handle *handle_of(uint64_t fd) {
     fd = (uint32_t)fd;              /* an int: what is above it is anybody's */
-    if (fd >= PROGRAM_FILES || proc == NULL) {
+    if (proc == NULL || fd >= file_room) {
         return NULL;
     }
     struct handle *h = &handles[fd];
-    return h->used != 0 ? h : NULL;
+
+    if (h->used == 0) {
+        return NULL;
+    }
+    if (h->ofd == 0 && ofd_kind(h)) {
+        for (unsigned i = 0; i < OFDS; i++) {
+            if (ofds[i].refs == 0) {
+                ofds[i] = (struct ofd){ 1, h->offset, h->size, NULL, NULL };
+                h->ofd = i + 1;
+                break;
+            }
+        }
+    }
+    /* Loaded once a syscall: after that the descriptor is the newer of the
+       two - pread moves it and reads through here again. */
+    if (h->ofd != 0 && !TOUCHED(fd)) {
+        h->offset = ofds[h->ofd - 1].offset;
+        h->size = ofds[h->ofd - 1].size;
+        proc->ofd_touched[fd / 64] |= 1ull << (fd % 64);
+    }
+    return h;
 }
 
 /* Close-on-exec, as a bit of the descriptor's `used`: on, the descriptor
@@ -450,8 +910,7 @@ bool is_console(uint64_t fd) {
    A program that exits without closing its files leaves them behind, so this
    runs before each one rather than after. */
 static void handles_reset(void) {
-    memset(handles, 0, sizeof handles);
-    memset(writer_names, 0, sizeof writer_names);
+    memset(handles, 0, file_room * sizeof *handles);
     for (unsigned fd = 0; fd < 3; fd++) {
         handles[fd].used = 1;
         handles[fd].start = CONSOLE_MARK;
@@ -464,13 +923,26 @@ static void handles_reset(void) {
  * grows as it is written to, up to PIPE_CAP, and then its writer waits for
  * the program at the other end - running beside it - to drain it. */
 
-#define PIPES      64               /* pipes, eventfds and socketpair ends open at once:
-                                       an X server and its windows hold dozens */
+#define PIPES      256              /* pipes, eventfds and socketpair ends open at once:
+                                       an X server and its windows hold dozens, a
+                                       browser's processes hundreds */
 #define PIPE_FIRST 8192
 #define PIPE_CAP   (64 * 1024)      /* the most one holds: then its writer waits */
 
 #define PIPE_TEXT  8192             /* the most of one */
 #define EFD_SEMAPHORE 1
+
+/* A message on a socketpair: where its bytes start in what has ever been
+   written, how many there are (a packet's; a stream's is 0), and the
+   descriptors sent with it, held until they are received. */
+#define PAIR_FDS 16
+
+struct pmsg {
+    uint64_t at;
+    uint32_t len, nfd;
+    int      pid;                   /* who sent it, for SCM_CREDENTIALS */
+    struct handle fd[PAIR_FDS];
+};
 
 static struct pipe {
     char    *data;
@@ -478,7 +950,27 @@ static struct pipe {
     unsigned refs;                  /* descriptors on either end */
     uint64_t count;                 /* an eventfd's; a pipe's, the write ends open on it */
     uint32_t fifo;                  /* a FIFO's: the number of the file it is */
-} pipes[PIPES];
+    bool     packets;               /* a SEQPACKET or DGRAM pair's: a write is one message */
+    uint64_t wrote, taken;          /* bytes ever put in, and taken out */
+    struct pmsg *msgs;              /* its messages' bounds and descriptors, oldest first */
+    uint32_t nmsgs, msg_room;
+    bool     passcred;              /* its reader asked who sends (SO_PASSCRED) */
+    int      last_pid;              /* who wrote to it last */
+    char    *made_from;             /* a /proc file's name, to make it again
+                                       when it is read from the start again */
+} *pipes;                           /* PIPES of them, mem_alloc'd at start: too many
+                                       for the kernel's own image */
+
+static void handle_release(struct handle *h);
+struct iovec {
+    uint64_t base;
+    uint64_t length;
+};
+static uint64_t pair_take(struct handle *h, struct pipe *p, const struct iovec *iov, uint64_t n,
+                          struct handle *fds, uint32_t *nfd, bool *cut);
+extern int pair_sender;
+static uint64_t pair_put(struct handle *h, struct pipe *p, const struct iovec *iov, uint64_t n,
+                         const struct handle *fds, uint32_t nfd, bool nonblock);
 
 struct pipe *pipe_of(const struct handle *h) {
     return h != NULL && h->start == PIPE_MARK && h->folder > 0 &&
@@ -491,7 +983,18 @@ static void pipe_drop(struct pipe *p) {
         if (p->data != NULL) {
             mem_free(p->data);
         }
+        mem_free(p->made_from);
+        /* Descriptors sent and never received go with it. */
+        struct pmsg *msgs = p->msgs;
+        uint32_t n = p->nmsgs;
+
         *p = (struct pipe){ 0 };
+        for (uint32_t i = 0; i < n; i++) {
+            for (uint32_t k = 0; k < msgs[i].nfd; k++) {
+                handle_release(&msgs[i].fd[k]);
+            }
+        }
+        mem_free(msgs);
     }
 }
 
@@ -650,6 +1153,9 @@ static uint64_t proc_net_open(const char *name) {
     }
     pipes[slot] = (struct pipe){ .data = text, .size = PIPE_TEXT, .refs = 1,
                                  .len = (uint32_t)(len < PIPE_TEXT ? len : PIPE_TEXT) };
+    if ((pipes[slot].made_from = mem_alloc(strlen(name) + 1)) != NULL) {
+        strcpy(pipes[slot].made_from, name);
+    }
     return fd;
 }
 
@@ -689,6 +1195,7 @@ static uint64_t pipe_put(struct pipe *p, const char *from, uint64_t count) {
     }
     memcpy(p->data + p->len, from, (size_t)count);
     p->len += (uint32_t)count;
+    p->wrote += count;
     return count;
 }
 
@@ -731,8 +1238,11 @@ static uint64_t pipe_read(struct pipe *p, char *to, uint64_t count) {
     if (count > left) {
         count = left;
     }
-    memcpy(to, p->data + p->read_at, (size_t)count);
+    if (to != NULL) {
+        memcpy(to, p->data + p->read_at, (size_t)count);
+    }
     p->read_at += (uint32_t)count;
+    p->taken += count;
     if (p->read_at == p->len) {
         p->read_at = p->len = 0;    /* all read: a pair is written to again */
     }
@@ -798,16 +1308,21 @@ static uint64_t fb_copy(struct handle *h, void *buf, uint64_t count, bool out) {
     return count;
 }
 
+static uint64_t mem_io(struct handle *h, uint64_t buf, uint64_t count, bool in);
+
 static uint64_t write_to(struct handle *h, uint64_t text, uint64_t length) {
     if (h == NULL) {
         return ERR(EBADF);
+    }
+    if (mem_backed(h)) {
+        return mem_io(h, text, length, true);
     }
     if (h->start == WRITE_MARK) {
         /* Into the file where the descriptor is, which is its end when the
            program has only been writing and anywhere in it once the program
            has moved about - what a program keeping a scratch file of its own
            does, ed's buffer among them. */
-        if (fs_write_at(writer_names[h->writer - 1], h->offset,
+        if (fs_write_at(write_name(h), h->offset,
                         (const void *)text, length) < 0) {
             return ERR(EIO);
         }
@@ -829,6 +1344,11 @@ static uint64_t write_to(struct handle *h, uint64_t text, uint64_t length) {
         }
         if (h->size == PIPE_PAIR) {
             p = pair_out(h);
+            if (p != NULL && p->packets) {
+                struct iovec one = { (uint64_t)text, length };
+
+                return pair_put(h, p, &one, 1, NULL, 0, false);
+            }
             return p == NULL ? ERR(EPIPE) : pipe_write(h, p, (const char *)text, length);
         }
         return p == NULL || h->size != PIPE_WRITE ? ERR(EBADF)
@@ -877,16 +1397,19 @@ static uint64_t sys_write(uint64_t fd, uint64_t text, uint64_t length) {
 
 
 uint64_t self_us(void) {
-    uint64_t took = efi_uptime_us() - now_running.started;
-    uint64_t not = now_running.children_wall + now_running.idle;
+    return now_running.user + now_running.sys;
+}
 
-    return took > not ? took - not : 0;
+/* A yield that let something else run: that time was not the caller's, so
+   it is taken off its system time as a wait's is. */
+void process_yielded(uint64_t us) {
+    if (proc != NULL) {
+        proc->times.idle += us;
+    }
 }
 
 uint64_t user_us(void) {
-    uint64_t self = self_us();
-
-    return self > now_running.sys ? self - now_running.sys : 0;
+    return now_running.user;
 }
 
 /* Marks the start of a wait, and then its end, which counts it idle. */
@@ -1056,6 +1579,7 @@ bool interrupt_check(void) {
 /* kill: to one process, to the caller's own group (0), to every other
    process (-1), or to a group (-pgid). Signal 0 only asks whether there is
    anyone there. pid_t is 32 bits: -1 arrives as 0xffffffff. */
+
 static uint64_t sys_kill(uint64_t pid, uint64_t sig, uint64_t c) {
     int target = (int)pid;
     bool any = false;
@@ -1117,6 +1641,10 @@ static uint64_t sys_rt_sigprocmask(uint64_t how, uint64_t set, uint64_t old) {
 static uint64_t sys_rt_sigaction(uint64_t sig, uint64_t act, uint64_t old) {
     struct sig_action *a = action_for(sig);
 
+    if ((uint32_t)sig < 1 || (uint32_t)sig > 64) {
+        return ERR(EINVAL);         /* there is no such signal: how a program
+                                       counting its way through them knows to stop */
+    }
     if ((act != 0 && !user_range(act, sizeof *a)) || (old != 0 && !user_range(old, sizeof *a))) {
         return ERR(EFAULT);
     }
@@ -1366,6 +1894,9 @@ static uint64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count) {
     if (h == NULL) {
         return ERR(EBADF);
     }
+    if (mem_backed(h)) {
+        return mem_io(h, buf, count, false);
+    }
     if (h->start == CONSOLE_MARK) {
         uint64_t began = wait_began();      /* waiting on whoever is typing */
         uint64_t got = console_read((char *)buf, count);
@@ -1382,7 +1913,7 @@ static uint64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count) {
            asked for, since a write may have moved the whole file. */
         struct fs_file file;
 
-        if (fs_stat(writer_names[h->writer - 1], &file) < 0) {
+        if (fs_stat(write_name(h), &file) < 0) {
             return ERR(EIO);
         }
         h->size = file.size;
@@ -1416,6 +1947,11 @@ static uint64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count) {
             thread_yield();
         }
         if (p != NULL && h->size == PIPE_PAIR) {
+            if (p->packets || p->nmsgs > 0) {
+                struct iovec one = { buf, count };
+
+                return pair_take(h, p, &one, 1, NULL, NULL, NULL);
+            }
             return pipe_read(p, (char *)buf, count);
         }
         return p == NULL || (h->size != PIPE_READ && h->size != PIPE_FILE)
@@ -1469,15 +2005,42 @@ static uint64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count) {
 /* The lowest free descriptor, holding what was found - which is the one
    Linux hands out too, and what a program closing 1 and opening a file
    counts on. */
+/* Room for descriptor need: the table doubled, up to PROGRAM_FILES. */
+static bool files_grow(uint32_t need) {
+    uint32_t room = file_room;
+
+    while (room <= need && room < PROGRAM_FILES) {
+        room *= 2;
+    }
+    room = room < PROGRAM_FILES ? room : PROGRAM_FILES;
+    if (need >= room) {
+        return false;
+    }
+    struct handle *bigger = mem_alloc(room * sizeof *bigger);
+
+    if (bigger == NULL) {
+        return false;
+    }
+    memset(bigger, 0, room * sizeof *bigger);
+    memcpy(bigger, handles, file_room * sizeof *bigger);
+    mem_free(proc->files_old);
+    proc->files_old = handles;
+    handles = bigger;
+    file_room = room;
+    return true;
+}
+
 uint64_t give_handle(struct handle h) {
-    for (unsigned i = 0; i < PROGRAM_FILES; i++) {
+    for (unsigned i = 0;; i++) {
+        if (i == file_room && !files_grow(i)) {
+            return ERR(EMFILE);
+        }
         if (handles[i].used == 0) {
             h.used = 1;             /* close-on-exec is said separately */
             handles[i] = h;
             return i;
         }
     }
-    return ERR(EMFILE);
 }
 
 /* Opens a file, or the folder of that name if there is no such file - which
@@ -1545,7 +2108,8 @@ static bool fd_path(uint64_t fd, char *out, size_t max) {
         name = "dev/tty1";
         break;
     case PROCDIR_MARK:
-        name = h->folder == 0 ? "proc" : h->folder == 2 ? "dev/input" : h->folder == 3 ? "dev/pts" : "dev";
+        name = h->folder == 0 ? "ctl" : h->folder == PROC_PIDS_FOLDER ? "proc" :
+               h->folder == 2 ? "dev/input" : h->folder == 3 ? "dev/pts" : "dev";
         break;
     case DEV_MARK:
         for (unsigned i = 0; i < DEVICES && name == NULL; i++) {
@@ -1557,7 +2121,10 @@ static bool fd_path(uint64_t fd, char *out, size_t max) {
         ksprintf(out, "%s:[%u]", h->start == PIPE_MARK ? "pipe" : "socket", (uint64_t)h->folder);
         return true;
     case WRITE_MARK:
-        name = writer_names[h->writer - 1];
+        name = write_name(h);
+        break;
+    case MEM_MARK:
+        name = "memfd:shm (deleted)";
         break;
     default:
         if (h->start == FOLDER_MARK && h->folder == 0) {
@@ -1584,6 +2151,49 @@ static bool fd_path(uint64_t fd, char *out, size_t max) {
     return true;
 }
 
+/* Whether name is /proc/self/fd, or /proc/<own pid>/fd: the folder of the
+   caller's descriptors, listed by number (opendir of it is how Chromium and
+   many another program close what they did not mean to keep). */
+bool proc_fd_folder(const char *name) {
+    unsigned pid = 0;
+    const char *p;
+
+    if (name == NULL || memcmp(name, "/proc/", 6) != 0 || proc == NULL) {
+        return false;
+    }
+    p = name + 6;
+    if (memcmp(p, "self/", 5) == 0) {
+        p += 5;
+    } else {
+        for (; *p >= '0' && *p <= '9'; p++) {
+            pid = pid * 10 + (unsigned)(*p - '0');
+        }
+        if (*p++ != '/' || (int)pid != proc->pid) {
+            return false;
+        }
+    }
+    return strcmp(p, "fd") == 0 || strcmp(p, "fd/") == 0;
+}
+
+/* /proc/self/task (or /proc/<own pid>/task): a folder whose link count is
+   its threads and two, as Linux's is - Chromium counts them by that. 0 for
+   any other name. */
+unsigned proc_task_links(const char *name) {
+    char self[24];
+
+    if (name == NULL || proc == NULL) {
+        return 0;
+    }
+    ksprintf(self, "/proc/%u/", (unsigned)proc->pid);
+    const char *p = memcmp(name, "/proc/self/", 11) == 0 ? name + 11
+                  : memcmp(name, self, strlen(self)) == 0 ? name + strlen(self) : NULL;
+
+    if (p == NULL || (strcmp(p, "task") != 0 && strcmp(p, "task/") != 0)) {
+        return 0;
+    }
+    return thread_count(proc) + 2;
+}
+
 const char *proc_fd_target(const char *name, char *out, size_t max) {
     unsigned pid = 0, fd = 0;
     const char *p;
@@ -1602,6 +2212,16 @@ const char *proc_fd_target(const char *name, char *out, size_t max) {
             return NULL;
         }
     }
+    if (strcmp(p, "exe") == 0) {
+        /* The program it runs: Firefox finds the folder it is installed in
+           from here, and many another program its own files. */
+        if (proc->exe[0] == '\0') {
+            return NULL;
+        }
+        out[0] = '/';
+        strcpy(out + 1, proc->exe[0] == '/' ? proc->exe + 1 : proc->exe);
+        return out;
+    }
     if (memcmp(p, "fd/", 3) != 0 || p[3] == '\0') {
         return NULL;
     }
@@ -1619,6 +2239,18 @@ static uint64_t open_name(const char *name, uint64_t flags) {
 
     if (name == NULL) {
         return ERR(EINVAL);
+    }
+    if (memcmp(name, "/proc/self/fd/", 14) == 0) {
+        uint64_t n = 0;
+
+        for (const char *d = name + 14; *d >= '0' && *d <= '9'; d++) {
+            n = n * 10 + (uint64_t)(*d - '0');
+        }
+        struct handle *of = handle_of(n);
+
+        if (of != NULL && (of->start == MEM_MARK || of->start == WRITE_MARK) && of->ofd != 0) {
+            return mem_reopen(of);  /* the same memory, opened again */
+        }
     }
     if (proc_fd_target(name, target, sizeof target) != NULL) {
         name = target;              /* opened, it is what it names */
@@ -1672,15 +2304,16 @@ static uint64_t open_name(const char *name, uint64_t flags) {
            asked for it to be thrown away. */
         struct handle h = { .start = WRITE_MARK };
         char scratch[FS_NAME_LEN];
-        unsigned slot = 0;
+        static unsigned tmpfiles;
+        unsigned slot = OFDS;
         size_t length;
         bool empty;
 
-        while (slot < WRITERS && writer_names[slot][0] != '\0') {
-            slot++;
+        for (unsigned i = 0; i < OFDS && slot == OFDS; i++) {
+            slot = ofds[i].refs == 0 ? i : slot;
         }
-        if (slot == WRITERS) {
-            return ERR(EMFILE);
+        if (slot == OFDS) {
+            return ERR(ENFILE);
         }
         if ((flags & O_TMPFILE) == O_TMPFILE) {
             /* A file with no name of its own, in the folder named: a
@@ -1691,7 +2324,7 @@ static uint64_t open_name(const char *name, uint64_t flags) {
             if (fs_folder_at(name, &(unsigned){ 0 }) != 0) {
                 return ERR(ENOENT);
             }
-            ksprintf(scratch, "%s/.tmp%u", name, slot);
+            ksprintf(scratch, "%s/.tmp%u", name, tmpfiles++ % 64);
             name = scratch;
             empty = true;
         } else {
@@ -1713,11 +2346,24 @@ static uint64_t open_name(const char *name, uint64_t flags) {
         if (fs_stat(name, &file) != 0) {
             return ERR(EACCES);
         }
-        memcpy(writer_names[slot], name, length + 1);
-        h.writer = slot + 1;
+        char *kept = mem_alloc(length + 1);
+
+        if (kept == NULL) {
+            return ERR(ENOMEM);
+        }
+        memcpy(kept, name, length + 1);
+        h.writer = 1;
         h.size = file.size;
         h.offset = (flags & O_APPEND) != 0 ? file.size : 0;
-        return give_handle(h);
+        ofds[slot] = (struct ofd){ 1, h.offset, h.size, NULL, kept };
+        h.ofd = slot + 1;
+
+        uint64_t fd = give_handle(h);
+
+        if ((int64_t)fd < 0) {
+            ofd_drop(&h);
+        }
+        return fd;
     }
     if (proc_net_name(name) != NULL) {
         return proc_net_open(proc_net_name(name));
@@ -1728,6 +2374,12 @@ static uint64_t open_name(const char *name, uint64_t flags) {
                 .start = PROC_MARK, .folder = i + 1,
                 .size = (uint32_t)proc_read(proc_at(i), 0, NULL, 0) });
         }
+    }
+    if (proc_fd_folder(name)) {
+        return give_handle((struct handle){ .start = PROCDIR_MARK, .folder = PROC_FD_FOLDER });
+    }
+    if (strcmp(name, "/proc") == 0 || strcmp(name, "/proc/") == 0) {
+        return give_handle((struct handle){ .start = PROCDIR_MARK, .folder = PROC_PIDS_FOLDER });
     }
     if (proc_folder(name) || dev_folder(name)) {
         return give_handle((struct handle){ .start = PROCDIR_MARK, .folder = dev_folder(name) });
@@ -1770,6 +2422,20 @@ const char *at_path(uint64_t dirfd, const char *name, char *out, size_t max) {
         return name;
     }
     h = handle_of(dirfd);
+    if (h != NULL && h->start == PROCDIR_MARK) {
+        /* /proc or /dev opened as a folder: a name relative to it is under it
+           - how Chromium looks at self/task through a descriptor of /proc. */
+        static const char *const bases[] = { "/proc/", "/dev/", "/dev/input/", "/dev/pts/",
+                                             "/proc/self/fd/" };
+        const char *base = h->folder < sizeof bases / sizeof bases[0] ? bases[h->folder] : "/proc/";
+
+        if (strlen(base) + strlen(name) + 1 > max) {
+            return NULL;
+        }
+        strcpy(out, base);
+        strcpy(out + strlen(base), name);
+        return out;
+    }
     if (h == NULL || h->start != FOLDER_MARK) {
         return name;                /* not a folder: nothing to be relative to */
     }
@@ -1806,6 +2472,7 @@ static uint64_t sys_close(uint64_t fd, uint64_t b, uint64_t c) {
         return ERR(EBADF);
     }
     h->used = 0;
+    ofd_drop(h);
     if (h->start == PIPE_MARK) {
         pipe_release(h);
         return 0;
@@ -1820,17 +2487,7 @@ static uint64_t sys_close(uint64_t fd, uint64_t b, uint64_t c) {
         }
         return 0;
     }
-    /* The name a file is written back to goes only with the last descriptor
-       holding it: a copy made with dup keeps the file open. */
-    if (h->writer > 0) {
-        for (unsigned i = 0; i < PROGRAM_FILES; i++) {
-            if (handles[i].used != 0 && handles[i].writer == h->writer) {
-                return 0;
-            }
-        }
-        writer_names[h->writer - 1][0] = '\0';
-    }
-    return 0;
+    return 0;                       /* a written file's name goes with its last descriptor (ofd_drop) */
 }
 
 /* A second descriptor for the same open file. Everything a handle holds is
@@ -1844,6 +2501,12 @@ static uint64_t dup_to(uint64_t fd, uint64_t to) {
     if (h == NULL || to >= PROGRAM_FILES) {
         return ERR(EBADF);
     }
+    if (to >= file_room) {
+        if (!files_grow((uint32_t)to)) {
+            return ERR(EMFILE);
+        }
+        h = handle_of(fd);          /* where it is now */
+    }
     if (to != fd) {
         if (handles[to].used != 0) {
             sys_close(to, 0, 0);
@@ -1851,6 +2514,7 @@ static uint64_t dup_to(uint64_t fd, uint64_t to) {
         handles[to] = *h;
         handles[to].used = 1;       /* a duplicate is not closed on exec */
         pipe_hold(h);
+        ofd_hold(h);
         if (h->start == SOCK_MARK) {
             sock_hold(h);
         }
@@ -1873,6 +2537,7 @@ static uint64_t sys_dup(uint64_t fd, uint64_t b, uint64_t c) {
     made = give_handle(*h);
     if ((int64_t)made >= 0) {
         pipe_hold(h);
+        ofd_hold(h);
     }
     if ((int64_t)made >= 0 && h->start == SOCK_MARK) {
         sock_hold(h);
@@ -1899,7 +2564,7 @@ static uint64_t sys_close_range(uint64_t first, uint64_t last, uint64_t flags) {
     if (first > last) {
         return ERR(EINVAL);
     }
-    for (uint64_t fd = first; fd <= last && fd < PROGRAM_FILES; fd++) {
+    for (uint64_t fd = first; fd <= last && fd < file_room; fd++) {
         if (handle_of(fd) == NULL) {
             continue;
         }
@@ -1924,6 +2589,28 @@ static uint64_t sys_lseek(uint64_t fd, uint64_t offset, uint64_t whence) {
 
     if (h == NULL || whence > 2) {
         return ERR(h == NULL ? EBADF : EINVAL);
+    }
+    /* A /proc file is text made as it was opened, read like a pipe - but
+       it can be gone back over, and gone back to its start it is made
+       again, as top rereads /proc/stat. */
+    struct pipe *made = h->start == PIPE_MARK && h->size == PIPE_FILE ? pipe_of(h) : NULL;
+
+    if (made != NULL && made->made_from != NULL) {
+        int64_t at = whence == 0 ? 0 : whence == 1 ? (int64_t)made->read_at : (int64_t)made->len;
+
+        at += (int64_t)offset;
+        if (at < 0) {
+            return ERR(EINVAL);
+        }
+        if (at == 0) {
+            size_t len = made->made_from[0] == '/'
+                       ? proc_linux(made->made_from, made->data, PIPE_TEXT)
+                       : net != NULL ? net->proc(made->made_from, made->data, PIPE_TEXT) : 0;
+
+            made->len = (uint32_t)(len < PIPE_TEXT ? len : PIPE_TEXT);
+        }
+        made->read_at = (uint32_t)(at < (int64_t)made->len ? at : (int64_t)made->len);
+        return (uint64_t)at;
     }
     /* The terminal, a pipe and a socket are streams, as on Linux - and a
        pipe's offset holds its flags, not a place in it. */
@@ -1952,17 +2639,97 @@ static uint64_t sys_ftruncate(uint64_t fd, uint64_t length, uint64_t c) {
     struct handle *h = handle_of(fd);
 
     (void)c;
-    if (h == NULL || h->start != WRITE_MARK) {
+    if (h == NULL) {
         return ERR(EBADF);
     }
-    if (length != 0) {
-        return ERR(EINVAL);
+    if (mem_backed(h)) {
+        h->size = (uint32_t)length; /* its pages come when touched */
+        return 0;
     }
-    if (fs_write(writer_names[h->writer - 1], NULL, 0) < 0) {
-        return ERR(EIO);
+    if (h->start != WRITE_MARK) {
+        return ERR(EINVAL);         /* not open for writing */
     }
-    h->offset = 0;
+    const char *name = write_name(h);
+    struct fs_file there;
+
+    if (fs_stat(name, &there) != 0) {
+        /* Deleted while open, as a temporary file used for memory is: it
+           has no disk to change, only the size its descriptors see. */
+        h->size = (uint32_t)length;
+        return 0;
+    }
+    if (length == 0) {
+        if (fs_write(name, NULL, 0) < 0) {
+            return ERR(EIO);
+        }
+    } else if (length > h->size) {
+        /* Longer: what is past the old end reads as zeroes. */
+        if (fs_write_at(name, (uint32_t)length - 1, "", 1) < 0) {
+            return ERR(EIO);
+        }
+    } else if (length < h->size) {
+        /* Shorter: what stays, written again on its own. */
+        struct fs_file file;
+        char *kept = mem_alloc(length);
+
+        if (kept == NULL) {
+            return ERR(ENOMEM);
+        }
+        if (fs_stat(name, &file) != 0 || read_at(&file, 0, kept, length) < 0 ||
+            fs_write(name, kept, length) < 0) {
+            mem_free(kept);
+            return ERR(EIO);
+        }
+        mem_free(kept);
+    }
+    h->size = (uint32_t)length;      /* the position stays where it was, as on Linux */
     return 0;
+}
+
+/* /proc/self/maps, as far as a program reads it: where its heap and its
+   stack are. glibc finds the main thread's stack here for
+   pthread_getattr_np, and Firefox will not start without that. */
+void process_maps(char *out, size_t max) {
+    out[0] = '\0';
+    if (proc == NULL || vm_base() == 0 || max < 200) {
+        return;
+    }
+    uint64_t top = vm_base() + USER_STACK;
+
+    ksprintf(out, "%x-%x rw-p 00000000 00:00 0                          [heap]\n"
+                  "%x-%x rw-p 00000000 00:00 0                          [stack]\n",
+             vm_base() + USER_BRK, program_break > vm_base() + USER_BRK ? program_break : vm_base() + USER_BRK + PAGE_SIZE,
+             top - USER_STACK_BYTES, top);
+}
+
+struct creds *process_creds(void) {
+    static struct creds kernel;     /* the kernel's own programs: root */
+
+    return proc != NULL ? &proc->cred : &kernel;
+}
+
+static uint64_t sys_getuid(uint64_t a, uint64_t b, uint64_t c) {
+    (void)a; (void)b; (void)c;
+    return process_creds()->uid;
+}
+
+static uint64_t sys_geteuid(uint64_t a, uint64_t b, uint64_t c) {
+    (void)a; (void)b; (void)c;
+    return process_creds()->euid;
+}
+
+static uint64_t sys_getgid(uint64_t a, uint64_t b, uint64_t c) {
+    (void)a; (void)b; (void)c;
+    return process_creds()->gid;
+}
+
+static uint64_t sys_getegid(uint64_t a, uint64_t b, uint64_t c) {
+    (void)a; (void)b; (void)c;
+    return process_creds()->egid;
+}
+
+uint64_t fd_truncate(uint64_t fd, uint64_t length) {
+    return sys_ftruncate(fd, length, 0);
 }
 
 /* Linux's getcwd returns the length it wrote, the NUL included. */
@@ -2053,6 +2820,7 @@ static uint64_t sys_fchdir(uint64_t fd, uint64_t b, uint64_t c) {
 static void program_memory_start(void) {
     program_break = vm_base() + USER_BRK;
     program_map = vm_base() + USER_MMAP;
+    program_map_high = vm_base() + USER_HIGH;
 }
 
 static uint64_t sys_brk(uint64_t addr, uint64_t b, uint64_t c) {
@@ -2060,7 +2828,7 @@ static uint64_t sys_brk(uint64_t addr, uint64_t b, uint64_t c) {
     (void)c;
     /* Linux answers a request it cannot meet with the break unchanged. */
     if (addr >= program_break && fits(addr, 0) &&
-        addr < program_break + 0x10000000) {
+        addr < program_break + 0x10000000 && (vm_base() == 0 || addr <= vm_base() + USER_HIGH)) {
         program_break = addr;
     }
     return program_break;
@@ -2205,7 +2973,7 @@ static bool map_share(uint64_t page) {
             return false;
         }
     }
-    if (!vm_map_shared(page, common)) {
+    if (!vm_map_shared(page, common, false)) {
         shared_drop(common);
         return false;
     }
@@ -2314,6 +3082,49 @@ static bool map_fill(uint64_t addr) {
     return true;
 }
 
+#define MAP_SHARED 0x01
+
+/* A file open for writing, mapped MAP_SHARED: its pages (struct mobj),
+   mapped writable here and counted once more, all at once - what is
+   shared this way is a few hundred kilobytes of memory, not a file read. */
+static uint64_t map_shared_file(struct handle *h, uint64_t at, uint64_t size, uint64_t offset) {
+    struct ofd *o = h->ofd != 0 ? &ofds[h->ofd - 1] : NULL;
+    uint32_t first = (uint32_t)(offset / PAGE_SIZE), count = (uint32_t)(size / PAGE_SIZE);
+
+    if (o == NULL || offset % PAGE_SIZE != 0) {
+        return ERR(o == NULL ? ENFILE : EINVAL);
+    }
+    if (o->mem == NULL && (o->mem = mobj_new()) == NULL) {
+        return ERR(ENOMEM);
+    }
+    map_trim(at, size);
+    vm_release(at, size);           /* whatever was there before */
+    for (uint32_t i = 0; i < count; i++) {
+        bool fresh = o->mem->room <= first + i || o->mem->frame[first + i] == 0;
+        uint64_t page = mobj_page(o->mem, first + i, true);
+        uint64_t from = (uint64_t)(first + i) * PAGE_SIZE;
+
+        if (page == 0) {
+            return ERR(ENOMEM);
+        }
+        /* A file on the disk: what it already holds, where it holds anything. */
+        if (fresh && h->start == WRITE_MARK && from < h->size) {
+            struct fs_file file;
+            uint64_t n = h->size - from < PAGE_SIZE ? h->size - from : PAGE_SIZE;
+
+            if (fs_stat(write_name(h), &file) == 0 && from < file.size) {
+                read_at(&file, from, (void *)page, n < file.size - from ? n : file.size - from);
+            }
+        }
+        shared_hold(page);
+        if (!vm_map_shared(at + (uint64_t)i * PAGE_SIZE, page, true)) {
+            shared_drop(page);
+            return ERR(ENOMEM);
+        }
+    }
+    return at;
+}
+
 static uint64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot) {
     uint64_t flags = arg[3], fd = arg[4], offset = arg[5];
     uint64_t size = (length + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
@@ -2326,8 +3137,18 @@ static uint64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot) {
     if ((flags & MAP_FIXED) != 0) {
         at = addr & ~(uint64_t)(PAGE_SIZE - 1);
     } else if (vm_base() != 0) {
-        at = program_map;
-        program_map += size + PAGE_SIZE;     /* a gap, so a fixed map nearby is safe */
+        /* Up to the heap, and no further: a reservation too big for what is
+           left fails, as V8's first try at a terabyte does, and leaves room
+           for the smaller one it tries next. */
+        if (size + PAGE_SIZE <= vm_base() + USER_BRK - program_map) {
+            at = program_map;
+            program_map += size + PAGE_SIZE;     /* a gap, so a fixed map nearby is safe */
+        } else if (size + PAGE_SIZE <= vm_end() - program_map_high) {
+            at = program_map_high;
+            program_map_high += size + PAGE_SIZE;
+        } else {
+            return ERR(ENOMEM);
+        }
     } else {
         /* The old window: handed out from the far end, growing down. */
         if (size > program_map - program_break) {
@@ -2378,6 +3199,22 @@ static uint64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot) {
            whatever the program draws, until the program ends. */
         graphics_take();
         vga_lend(true);
+        return at;
+    }
+    if (h != NULL && (h->start == WRITE_MARK || h->start == MEM_MARK) && (flags & MAP_SHARED) != 0) {
+        return map_shared_file(h, at, size, offset);
+    }
+    if (h != NULL && mem_backed(h)) {
+        /* Private: a copy of what it holds now. */
+        uint32_t was = h->offset;
+
+        if (!claim(at, size)) {
+            return ERR(ENOMEM);
+        }
+        memset((void *)at, 0, size);
+        h->offset = (uint32_t)offset;
+        mem_io(h, at, size, false);
+        h->offset = was;
         return at;
     }
     if (h == NULL || h->start >= FIRST_MARK) {
@@ -2438,6 +3275,61 @@ uint64_t fs_errno(int err) {
     }
 }
 
+/* name is about to go: whatever has it open for writing keeps its bytes,
+   as memory - what it held copied in, the name forgotten (mem_backed). */
+static void unlinked_open(const char *name) {
+    struct fs_file file;
+    bool there = fs_stat(name, &file) == 0;
+    struct mobj *kept = NULL;
+
+    for (unsigned i = 0; i < OFDS; i++) {
+        struct ofd *o = &ofds[i];
+
+        if (o->refs == 0 || o->name == NULL ||
+            (strcmp(o->name, name) != 0 && strcmp(o->name + (o->name[0] == '/'), name + (name[0] == '/')) != 0)) {
+            continue;
+        }
+        if (o->mem == NULL && (o->mem = mobj_new()) == NULL) {
+            continue;               /* no memory: it goes with its name */
+        }
+        for (uint64_t at = 0; there && at < file.size && at < o->size; at += PAGE_SIZE) {
+            bool fresh = o->mem->room <= at / PAGE_SIZE || o->mem->frame[at / PAGE_SIZE] == 0;
+            uint64_t page = mobj_page(o->mem, (uint32_t)(at / PAGE_SIZE), true);
+            uint64_t n = file.size - at < PAGE_SIZE ? file.size - at : PAGE_SIZE;
+
+            if (page != 0 && fresh) {
+                read_at(&file, at, (void *)page, n);
+            }
+        }
+        mem_free(o->name);
+        o->name = NULL;
+        kept = kept != NULL ? kept : o->mem;
+    }
+    /* Opened for reading too, by its name before it went - Chromium's
+       read-only view of memory it shares, which its renderers map: those
+       become views of the same memory. */
+    for (unsigned i = 0; kept != NULL && there && file.start != 0 && i < PROCESSES; i++) {
+        struct process *p = procs[i];
+
+        for (uint32_t fd = 0; p != NULL && !p->zombie && fd < p->files_room; fd++) {
+            struct handle *h = &p->files[fd];
+
+            if (h->used == 0 || h->start != file.start || h->ofd == 0) {
+                continue;
+            }
+            struct ofd *o = &ofds[h->ofd - 1];
+
+            if (o->mem == NULL) {
+                kept->refs++;
+                o->mem = kept;
+                o->size = file.size;
+            }
+            h->start = MEM_MARK;
+            h->size = file.size;
+        }
+    }
+}
+
 static uint64_t sys_unlink(uint64_t path, uint64_t b, uint64_t c) {
     const char *name = user_string(path);
 
@@ -2446,6 +3338,7 @@ static uint64_t sys_unlink(uint64_t path, uint64_t b, uint64_t c) {
     if (name == NULL) {
         return ERR(EFAULT);
     }
+    unlinked_open(name);
     return fs_errno(fs_remove(name));
 }
 
@@ -2459,11 +3352,12 @@ static uint64_t sys_unlinkat(uint64_t dirfd, uint64_t path, uint64_t flags) {
     if (name == NULL) {
         return ERR(EFAULT);
     }
+    unlinked_open(name);
     return fs_errno(fs_remove(name));
 }
 
-/* A folder made with other than the usual 0755, once umask's 022 is taken
-   off, keeps its mode: fish will not use a runtime folder anyone else can
+/* A folder made with other than the usual 0755, once umask is taken off,
+   keeps its mode: fish will not use a runtime folder anyone else can
    read. */
 static uint64_t make_folder(const char *name, uint64_t mode) {
     int err;
@@ -2471,9 +3365,10 @@ static uint64_t make_folder(const char *name, uint64_t mode) {
     if (name == NULL) {
         return ERR(EFAULT);
     }
+    mode &= ~(uint64_t)(process_creds()->umask_off ^ 022u) & 07777;
     err = fs_mkdir(name);
-    if (err == 0 && (mode & 07755) != 0755) {
-        err = fs_set_mode(name, (unsigned)(S_IFDIR | (mode & 07755)));
+    if (err == 0 && mode != 0755) {
+        err = fs_set_mode(name, (unsigned)(S_IFDIR | mode));
     }
     return fs_errno(err);
 }
@@ -2554,13 +3449,32 @@ void tty_set_foreground(int pgid) {
 /* Only ARCH_SET_FS, which is how a libc points at its thread-local data.
    Even a program with one thread has to have it set, or the first access to
    a thread variable reads address zero; each thread keeps its own. */
+/* FS and GS bases: FS a thread's TLS, GS whatever the program makes of it -
+   Firefox's sandboxed WebAssembly libraries reach their memory through it. */
+#define ARCH_SET_GS 0x1001
+#define ARCH_GET_FS 0x1003
+#define ARCH_GET_GS 0x1004
+#define MSR_GS_BASE 0xC0000101
+
 static uint64_t sys_arch_prctl(uint64_t code, uint64_t addr, uint64_t c) {
     (void)c;
-    if (code != ARCH_SET_FS || !user_range(addr, 0)) {
-        return ERR(EINVAL);
+    switch (code) {
+    case ARCH_SET_FS:
+    case ARCH_SET_GS:
+        if (!user_range(addr, 0)) {
+            return ERR(EPERM);
+        }
+        wrmsr(code == ARCH_SET_FS ? MSR_FS_BASE : MSR_GS_BASE, addr);
+        return 0;
+    case ARCH_GET_FS:
+    case ARCH_GET_GS:
+        if (!user_range(addr, 8)) {
+            return ERR(EFAULT);
+        }
+        *(uint64_t *)addr = rdmsr(code == ARCH_GET_FS ? MSR_FS_BASE : MSR_GS_BASE);
+        return 0;
     }
-    wrmsr(MSR_FS_BASE, addr);
-    return 0;
+    return ERR(EINVAL);
 }
 
 /* A read from a given place that leaves the file where it was. */
@@ -2570,7 +3484,7 @@ static uint64_t sys_pread64(uint64_t fd, uint64_t buf, uint64_t count) {
     uint32_t was;
     uint64_t got;
 
-    if (h == NULL || (h->start >= FIRST_MARK && h->start != WRITE_MARK)) {
+    if (h == NULL || (h->start >= FIRST_MARK && h->start != WRITE_MARK && h->start != MEM_MARK)) {
         return ERR(EBADF);          /* not a file on the disk */
     }
     was = h->offset;
@@ -2675,6 +3589,56 @@ static uint64_t futex_wake_op(uint64_t address, uint32_t n, uint64_t address2, u
     return (uint64_t)(woke + (pass ? thread_wake(address2, (int)n2, 0, 0) : 0));
 }
 
+/* The priority-inheritance locks (FUTEX_LOCK_PI and kin): the word is its
+   owner's thread id, with FUTEX_WAITERS set while anyone waits. Nothing
+   here has priorities to lend, so this is a lock and no more - which is all
+   a mutex made with PTHREAD_PRIO_INHERIT needs. Firefox's are. */
+#define FUTEX_LOCK_PI    6
+#define FUTEX_UNLOCK_PI  7
+#define FUTEX_TRYLOCK_PI 8
+#define FUTEX_LOCK_PI2   13
+#define FUTEX_WAITERS    0x80000000u
+#define FUTEX_TID_MASK   0x3FFFFFFFu
+
+static uint64_t futex_lock_pi(uint64_t address, bool wait, uint64_t timeout) {
+    volatile uint32_t *word = (volatile uint32_t *)address;
+    uint32_t me = (uint32_t)thread_id();
+    uint64_t until = timeout != 0 && user_range(timeout, 16) ? efi_uptime_ms() + timespec_ms(timeout) : 0;
+
+    for (;;) {
+        uint32_t v = *word;
+
+        if ((v & FUTEX_TID_MASK) == 0) {
+            *word = me | (v & FUTEX_WAITERS);   /* free: the caller's */
+            return 0;
+        }
+        if ((v & FUTEX_TID_MASK) == me) {
+            return ERR(EDEADLK);
+        }
+        if (!wait) {
+            return ERR(EAGAIN);
+        }
+        *word = v | FUTEX_WAITERS;          /* the owner unlocks through here */
+        if (until != 0 && efi_uptime_ms() >= until) {
+            return ERR(ETIMEDOUT);
+        }
+        if (thread_only()) {
+            return ERR(EDEADLK);            /* nobody could ever let go of it */
+        }
+        thread_yield();
+    }
+}
+
+static uint64_t futex_unlock_pi(uint64_t address) {
+    volatile uint32_t *word = (volatile uint32_t *)address;
+
+    if ((*word & FUTEX_TID_MASK) != (uint32_t)thread_id()) {
+        return ERR(EPERM);
+    }
+    *word = 0;                              /* a waiter takes it on its next look */
+    return 0;
+}
+
 static uint64_t sys_futex(uint64_t address, uint64_t op, uint64_t value) {
     uint64_t timeout = arg[3], address2 = arg[4], value3 = arg[5];
 
@@ -2698,16 +3662,17 @@ static uint64_t sys_futex(uint64_t address, uint64_t op, uint64_t value) {
     case FUTEX_WAKE_OP:
         return futex_wake_op(address, (uint32_t)value, address2, (uint32_t)timeout,
                              (uint32_t)value3);
+    case FUTEX_LOCK_PI:
+    case FUTEX_LOCK_PI2:
+        return futex_lock_pi(address, true, timeout);
+    case FUTEX_TRYLOCK_PI:
+        return futex_lock_pi(address, false, 0);
+    case FUTEX_UNLOCK_PI:
+        return futex_unlock_pi(address);
     }
     return ERR(ENOSYS);
 }
 
-static uint64_t sys_root(uint64_t a, uint64_t b, uint64_t c) {
-    (void)a;
-    (void)b;
-    (void)c;
-    return 0;                       /* getuid and its kin: this is root */
-}
 
 /* The caller's group - what a shell compares with the terminal's before it
    decides it may run jobs. */
@@ -2718,13 +3683,16 @@ static uint64_t sys_getpgrp(uint64_t a, uint64_t b, uint64_t c) {
     return (uint64_t)proc->pgid;
 }
 
-/* The file mode a program's own files would be trimmed by. Nothing here has
-   permissions, so this is the usual answer and nothing more. */
+/* The file mode a program's own files are trimmed by: kept, since a folder
+   keeps its mode - mkdir -m 1777 clears it first to make /tmp/.X11-unix. */
 static uint64_t sys_umask(uint64_t mask, uint64_t b, uint64_t c) {
-    (void)mask;
+    struct creds *cred = process_creds();
+    uint64_t old = cred->umask_off ^ 022u;
+
     (void)b;
     (void)c;
-    return 022;
+    cred->umask_off = (uint16_t)((mask & 0777) ^ 022u);
+    return old;
 }
 
 
@@ -2739,7 +3707,16 @@ static uint64_t sys_umask(uint64_t mask, uint64_t b, uint64_t c) {
 #define F_SETFD         2
 #define F_GETFL         3
 #define F_SETFL         4
+#define F_GETLK         5
+#define F_SETLK         6
+#define F_SETLKW        7
+#define F_OFD_GETLK     36
+#define F_OFD_SETLK     37
+#define F_OFD_SETLKW    38
+#define F_UNLCK         2
 #define F_DUPFD_CLOEXEC 1030
+#define F_ADD_SEALS     1033
+#define F_GET_SEALS     1034
 
 static uint64_t sys_fcntl(uint64_t fd, uint64_t command, uint64_t c) {
     struct handle *h = handle_of(fd);
@@ -2778,14 +3755,28 @@ static uint64_t sys_fcntl(uint64_t fd, uint64_t command, uint64_t c) {
     case F_SETFD:
         fd_cloexec(fd, (arg[2] & 1) != 0);
         return 0;
+    case F_GETLK:
+    case F_OFD_GETLK:
+        /* Record locks: granted, every one. Programs take them against each
+           other - systemd-sysusers on /etc/passwd, dpkg on its database -
+           and here nothing ever holds one another wants, so a lock asked
+           about is always free. */
+        if (!user_range(arg[2], 2)) {
+            return ERR(EFAULT);
+        }
+        *(uint16_t *)arg[2] = F_UNLCK;
+        return 0;
+    case F_SETLK:
+    case F_SETLKW:
+    case F_OFD_SETLK:
+    case F_OFD_SETLKW:
+    case F_ADD_SEALS:               /* sealed: nothing here would change it anyway */
+        return 0;
+    case F_GET_SEALS:
+        return 0;
     }
     return ERR(EINVAL);
 }
-
-struct iovec {
-    uint64_t base;
-    uint64_t length;
-};
 
 static uint64_t sys_readv(uint64_t fd, uint64_t vectors, uint64_t count);
 
@@ -2856,10 +3847,19 @@ static uint64_t sys_pwrite64(uint64_t fd, uint64_t text, uint64_t count) {
     if (!user_range(text, count)) {
         return ERR(EFAULT);
     }
+    if (h != NULL && mem_backed(h)) {
+        uint32_t was = h->offset;
+        uint64_t done;
+
+        h->offset = (uint32_t)offset;
+        done = mem_io(h, text, count, true);
+        h->offset = was;
+        return done;
+    }
     if (h == NULL || h->start != WRITE_MARK) {
         return ERR(EBADF);
     }
-    if (fs_write_at(writer_names[h->writer - 1], (uint32_t)offset,
+    if (fs_write_at(write_name(h), (uint32_t)offset,
                     (const void *)text, count) < 0) {
         return ERR(EIO);
     }
@@ -3048,11 +4048,14 @@ static void traps_init(void) {
     uint64_t cr0 = write_protect(false);
     for (unsigned i = 0; i < EXCEPTIONS; i++) {
         uint64_t handler = i == VEC_PAGE_FAULT ? (uint64_t)page_fault_entry
-                                               : (uint64_t)trap_stubs + i * 16;
+                                               : (uint64_t)trap_stubs + i * 32;
         idt[i] = (struct idt_gate){
             .offset_low  = (uint16_t)handler,
             .selector    = kernel_cs,
-            .type        = 0x8E,        /* present 64-bit interrupt gate */
+            /* present 64-bit interrupt gates - int3 and into ones a program
+               may use itself, as a debugger's breakpoint and as Chromium's
+               way of ending on purpose */
+            .type        = i == 3 || i == 4 ? 0xEE : 0x8E,
             .offset_mid  = (uint16_t)(handler >> 16),
             .offset_high = (uint32_t)(handler >> 32),
         };
@@ -3093,6 +4096,20 @@ static uint64_t sys_sync(uint64_t a, uint64_t b, uint64_t c) {
 /* The calls answered, number and handler side by side. The calls a libc
    makes for the plainest commands are among them: rm is unlinkat, mkdir is
    mkdirat, mv is renameat2. */
+/* madvise: MADV_DONTNEED (and FREE) give the private pages back - read
+   again they are zeroes, or the file's bytes again - as a JavaScript engine
+   counts on when it lets go of memory. Shared memory keeps what it holds.
+   Every other advice is taken as read. */
+static uint64_t sys_madvise(uint64_t addr, uint64_t length, uint64_t advice) {
+    if (advice == 4 || advice == 8) {               /* MADV_DONTNEED, MADV_FREE */
+        if (addr % PAGE_SIZE != 0) {
+            return ERR(EINVAL);
+        }
+        vm_discard(addr, (length + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1));
+    }
+    return 0;
+}
+
 static const uint16_t numbers[] = {
     SYS_READ,
     SYS_WRITE,
@@ -3158,12 +4175,20 @@ static const uint16_t numbers[] = {
     SYS_TIMER_GETTIME,
     SYS_TIMER_GETOVERRUN,
     SYS_TIMER_DELETE,
+    SYS_ALARM,
+    SYS_GETITIMER,
+    SYS_SETITIMER,
     SYS_EXECVE,
     SYS_WAIT4,
     SYS_PIPE,
     SYS_PIPE2,
     SYS_EVENTFD,
     SYS_EVENTFD2,
+    SYS_INOTIFY_INIT,
+    SYS_INOTIFY_INIT1,
+    SYS_INOTIFY_ADD_WATCH,
+    SYS_INOTIFY_RM_WATCH,
+    SYS_MEMFD_CREATE,
     SYS_UNLINKAT,
     SYS_MKDIRAT,
     SYS_READV,
@@ -3187,7 +4212,7 @@ static const syscall_fn handlers[] = {
     sys_writev,
     sys_getpid,
     sys_sched_yield,
-    sys_ok,
+    sys_madvise,
     sys_sync,
     sys_sync,
     sys_sync,
@@ -3206,10 +4231,10 @@ static const syscall_fn handlers[] = {
     sys_mkdir,
     sys_fcntl,
     sys_futex,
-    sys_root,
-    sys_root,
-    sys_root,
-    sys_root,
+    sys_getuid,
+    sys_getgid,
+    sys_geteuid,
+    sys_getegid,
     sys_rt_sigaction,
     sys_rt_sigprocmask,
     sys_exit,
@@ -3238,13 +4263,21 @@ static const syscall_fn handlers[] = {
     sys_timer_settime,
     sys_timer_gettime,
     sys_ok,
-    sys_ok,
+    sys_timer_delete,
+    sys_alarm,
+    sys_getitimer,
+    sys_setitimer,
     sys_execve,
     sys_wait4,
     sys_pipe,
     sys_pipe2,
     sys_eventfd,
     sys_eventfd2,
+    sys_inotify_init1,
+    sys_inotify_init1,
+    sys_inotify_add_watch,
+    sys_ok,
+    sys_memfd_create,
     sys_unlinkat,
     sys_mkdirat,
     sys_readv,
@@ -3258,6 +4291,9 @@ static const syscall_fn handlers[] = {
 #define SYSCALLS (sizeof numbers / sizeof numbers[0])
 
 void syscall_init(void) {
+    if (pipes == NULL && (pipes = mem_alloc(PIPES * sizeof *pipes)) != NULL) {
+        memset(pipes, 0, PIPES * sizeof *pipes);
+    }
     gdt_init();
     sse_init();
     traps_init();
@@ -3306,6 +4342,10 @@ uint64_t syscall_dispatch(uint64_t a, uint64_t b, uint64_t c,
                           uint64_t d, uint64_t e, uint64_t f, uint64_t number) {
     void *entry = tracer != NULL ? tracer->begin((uint32_t)number, a, b, c) : NULL;
     uint64_t result = ERR(ENOSYS);
+
+    if (proc != NULL && now_running.left != 0) {
+        now_running.user += efi_uptime_us() - now_running.left;
+    }
     arg[0] = a;
     arg[1] = b;
     arg[2] = c;
@@ -3354,6 +4394,7 @@ uint64_t syscall_dispatch(uint64_t a, uint64_t b, uint64_t c,
        answered EAGAIN, again and again - would have the processor for good,
        and the program it waits on would never run. Every syscall is a point
        where the others can have a turn, and a busy one gives them it. */
+    ofd_sync();
     if ((calls & 31) == 0 || result == ERR(EAGAIN)) {
         thread_yield();
     }
@@ -3366,6 +4407,9 @@ uint64_t syscall_dispatch(uint64_t a, uint64_t b, uint64_t c,
        mid-call, so those entries stay unfinished - which is worth seeing. */
     if (entry != NULL && tracer != NULL) {
         tracer->end(entry, result);
+    }
+    if (proc != NULL) {
+        now_running.left = efi_uptime_us();
     }
     return result;
 }
@@ -3408,30 +4452,99 @@ size_t program_memory(void) {
 /* Called by a trap stub with the vector that fired, just before the program
    is ended. Naming it is the difference between "something went wrong" and
    knowing a program used an instruction this machine never turned on. */
-void trap_report(unsigned vector, const uint64_t *frame) {
-    static const char *const named[] = {
-        [0] = "divide by zero", [1] = "debug", [3] = "breakpoint",
-        [4] = "overflow", [5] = "bound range", [6] = "illegal instruction",
-        [7] = "no maths unit", [8] = "double fault", [10] = "bad task switch",
-        [11] = "segment not there", [12] = "bad stack", [13] = "protection fault",
-        [16] = "maths error", [17] = "misaligned", [19] = "SSE error",
-    };
-    const char *name = vector < sizeof named / sizeof named[0] && named[vector] != NULL
-                     ? named[vector] : "exception";
+/* The registers of a program at an exception, as trap_common and
+   page_fault_entry save them: everything, and the processor's own frame. */
+struct trap_regs {
+    uint64_t r15, r14, r13, r12, r11, r10, r9, r8, rbp, rdx, rcx, rbx, rax, rsi, rdi;
+    uint64_t err, rip, cs, rflags, rsp, ss;
+};
 
-    /* Past the RDI the stub kept, the processor's own frame: an error code
-       for the vectors that have one, then where it was. */
-    bool coded = vector == 8 || (vector >= 10 && vector <= 14) || vector == 17 ||
-                 vector == 21 || vector == 29 || vector == 30;
+#define SIGILL  4
+#define SIGTRAP 5
+#define SIGBUS  7
+#define SIGFPE  8
 
-    const uint64_t *cpu = frame + (coded ? 2 : 1);
+/* The program's handler for sig, run instead of the instruction that went
+   wrong: the frame Linux builds, from every register, with si_addr. False
+   if it has none to run - or this is not the program's own fault. */
+static bool fault_deliver(uint64_t sig, int code, uint64_t addr, unsigned vector,
+                          struct trap_regs *r) {
+    struct sig_action *a = action_for(sig);
 
-    dbg("trap %u (%s) at %x code %x: killed\n", (uint64_t)vector, name,
-        cpu[0], coded ? frame[1] : 0);
+    if (proc == NULL || (r->cs & 3) != 3 || a == NULL || !handled(sig) ||
+        (blocked & 1ull << (sig - 1)) != 0) {
+        return false;
+    }
+    uint64_t at = ((r->rsp - 128 - sizeof(struct sig_frame)) & ~15ull) - 8;
+    struct sig_frame *frame = (struct sig_frame *)at;
+
+    if (!user_range(at, sizeof *frame)) {
+        return false;
+    }
+    memset(frame, 0, sizeof *frame);
+    frame->restorer = a->restorer;
+    frame->uc.sigmask = blocked;
+    blocked |= a->mask | ((a->flags & SA_NODEFER) != 0 ? 0 : 1ull << (sig - 1));
+
+    uint64_t *g = frame->uc.gregs;
+
+    g[G_R8] = r->r8;
+    g[G_R9] = r->r9;
+    g[G_R10] = r->r10;
+    g[G_R11] = r->r11;
+    g[G_R12] = r->r12;
+    g[G_R13] = r->r13;
+    g[G_R14] = r->r14;
+    g[G_R15] = r->r15;
+    g[G_RDI] = r->rdi;
+    g[G_RSI] = r->rsi;
+    g[G_RBP] = r->rbp;
+    g[G_RBX] = r->rbx;
+    g[G_RDX] = r->rdx;
+    g[G_RAX] = r->rax;
+    g[G_RCX] = r->rcx;
+    g[G_RSP] = r->rsp;
+    g[G_RIP] = r->rip;
+    g[G_EFLAGS] = r->rflags;
+    g[19] = r->err;                 /* REG_ERR, REG_TRAPNO, REG_CR2 */
+    g[20] = vector;
+    g[22] = addr;
+    frame->info.signo = (int32_t)sig;
+    frame->info.code = code;
+    *(uint64_t *)frame->info.rest = addr;   /* si_addr */
+
+    r->rdi = sig;
+    r->rsi = (uint64_t)&frame->info;
+    r->rdx = (uint64_t)&frame->uc;
+    r->rax = 0;
+    r->rsp = at;
+    r->rip = a->handler;
+    if ((a->flags & SA_RESETHAND) != 0) {
+        *a = (struct sig_action){ 0 };
+    }
+    return true;
 }
 
-/* Called by page_fault_entry with the address that faulted, and where from. */
-void page_fault(uint64_t addr, uint64_t rip) {
+/* Called by trap_common: the signal the exception is - to the program's
+   handler if it has one (and this returns, into it), else its end, as on
+   Linux: a shell says "Segmentation fault", "Illegal instruction". */
+void trap_signal(unsigned vector, struct trap_regs *r) {
+    uint64_t sig = vector == 0 || vector == 16 || vector == 19 ? SIGFPE :
+                   vector == 1 || vector == 3 ? SIGTRAP :
+                   vector == 6 ? SIGILL : vector == 17 ? SIGBUS : SIGSEGV;
+    int code = sig == SIGTRAP ? 0x80 : sig == SIGILL ? 2 /* ILL_ILLOPN */ :
+               sig == SIGFPE ? 1 /* FPE_INTDIV */ : 0x80 /* SI_KERNEL */;
+
+    if (fault_deliver(sig, code, r->rip, vector, r)) {
+        return;
+    }
+    dbg("trap %u at %x code %x: %s %u, signal %u\n", (uint64_t)vector, r->rip, r->err,
+        proc != NULL ? proc->name : "?", (uint64_t)(proc != NULL ? proc->pid : 0), sig);
+    process_exit(SIGNALLED | (int)sig);
+}
+
+/* Called by page_fault_entry with the address that faulted, and the registers. */
+void page_fault(uint64_t addr, struct trap_regs *r) {
     struct kernel_mark mark = kernel_began();
 
     /* Something promised to a mapping comes first: the page is not merely
@@ -3440,8 +4553,15 @@ void page_fault(uint64_t addr, uint64_t rip) {
         kernel_ended(mark);
         return;
     }
-    dbg("fault at %x from %x: killed\n", addr, rip);
-    process_exit(PROGRAM_KILLED);
+    /* SEGV_MAPERR where nothing is, SEGV_ACCERR where something is that may
+       not be touched so - what a JavaScript engine's guard pages rely on. */
+    if (fault_deliver(SIGSEGV, (r->err & 1) != 0 ? 2 : 1, addr, 14, r)) {
+        kernel_ended(mark);
+        return;
+    }
+    dbg("fault at %x from %x: %s %u killed\n", addr, r->rip, proc != NULL ? proc->name : "?",
+        (uint64_t)(proc != NULL ? proc->pid : 0));
+    process_exit(SIGNALLED | SIGSEGV);
 }
 
 /* ---- loading -----------------------------------------------------------
@@ -3679,6 +4799,8 @@ int program_load(const struct fs_file *file, uint64_t *entry) {
     if (file->size < sizeof header || read_at(file, 0, &header, sizeof header) != 0 ||
         header.ident[0] != 0x7F || header.ident[1] != 'E' ||
         header.ident[2] != 'L' || header.ident[3] != 'F') {
+        dbg("load: not ELF: size %u start %x read %d magic %x\n", (uint64_t)file->size, (uint64_t)file->start,
+            (uint64_t)(int64_t)read_at(file, 0, &header, sizeof header), (uint64_t)header.ident[0]);
         err = PROGRAM_EINVAL;
         goto done;
     }
@@ -3688,6 +4810,7 @@ int program_load(const struct fs_file *file, uint64_t *entry) {
     /* Something linked to run at a fixed address goes there, in low memory;
        anything position-independent goes in its region. */
     if (vm_base() == 0) {
+        dbg("load: no region\n");
         err = PROGRAM_EINVAL;
         goto done;
     }
@@ -3877,6 +5000,8 @@ static int program_run(uint64_t entry, unsigned argc, const char *const *argv,
        file of its own in /var/log. What it did stays in the ring to be
        written out when the machine is next idle. */
     process_named(argc > 0 ? argv[0] : "program");
+    process_cmdline(argc, argv);
+    now_running.left = efi_uptime_us();
     return user_enter(entry, rsp);
 }
 
@@ -3955,6 +5080,26 @@ static uint64_t sys_eventfd2(uint64_t count, uint64_t flags, uint64_t c) {
     return with_cloexec(fd, (flags & O_CLOEXEC) != 0);
 }
 
+/* inotify: a descriptor that is told what to watch and never has anything to
+   say - nothing here watches files change. A program waiting on it for a
+   change it would then reread carries on as on a machine where none came:
+   Chromium's, GTK's file chooser, a desktop's menu. */
+static uint64_t sys_inotify_init1(uint64_t flags, uint64_t b, uint64_t c) {
+    (void)b;
+    (void)c;
+    return sys_eventfd2(0, flags & (O_NONBLOCK | O_CLOEXEC), 0);
+}
+
+static uint64_t sys_inotify_add_watch(uint64_t fd, uint64_t path, uint64_t mask) {
+    static uint32_t next;
+
+    (void)mask;
+    if (handle_of(fd) == NULL) {
+        return ERR(EBADF);
+    }
+    return user_string(path) == NULL ? ERR(EFAULT) : ++next;
+}
+
 static uint64_t sys_eventfd(uint64_t count, uint64_t b, uint64_t c) {
     (void)b;
     return sys_eventfd2(count, 0, c);
@@ -3966,6 +5111,8 @@ static uint64_t sys_eventfd(uint64_t count, uint64_t b, uint64_t c) {
    read (syscall_dispatch). */
 #define AF_UNIX     1
 #define SOCK_STREAM 1
+#define SOCK_DGRAM  2
+#define SOCK_SEQPACKET 5
 #define SOCK_TYPE   0xF
 
 bool pair_new(struct handle out[2], uint32_t flags) {
@@ -3991,12 +5138,249 @@ bool pair_new(struct handle out[2], uint32_t flags) {
 }
 
 void handle_close(struct handle *h) {
+    ofd_drop(h);
     if (h->start == PIPE_MARK) {
         pipe_release(h);
     } else if (h->start == SOCK_MARK) {
         sock_drop(h);
     }
     h->used = 0;
+}
+
+/* ---- messages, and descriptors passed, on a socketpair ----------------------
+ *
+ * A SEQPACKET or DGRAM pair keeps each write as one message, and a read
+ * takes one - the rest of a message too long for it is lost, as Linux has
+ * it. Either kind carries descriptors with what is sent (SCM_RIGHTS): a copy
+ * of each, its pipe, socket or file held as dup would hold it, waiting with
+ * the bytes it came with and handed out as a new descriptor of the process
+ * that reads them. Chromium's processes and Firefox's talk this way, and
+ * pass each other the memory they share. */
+
+/* What fd is, held once more for somewhere else to have it; false if fd is not. */
+bool handle_share(uint64_t fd, struct handle *out) {
+    struct handle *h = handle_of(fd);
+
+    if (h == NULL) {
+        return false;
+    }
+    *out = *h;
+    out->used = 1;                  /* not close-on-exec where it arrives */
+    pipe_hold(h);
+    ofd_hold(h);
+    if (h->start == SOCK_MARK) {
+        sock_hold(h);
+    }
+    if (ops_of(h) != NULL) {
+        ops_of(h)->hold(h);
+    }
+    return true;
+}
+
+/* A held copy let go of: what closing a descriptor of it would do. */
+static void handle_release(struct handle *h) {
+    if (ops_of(h) != NULL) {
+        ops_of(h)->drop(h);
+    }
+    handle_close(h);
+}
+
+static bool pmsg_push(struct pipe *p, uint64_t at, uint32_t len, const struct handle *fds, uint32_t nfd) {
+    p->last_pid = proc != NULL ? proc->pid : 0;
+    if (p->nmsgs == p->msg_room) {
+        uint32_t room = p->msg_room == 0 ? 4 : p->msg_room * 2;
+        struct pmsg *more = mem_alloc(room * sizeof *more);
+
+        if (more == NULL) {
+            return false;
+        }
+        if (p->msgs != NULL) {
+            memcpy(more, p->msgs, p->nmsgs * sizeof *more);
+            mem_free(p->msgs);
+        }
+        p->msgs = more;
+        p->msg_room = room;
+    }
+    struct pmsg *m = &p->msgs[p->nmsgs++];
+
+    m->at = at;
+    m->len = len;
+    m->nfd = nfd;
+    m->pid = p->last_pid;
+    if (nfd > 0) {
+        memcpy(m->fd, fds, nfd * sizeof *fds);
+    }
+    return true;
+}
+
+static uint64_t pair_put(struct handle *h, struct pipe *p, const struct iovec *iov, uint64_t n,
+                         const struct handle *fds, uint32_t nfd, bool nonblock) {
+    uint64_t total = 0, done = 0;
+
+    for (uint64_t i = 0; i < n; i++) {
+        if (!user_range(iov[i].base, iov[i].length)) {
+            return ERR(EFAULT);
+        }
+        total += iov[i].length;
+    }
+    if (p->packets) {
+        if (total > PIPE_CAP) {
+            return ERR(EMSGSIZE);
+        }
+        /* A message goes in whole: room for all of it first. */
+        while (PIPE_CAP - (p->len - p->read_at) < total) {
+            if (nonblock || (h->offset & O_NONBLOCK) != 0 || thread_only()) {
+                return ERR(EAGAIN);
+            }
+            if (interrupt_check()) {
+                return ERR(EINTR);
+            }
+            thread_yield();
+            if (pair_out(h) != p) {
+                return ERR(EPIPE);
+            }
+        }
+        if (!pmsg_push(p, p->wrote, (uint32_t)total, fds, nfd)) {
+            return ERR(ENOBUFS);
+        }
+        for (uint64_t i = 0; i < n; i++) {
+            pipe_put(p, (const char *)iov[i].base, iov[i].length);
+        }
+        return total;
+    }
+    if (nfd > 0 && !pmsg_push(p, p->wrote, 0, fds, nfd)) {
+        return ERR(ENOBUFS);
+    }
+    p->last_pid = proc != NULL ? proc->pid : 0;
+    for (uint64_t i = 0; i < n; i++) {
+        uint64_t r = iov[i].length != 0 ? pipe_write(h, p, (const char *)iov[i].base, iov[i].length) : 0;
+
+        if ((int64_t)r < 0) {
+            return done > 0 ? done : r;
+        }
+        done += r;
+    }
+    return done;
+}
+
+static uint64_t pair_take(struct handle *h, struct pipe *p, const struct iovec *iov, uint64_t n,
+                          struct handle *fds, uint32_t *nfd, bool *cut) {
+    uint64_t want = 0, done = 0;
+
+    pair_sender = p->last_pid;
+
+    for (uint64_t i = 0; i < n; i++) {
+        if (!user_range(iov[i].base, iov[i].length)) {
+            return ERR(EFAULT);
+        }
+        want += iov[i].length;
+    }
+    while (!readable(h)) {
+        if ((h->offset & O_NONBLOCK) != 0 || (cut != NULL && *cut)) {
+            return ERR(EAGAIN);     /* *cut on the way in: MSG_DONTWAIT */
+        }
+        if (thread_only()) {
+            break;
+        }
+        if (interrupt_check()) {
+            return ERR(EINTR);
+        }
+        thread_yield();
+    }
+    if (cut != NULL) {
+        *cut = false;
+    }
+    if (nfd != NULL) {
+        *nfd = 0;
+    }
+    uint64_t avail = p->len - p->read_at, limit = avail;
+    struct pmsg *m = p->nmsgs > 0 ? &p->msgs[0] : NULL;
+    bool whole = false;
+
+    if (p->packets) {
+        if (m == NULL) {
+            return 0;               /* nothing, and nobody left to send: the end */
+        }
+        limit = m->len;
+        whole = true;
+    } else if (m != NULL) {
+        if (m->at <= p->taken) {
+            whole = true;           /* its descriptors come with its first byte */
+            limit = p->nmsgs > 1 ? p->msgs[1].at - p->taken : avail;
+        } else {
+            limit = m->at - p->taken;   /* up to it, not into it */
+        }
+    }
+    limit = limit < avail ? limit : avail;
+    for (uint64_t i = 0; i < n && done < limit && done < want; i++) {
+        uint64_t k = iov[i].length < limit - done ? iov[i].length : limit - done;
+
+        done += pipe_read(p, (char *)iov[i].base, k);
+    }
+    if (p->packets && done < m->len) {
+        pipe_read(p, NULL, m->len - done);     /* what did not fit is lost */
+        if (cut != NULL) {
+            *cut = true;
+        }
+    }
+    if (whole) {
+        pair_sender = m->pid;
+        for (uint32_t k = 0; k < m->nfd; k++) {
+            if (fds != NULL && nfd != NULL) {
+                fds[(*nfd)++] = m->fd[k];
+            } else {
+                handle_release(&m->fd[k]);  /* read without asking for them */
+            }
+        }
+        memmove(p->msgs, p->msgs + 1, (p->nmsgs - 1) * sizeof *m);
+        p->nmsgs--;
+    }
+    return done;
+}
+
+/* For the ipc/unix module: a pair end's SO_PASSCRED, set or cleared (on < 0
+   leaves it), and what it is - bit 0 passcred, bit 1 a packet pair; -1 if
+   fd is no pair end. pair_sender: who sent what recvmsg last took. */
+int pair_sender;
+
+int pair_flags(uint64_t fd, int on) {
+    struct handle *h = handle_of(fd);
+    struct pipe *p = h != NULL && h->start == PIPE_MARK && h->size == PIPE_PAIR ? pipe_of(h) : NULL;
+
+    if (p == NULL) {
+        return -1;
+    }
+    if (on >= 0) {
+        p->passcred = on != 0;
+    }
+    return (p->passcred ? 1 : 0) | (p->packets ? 2 : 0);
+}
+
+/* For the ipc/unix module's sendmsg and recvmsg on a pair end: the iovecs at
+   iov in the program's memory, and descriptors to send or that came. */
+uint64_t pair_send(uint64_t fd, uint64_t iov, uint64_t n, const struct handle *fds, uint32_t nfd,
+                   bool nonblock) {
+    struct handle *h = handle_of(fd);
+    struct pipe *p = h != NULL && h->start == PIPE_MARK && h->size == PIPE_PAIR ? pair_out(h) : NULL;
+
+    if (h == NULL || !user_range(iov, n * sizeof(struct iovec))) {
+        return ERR(h == NULL ? EBADF : EFAULT);
+    }
+    return p == NULL ? ERR(EPIPE) : pair_put(h, p, (const struct iovec *)iov, n, fds, nfd, nonblock);
+}
+
+uint64_t pair_recv(uint64_t fd, uint64_t iov, uint64_t n, struct handle *fds, uint32_t *nfd,
+                   bool *cut) {
+    struct handle *h = handle_of(fd);
+    struct pipe *p = h != NULL && h->start == PIPE_MARK && h->size == PIPE_PAIR ? pipe_of(h) : NULL;
+
+    if (h == NULL || p == NULL) {
+        return ERR(EBADF);
+    }
+    if (!user_range(iov, n * sizeof(struct iovec))) {
+        return ERR(EFAULT);
+    }
+    return pair_take(h, p, (const struct iovec *)iov, n, fds, nfd, cut);
 }
 
 static uint64_t sys_socketpair(uint64_t domain, uint64_t type, uint64_t c) {
@@ -4008,7 +5392,9 @@ static uint64_t sys_socketpair(uint64_t domain, uint64_t type, uint64_t c) {
     if (domain != AF_UNIX) {
         return ERR(EAFNOSUPPORT);
     }
-    if ((type & SOCK_TYPE) != SOCK_STREAM) {
+    uint32_t kind = (uint32_t)type & SOCK_TYPE;
+
+    if (kind != SOCK_STREAM && kind != SOCK_DGRAM && kind != SOCK_SEQPACKET) {
         return ERR(EOPNOTSUPP);
     }
     if (!user_range(arg[3], 8)) {
@@ -4016,6 +5402,9 @@ static uint64_t sys_socketpair(uint64_t domain, uint64_t type, uint64_t c) {
     }
     if (!pair_new(pair, (uint32_t)type)) {
         return ERR(ENFILE);
+    }
+    if (kind != SOCK_STREAM) {
+        pipe_of(&pair[0])->packets = pipe_of(&pair[1])->packets = true;
     }
     fd[0] = give_handle(pair[0]);
     fd[1] = (int64_t)fd[0] < 0 ? fd[0] : give_handle(pair[1]);
@@ -4056,7 +5445,7 @@ static int wait_status(int code) {
 static void process_end(int code) {
     struct process *p = proc, *parent;
 
-    for (unsigned fd = 0; fd < PROGRAM_FILES; fd++) {
+    for (unsigned fd = 0; fd < file_room; fd++) {
         if (handles[fd].used != 0) {
             sys_close(fd, 0, 0);
         }
@@ -4166,7 +5555,7 @@ extern uint64_t user_flags;
 /* One more descriptor on everything a file table holds: a fork's child has
    them too, and its closing them must not take them from its parent. */
 static void hold_all(struct handle *table) {
-    for (unsigned fd = 0; fd < PROGRAM_FILES; fd++) {
+    for (unsigned fd = 0; fd < file_room; fd++) {
         if (table[fd].used == 0) {
             continue;
         }
@@ -4179,6 +5568,7 @@ static void hold_all(struct handle *table) {
         if (pipe_of(&table[fd]) != NULL) {
             pipe_hold(&table[fd]);
         }
+        ofd_hold(&table[fd]);
     }
 }
 
@@ -4207,12 +5597,26 @@ static uint64_t fork_on(uint64_t stack, bool share) {
     child->ppid = parent->pid;
     child->pgid = parent->pgid;
     child->sid = parent->sid;
-    memcpy(child->files, parent->files, sizeof child->files);
-    memcpy(child->writers, parent->writers, sizeof child->writers);
+    if (child->files_room < parent->files_room) {
+        struct handle *bigger = mem_alloc(parent->files_room * sizeof *bigger);
+
+        if (bigger == NULL) {
+            return FS_ENOSPC;
+        }
+        mem_free(child->files);
+        child->files = bigger;
+        child->files_room = parent->files_room;
+    }
+    memcpy(child->files, parent->files, parent->files_room * sizeof *child->files);
     strcpy(child->cwd, fs_cwd());
     child->brk = parent->brk;
     child->map = parent->map;
-    child->times = (struct times){ .started = efi_uptime_us() };
+    child->map_high = parent->map_high;
+    child->times = (struct times){ .started = efi_uptime_us(), .left = efi_uptime_us() };
+    if (parent->cmdline != NULL && (child->cmdline = mem_alloc(parent->cmdline_len)) != NULL) {
+        memcpy(child->cmdline, parent->cmdline, parent->cmdline_len);
+        child->cmdline_len = parent->cmdline_len;
+    }
     memcpy(child->actions, parent->actions, sizeof child->actions);
     if (parent->maps != NULL) {
         /* Its own copy, even sharing memory: an execve empties the child's. */
@@ -4224,6 +5628,8 @@ static uint64_t fork_on(uint64_t stack, bool share) {
         child->maps_room = parent->maps_room;
     }
     memcpy(child->name, parent->name, sizeof child->name);
+    memcpy(child->exe, parent->exe, sizeof child->exe);
+    child->cred = parent->cred;
     if (share) {
         child->space = parent->space;
         child->borrowed = true;
@@ -4281,6 +5687,11 @@ static uint64_t start_thread(uint64_t flags, uint64_t stack, uint64_t parent_tid
 
 static uint64_t clone_with(uint64_t flags, uint64_t stack, uint64_t parent_tid,
                            uint64_t child_tid, uint64_t tls) {
+    /* Namespaces are not had here: asked for, the answer a kernel built
+       without them gives - and a browser then runs without its sandbox. */
+    if ((flags & 0x7E020000u) != 0) {   /* CLONE_NEWNS ... CLONE_NEWNET */
+        return ERR(EINVAL);
+    }
     /* vfork, and posix_spawn built on it: shared memory until the child
        starts a program, its parent waiting. */
     if ((flags & CLONE_VFORK) && !(flags & CLONE_THREAD)) {
@@ -4330,46 +5741,217 @@ static uint64_t sys_rt_sigtimedwait(uint64_t set, uint64_t info, uint64_t timeou
 }
 /* ---- timers ---------------------------------------------------------------
  *
- * Nothing can interrupt a running program to say its time is up, so a timer
- * is taken and never goes off: a program that sets one to cut a slow job
- * short - vim, for a regex that is taking too long - carries on as it would
- * on a machine fast enough never to need it. */
+ * A timer is a deadline and a signal. Every wait gives way to the others
+ * through thread_yield, and each time it does the timers due are sent: a
+ * program waiting - `timeout` in sigsuspend, a poll with an alarm behind it -
+ * is woken as on Linux. One computing without a syscall is not interrupted
+ * (nothing preempts here); it hears at its next. alarm and setitimer's real
+ * timer are one more per process, id -1. */
 
-static uint64_t sys_timer_create(uint64_t clock, uint64_t event, uint64_t id) {
-    static int32_t next;
+#define TIMERS       32
+#define SIGALRM      14
+#define SIGEV_NONE   1
+#define TIMER_ABSTIME 1
+#define ALARM_ID     (-1)
 
-    (void)clock;
-    (void)event;
-    if (!user_range(id, 4)) {
-        return ERR(EFAULT);
+static struct ktimer {
+    int      pid;                   /* 0: free */
+    int32_t  id;
+    int      signo;                 /* 0: SIGEV_NONE */
+    bool     realtime;              /* an absolute time is on CLOCK_REALTIME */
+    uint64_t due, every;            /* ms of uptime, 0 unarmed; and the period */
+} timers[TIMERS];
+
+void timers_tick(void) {
+    uint64_t now = 0;
+
+    for (unsigned i = 0; i < TIMERS; i++) {
+        struct ktimer *t = &timers[i];
+
+        if (t->pid == 0 || t->due == 0) {
+            continue;
+        }
+        now = now != 0 ? now : efi_uptime_ms();
+        if (t->due > now) {
+            continue;
+        }
+        struct process *p = proc_find(t->pid);
+
+        if (p == NULL || p->zombie) {
+            *t = (struct ktimer){ 0 };  /* its process is gone */
+            continue;
+        }
+        t->due = t->every != 0 ? now + t->every : 0;
+        if (t->signo != 0) {
+            signal_to(p, (uint64_t)t->signo);
+        }
     }
-    *(int32_t *)id = next++;
-    return 0;
 }
 
-/* timer_settime's old value, or timer_gettime's: never running. */
+static struct ktimer *timer_of(int32_t id) {
+    for (unsigned i = 0; i < TIMERS; i++) {
+        if (timers[i].pid == proc->pid && timers[i].id == id) {
+            return &timers[i];
+        }
+    }
+    return NULL;
+}
+
+static struct ktimer *timer_new(int32_t id, int signo) {
+    for (unsigned i = 0; i < TIMERS; i++) {
+        struct process *p = timers[i].pid != 0 ? proc_find(timers[i].pid) : NULL;
+
+        if (timers[i].pid == 0 || p == NULL || p->zombie) {
+            timers[i] = (struct ktimer){ .pid = proc->pid, .id = id, .signo = signo };
+            return &timers[i];
+        }
+    }
+    return NULL;
+}
+
+static uint64_t timer_left(const struct ktimer *t) {
+    uint64_t now = efi_uptime_ms();
+
+    return t == NULL || t->due == 0 ? 0 : t->due > now ? t->due - now : 1;
+}
+
+/* ms as a timespec (nsec) or a timeval (usec) at out. */
+static void put_time(uint64_t out, uint64_t ms, bool usec) {
+    ((uint64_t *)out)[0] = ms / 1000;
+    ((uint64_t *)out)[1] = (ms % 1000) * (usec ? 1000 : 1000000);
+}
+
+static uint64_t get_time(uint64_t at, bool usec) {
+    const uint64_t *v = (const uint64_t *)at;
+
+    return v[0] * 1000 + v[1] / (usec ? 1000 : 1000000);
+}
+
+static void timer_arm(struct ktimer *t, uint64_t value, uint64_t interval, bool absolute) {
+    uint64_t now = efi_uptime_ms();
+
+    if (absolute && value != 0) {
+        uint64_t clock = t->realtime ? realtime_ms() : now;
+
+        value = value > clock ? value - clock : 1;
+    }
+    t->due = value != 0 ? now + value : 0;
+    t->every = interval;
+}
+
+static uint64_t sys_timer_create(uint64_t clock, uint64_t event, uint64_t id) {
+    int signo = SIGALRM;
+
+    if (!user_range(id, 4) || (event != 0 && !user_range(event, 16))) {
+        return ERR(EFAULT);
+    }
+    if (event != 0) {
+        signo = *(const int32_t *)(event + 12) == SIGEV_NONE ? 0 : *(const int32_t *)(event + 8);
+    }
+    for (int32_t want = 0; want < TIMERS; want++) {
+        if (timer_of(want) == NULL) {
+            struct ktimer *t = timer_new(want, signo);
+
+            if (t == NULL) {
+                return ERR(EAGAIN);
+            }
+            t->realtime = clock == 0;       /* CLOCK_REALTIME */
+            *(int32_t *)id = want;
+            return 0;
+        }
+    }
+    return ERR(EAGAIN);
+}
+
 static uint64_t sys_timer_settime(uint64_t id, uint64_t flags, uint64_t spec) {
+    struct ktimer *t = timer_of((int32_t)id);
     uint64_t old = arg[3];
 
-    (void)id;
-    (void)flags;
-    (void)spec;
-    if (old != 0) {
-        if (!user_range(old, 32)) {
-            return ERR(EFAULT);
-        }
-        memset((void *)old, 0, 32);
+    if (t == NULL) {
+        return ERR(EINVAL);
     }
+    if (!user_range(spec, 32) || (old != 0 && !user_range(old, 32))) {
+        return ERR(EFAULT);
+    }
+    if (old != 0) {
+        put_time(old, t->every, false);
+        put_time(old + 16, timer_left(t), false);
+    }
+    timer_arm(t, get_time(spec + 16, false), get_time(spec, false), (flags & TIMER_ABSTIME) != 0);
     return 0;
 }
 
 static uint64_t sys_timer_gettime(uint64_t id, uint64_t spec, uint64_t c) {
-    (void)id;
+    struct ktimer *t = timer_of((int32_t)id);
+
     (void)c;
+    if (t == NULL) {
+        return ERR(EINVAL);
+    }
     if (!user_range(spec, 32)) {
         return ERR(EFAULT);
     }
-    memset((void *)spec, 0, 32);
+    put_time(spec, t->every, false);
+    put_time(spec + 16, timer_left(t), false);
+    return 0;
+}
+
+static uint64_t sys_timer_delete(uint64_t id, uint64_t b, uint64_t c) {
+    struct ktimer *t = timer_of((int32_t)id);
+
+    (void)b;
+    (void)c;
+    if (t == NULL) {
+        return ERR(EINVAL);
+    }
+    *t = (struct ktimer){ 0 };
+    return 0;
+}
+
+/* alarm, and setitimer/getitimer's ITIMER_REAL: the process's one timer. */
+static uint64_t sys_alarm(uint64_t seconds, uint64_t b, uint64_t c) {
+    struct ktimer *t = timer_of(ALARM_ID);
+    uint64_t left = (timer_left(t) + 999) / 1000;
+
+    (void)b;
+    (void)c;
+    if (t == NULL && seconds != 0 && (t = timer_new(ALARM_ID, SIGALRM)) == NULL) {
+        return 0;
+    }
+    if (t != NULL) {
+        timer_arm(t, seconds * 1000, 0, false);
+    }
+    return left;
+}
+
+static uint64_t sys_getitimer(uint64_t which, uint64_t value, uint64_t c) {
+    struct ktimer *t = which == 0 ? timer_of(ALARM_ID) : NULL;
+
+    (void)c;
+    if (!user_range(value, 32)) {
+        return ERR(EFAULT);
+    }
+    put_time(value, t != NULL ? t->every : 0, true);
+    put_time(value + 16, timer_left(t), true);
+    return 0;
+}
+
+static uint64_t sys_setitimer(uint64_t which, uint64_t value, uint64_t old) {
+    struct ktimer *t = timer_of(ALARM_ID);
+
+    if (which != 0) {
+        return 0;                   /* the CPU-time ones: never due */
+    }
+    if (old != 0 && sys_getitimer(which, old, 0) != 0) {
+        return ERR(EFAULT);
+    }
+    if (value == 0 || !user_range(value, 32)) {
+        return value == 0 ? 0 : ERR(EFAULT);
+    }
+    if (t == NULL && (t = timer_new(ALARM_ID, SIGALRM)) == NULL) {
+        return ERR(EAGAIN);
+    }
+    timer_arm(t, get_time(value + 16, true), get_time(value, true), false);
     return 0;
 }
 
@@ -4569,6 +6151,10 @@ static uint64_t sys_execve(uint64_t path, uint64_t argv, uint64_t envp) {
         return ERR(ENOMEM);
     }
     strcpy(held->name, given);
+    if (proc_fd_target(given, held->script, sizeof held->script) != NULL) {
+        strcpy(held->name, held->script);   /* /proc/self/exe: the program itself -
+                                               how Chromium starts its helpers */
+    }
     argc = copy_list(argv, held->line, sizeof held->line, &used, held->words, EXEC_ARGS);
     envc = copy_list(envp, held->line, sizeof held->line, &used, held->env, EXEC_ENV);
     if (argc == 0) {
@@ -4636,7 +6222,7 @@ static uint64_t sys_execve(uint64_t path, uint64_t argv, uint64_t envp) {
        for a vfork's child, the parent's memory is handed back and the
        child has a region of its own - and what it had open to close on exec. */
     thread_end_others();
-    for (unsigned fd = 0; fd < PROGRAM_FILES; fd++) {
+    for (unsigned fd = 0; fd < file_room; fd++) {
         if ((handles[fd].used & HANDLE_CLOEXEC) != 0) {
             sys_close(fd, 0, 0);
         }
@@ -4664,11 +6250,15 @@ static uint64_t sys_execve(uint64_t path, uint64_t argv, uint64_t envp) {
         }
     }
     process_named(held->words[0]);
+    process_cmdline(argc, (const char *const *)held->words);
+    strcpy(proc->exe, file.name);
+    proc->cred.keepcaps = proc->cred.capable = 0;
     mem_free(held);
 
     /* The syscall returns into the new program: its entry, its stack, every
        register clear, no thread data yet. */
     wrmsr(MSR_FS_BASE, 0);
+    wrmsr(MSR_GS_BASE, 0);
     memset(user_frame, 0, sizeof *user_frame);
     user_frame->rip = entry;
     user_frame->rsp = rsp;

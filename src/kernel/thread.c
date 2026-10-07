@@ -6,7 +6,8 @@
 #include "string.h"
 
 #define MSR_FS_BASE   0xC0000100
-#define THREADS       64            /* at once, over every process */
+#define MSR_GS_BASE   0xC0000101    /* a program's too: the kernel never uses GS */
+#define THREADS       512           /* at once, over every process: a browser has hundreds */
 #define STACK_PAGES   (THREAD_STACK_BYTES / 4096)  /* a thread's kernel stack, with the
                                        thread itself at the bottom of it */
 
@@ -24,7 +25,7 @@ struct thread {
     uint64_t sigmask;               /* the signals it has blocked: each thread its own */
     uint64_t clear_tid;
     /* What belongs to whoever is running, put aside while it is not. */
-    uint64_t fs_base, kernel_rsp, args[6];
+    uint64_t fs_base, gs_base, kernel_rsp, args[6];
     struct user_regs *frame;
     struct user_regs regs;          /* where a new one starts */
     /* Its x87 and SSE registers, while another thread has the processor: a
@@ -89,6 +90,7 @@ static void switch_to(struct thread *next) {
     struct thread *prev = current;
 
     prev->fs_base = rdmsr(MSR_FS_BASE);
+    prev->gs_base = rdmsr(MSR_GS_BASE);
     prev->kernel_rsp = *kernel_rsp();
     prev->frame = user_frame;
     memcpy(prev->args, syscall_args(), sizeof prev->args);
@@ -97,6 +99,7 @@ static void switch_to(struct thread *next) {
     }
     current = next;
     wrmsr(MSR_FS_BASE, next->fs_base);
+    wrmsr(MSR_GS_BASE, next->gs_base);
     *kernel_rsp() = next->kernel_rsp;
     user_frame = next->frame;
     memcpy(syscall_args(), next->args, sizeof next->args);
@@ -135,11 +138,19 @@ static struct thread *leader_of(void *proc) {
     return NULL;
 }
 
+void timers_tick(void);            /* syscall.c: the timers that are due, sent */
+void process_yielded(uint64_t us); /* syscall.c: time others had, not the caller's */
+uint64_t efi_uptime_us(void);
+
 void thread_yield(void) {
+    timers_tick();
     struct thread *next = next_one(false);
 
     if (next != NULL) {
+        uint64_t began = efi_uptime_us();
+
         switch_to(next);
+        process_yielded(efi_uptime_us() - began);
     }
     if (current->exiting) {
         current->exiting = false;
@@ -219,7 +230,7 @@ static struct thread *thread_new(void *proc, bool leader, const struct user_regs
 
     *t = (struct thread){
         .bottom = (uint8_t *)(t + 1), .proc = proc, .leader = leader, .tid = next_tid++,
-        .sigmask = sigmask, .fs_base = fs,
+        .sigmask = sigmask, .fs_base = fs, .gs_base = rdmsr(MSR_GS_BASE),
         /* Its syscalls land at the top of its own stack. */
         .kernel_rsp = base + STACK_PAGES * 4096 - 64,
         .regs = *regs,

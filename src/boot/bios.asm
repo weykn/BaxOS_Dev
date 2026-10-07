@@ -27,7 +27,7 @@ BITS 16
 ORG 0x8000
 DEFAULT ABS
 
-KERNEL_BYTES equ 0x20000            ; boot.h
+KERNEL_BYTES equ 0x28000            ; boot.h
 BOOT_MAGIC   equ 0x536F7861426     ; boot.h
 
 E820       equ 0x0500

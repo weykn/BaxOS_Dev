@@ -252,7 +252,7 @@ FIRMWARE = $(if $(filter bios,$(BOOT)),,-drive if=pflash$(comma)format=raw$(comm
 run: $(IMAGE)
 	@cp -n $(OVMF_VARS) $(BUILD)/ovmf_vars.fd 2>/dev/null || true
 	qemu-system-x86_64 $(ACCEL) $(FIRMWARE) \
-	    -drive format=raw,file=$(IMAGE) $(NIC) -m $(MEM) -usb -device usb-tablet
+	    -drive format=raw,file=$(IMAGE) $(NIC) -m $(MEM) -device qemu-xhci -device usb-tablet
 
 clean:
 	rm -rf $(BUILD)

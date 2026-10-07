@@ -1,6 +1,13 @@
-/* Plain HTTP/1.0 over a socket, and the one DNS query it needs, to the
- * nameserver in /etc/resolv.conf. HTTP/1.0 so that no server answers in
- * chunks: the body runs to the close. */
+/* Plain HTTP over a socket, and the one DNS query it needs, to the
+ * nameserver in /etc/resolv.conf.
+ *
+ * As apt does it: the name is looked up once, and one connection carries
+ * every request to the same server - HTTP/1.1, each body read to its
+ * Content-Length so the next request can follow on the same socket. A
+ * hundred packages were a hundred lookups and a hundred connections, and
+ * the setting up was most of what fetching small ones cost. A server that
+ * answers in chunks, or without a length, is asked again over HTTP/1.0,
+ * whose body runs to the close. */
 
 #include "tuxpac.h"
 
@@ -96,10 +103,16 @@ static unsigned skip_name(const uint8_t *p, unsigned at, unsigned end) {
 
 static bool resolve(const char *host, uint32_t *ip) {
     static uint8_t q[300], a[512];
+    static char last[128];
+    static uint32_t last_ip;
     unsigned n = 12;
     bool found = false;
 
     if (parse_ip(host, ip)) {
+        return true;
+    }
+    if (last[0] != '\0' && strcmp(last, host) == 0) {
+        *ip = last_ip;              /* asked a moment ago */
         return true;
     }
     long u = sys_socket(AF_INET, SOCK_DGRAM, 0);   /* brings the network up first */
@@ -162,6 +175,10 @@ static bool resolve(const char *host, uint32_t *ip) {
     if (u >= 0) {
         sys_close((int)u);
     }
+    if (found && strlen(host) < sizeof last) {
+        strcpy(last, host);
+        last_ip = *ip;
+    }
     return found;
 }
 
@@ -174,8 +191,24 @@ static uint32_t receive(int s, uint8_t *to, uint32_t cap) {
 
 static uint32_t sock_fill(struct source *b) {
     b->pos = 0;
-    b->len = receive(b->fd, b->buf, b->cap);
+    b->len = b->left == 0 ? 0 : receive(b->fd, b->buf, b->left < b->cap ? (uint32_t)b->left : b->cap);
+    if (b->left != ~(uint64_t)0) {
+        b->left -= b->len;
+    }
     return b->len;
+}
+
+/* The connection kept open for the next request, and where it goes. */
+static int kept_fd = -1;
+static bool keep_open;            /* the response being read may leave it open */
+static char kept_host[128];
+static uint32_t kept_port;
+
+static void kept_drop(void) {
+    if (kept_fd >= 0) {
+        sys_close(kept_fd);
+    }
+    kept_fd = -1;
 }
 
 static char lower(char c) {
@@ -232,48 +265,60 @@ bool http_open(const char *url, struct source *b) {
         }
         path = *p == '/' ? p : "/";
 
-        long s = sys_socket(AF_INET, SOCK_STREAM, 0);
+        bool reused = false, old = false;
+        long s;
+        uint32_t got = 0, end = 0;
 
-        if (s < 0) {
-            fail("tuxpac: no network\n");
-            return false;
-        }
-        if (!resolve(host, &ip)) {
-            fail("tuxpac: %s: cannot resolve\n", host);
-            sys_close((int)s);
-            return false;
-        }
-        struct sockaddr_in to = { AF_INET, be16(port), ip, { 0 } };
+    again:
+        got = end = 0;
+        if (!old && kept_fd >= 0 && kept_port == port && strcmp(kept_host, host) == 0) {
+            s = kept_fd;            /* the connection the last request left open */
+            kept_fd = -1;
+            reused = true;
+        } else {
+            kept_drop();
+            reused = false;
+            s = sys_socket(AF_INET, SOCK_STREAM, 0);
+            if (s < 0) {
+                fail("tuxpac: no network\n");
+                return false;
+            }
+            if (!resolve(host, &ip)) {
+                fail("tuxpac: %s: cannot resolve\n", host);
+                sys_close((int)s);
+                return false;
+            }
+            struct sockaddr_in to = { AF_INET, be16(port), ip, { 0 } };
 
-        if (sys_connect((int)s, &to, sizeof to) < 0) {
-            fail("tuxpac: %s: cannot connect\n", host);
-            sys_close((int)s);
-            return false;
+            if (sys_connect((int)s, &to, sizeof to) < 0) {
+                fail("tuxpac: %s: cannot connect\n", host);
+                sys_close((int)s);
+                return false;
+            }
         }
         b->fd = (int)s;
-        format((char *)b->buf, "GET %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: tuxpac\r\n\r\n",
+        keep_open = false;
+        format((char *)b->buf, old ? "GET %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: tuxpac\r\n\r\n"
+                                   : "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: tuxpac\r\n"
+                                     "Connection: keep-alive\r\n\r\n",
                path, host);
+        bool sent_all = true;
+
         for (size_t sent = 0, len = strlen((char *)b->buf); sent < len;) {
             long k = sys_write((int)s, b->buf + sent, len - sent);
 
             if (k <= 0) {
-                fail("tuxpac: %s: cannot send\n", host);
-                http_close(b);
-                return false;
+                sent_all = false;
+                break;
             }
             sent += (size_t)k;
         }
-
         /* The head, whole, then whatever of the body came with it. */
-        uint32_t got = 0, end = 0;
-
-        while (end == 0) {
+        while (sent_all && end == 0) {
             uint32_t k = got < b->cap - 1 ? receive((int)s, b->buf + got, b->cap - 1 - got) : 0;
 
             if (k == 0) {
-                fail("tuxpac: %s: no answer\n", host);
-                http_close(b);
-                return false;
+                break;
             }
             for (uint32_t i = got >= 3 ? got - 3 : 0; i + 3 < got + k && end == 0; i++) {
                 if (memcmp_n((char *)b->buf + i, "\r\n\r\n", 4)) {
@@ -282,6 +327,14 @@ bool http_open(const char *url, struct source *b) {
             }
             got += k;
         }
+        if (end == 0) {
+            http_close(b);
+            if (reused) {
+                goto again;         /* the server had let the old one go */
+            }
+            fail("tuxpac: %s: %s\n", host, sent_all ? "no answer" : "cannot send");
+            return false;
+        }
         char *head = (char *)b->buf;
         unsigned status_code = 0;
 
@@ -289,7 +342,20 @@ bool http_open(const char *url, struct source *b) {
         for (const char *c = strchr(head, ' '); c != NULL && *++c >= '0' && *c <= '9';) {
             status_code = status_code * 10 + (unsigned)(*c - '0');
         }
+        const char *length = header(head, "content-length:");
+        const char *coding = header(head, "transfer-encoding:");
+        const char *conn = header(head, "connection:");
         const char *loc = header(head, "location:");
+        uint64_t body = 0;
+
+        for (const char *c = length; c != NULL && *c >= '0' && *c <= '9'; c++) {
+            body = body * 10 + (uint64_t)(*c - '0');
+        }
+        if (!old && (length == NULL || (coding != NULL && memcmp_n(coding, "chunked", 7)))) {
+            http_close(b);          /* no length to stop at: asked the old way */
+            old = true;
+            goto again;
+        }
 
         if (status_code >= 300 && status_code < 400 && loc != NULL) {
             size_t k = 0;
@@ -313,6 +379,23 @@ bool http_open(const char *url, struct source *b) {
         }
         b->pos = end;
         b->len = got;
+        b->left = ~(uint64_t)0;
+        if (!old) {
+            uint64_t have = got - end;
+
+            if (have > body) {
+                b->len = end + (uint32_t)body;
+                have = body;
+            }
+            b->left = body - have;
+            keep_open = conn == NULL || !memcmp_n(conn, "close", 5);
+            if (keep_open && strlen(host) < sizeof kept_host) {
+                strcpy(kept_host, host);
+                kept_port = port;
+            } else {
+                keep_open = false;
+            }
+        }
         b->count = 0;
         b->bad = false;
         b->fill = sock_fill;
@@ -322,9 +405,15 @@ bool http_open(const char *url, struct source *b) {
     return false;
 }
 
+/* Done with a response: its connection kept for the next request if it
+   was read to the end and the server keeps it open too, else closed. */
 void http_close(struct source *b) {
-    if (b->fd >= 0) {
+    if (b->fd >= 0 && keep_open && b->left == 0) {
+        kept_drop();
+        kept_fd = b->fd;
+    } else if (b->fd >= 0) {
         sys_close(b->fd);
     }
+    keep_open = false;
     b->fd = -1;
 }

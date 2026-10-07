@@ -18,7 +18,9 @@ Designed to be hyper-lightweight, Tuxlet OS requires only **256 KiB of RAM** and
 ## Key Features
 
 * **Linux ABI Compatibility:** Runs standard, uncompiled Linux programs natively via Linux-style socket calls and `/proc` hooks.
-* **Custom Modular Architecture:** Dedicated kernel, shell (`tsh`), and dynamic loadable modules (storage, input, networking, and debugging).
+* **Custom Modular Architecture:** Dedicated kernel, shell (`tsh`), and dynamic loadable modules (storage, USB, input, networking, IPC, Linux compatibility, and debugging).
+* **Modern PC Drivers:** AHCI (SATA), NVMe, USB (xHCI) keyboards and storage sticks, and Realtek gigabit Ethernet alongside the classic IDE / PS/2 drivers.
+* **Graphical Desktop:** `/dev/fb0` and evdev input let Debian's X.Org server, `openbox` and `xterm` run unmodified.
 * **UEFI and BIOS:** One image boots on either firmware, on x86-64 hardware and in virtualized environments (QEMU).
 * **Embedded Package Manager:** Includes `tuxpac`, a dedicated tool for fetching, resolving, and installing Debian main repository packages.
 * **Scriptable Startup:** Simple, human-readable shell scripts (`/etc/tuxlet/boot`) control the initial boot sequence.
@@ -113,7 +115,7 @@ Tuxlet boots into `tsh`, a lightweight built-in shell.
 To access kernel commands and binaries, ensure your shell environment variables are exported:
 
 ```sh
-export PATH=/ctl:/usr/bin
+export PATH=/ctl:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
 export MODPATH=/usr/lib/modules
 ```
 
@@ -125,9 +127,11 @@ System control executables are located in `/ctl`:
 
 | Command | Usage | Description |
 | --- | --- | --- |
-| `mem` | `mem [all]` | Displays current system memory allocation and usage. |
+| `mem` | `mem [all\|top]` | Displays current system memory allocation and usage. |
 | `mode` / `scale` / `font` | Standard options | Configures frame-buffer resolution, UI scaling, and console font. |
 | `clear` / `echo` | Text output | Clears terminal screen or prints text; Supports `{bold}`, `{n}` *(newline)* and `{uptime}`. |
+| `greet` | `greet <text>` | Prints a welcome line, with the same markup as `echo`. |
+| `tsh` | `tsh [script]` | Starts a shell, or runs a script. |
 | `modman` | Management | Loads, unloads, and inspects module states (see details below). |
 | `reboot` / `poweroff` | Power control | Restarts or safely shuts down the machine. |
 
@@ -148,12 +152,21 @@ modman auto <category>   # Auto-detect and load compatible hardware drivers
 | Category | Module | Provided Feature / Service |
 | --- | --- | --- |
 | **`storage`** | `storage/ide` | Low-level IDE disk controller support |
+|  | `storage/ahci` | SATA disks on an AHCI controller |
+|  | `storage/nvme` | NVMe SSDs |
+|  | `storage/usb` | USB sticks and disks (bulk-only mass storage) |
 |  | `storage/cache` | In-memory block cache (exposes `cache` command) |
-| **`input`** | `input/ps2` | PS/2 keyboard interface support |
+| **`usb`** | `usb/xhci` | USB 3 (xHCI) host controller, used by the USB class drivers |
+| **`input`** | `input/ps2` | PS/2 keyboard and mouse support |
+|  | `input/usbkbd` | USB keyboard support (needs `usb/xhci`) |
 | **`network`** | `network/stack` | TCP/IP network protocol stack (exposes `net` command) |
 |  | `network/e1000` | Intel e1000 Gigabit NIC driver |
 |  | `network/rtl8139` | Realtek RTL8139 Fast Ethernet driver |
+|  | `network/rtl8169` | Realtek RTL8168/8111 Gigabit and RTL8125 2.5G Ethernet driver |
 |  | `network/virtio` | Para-virtualized VirtIO network driver |
+| **`ipc`** | `ipc/unix` | `AF_UNIX` stream sockets and device-event netlink |
+|  | `ipc/pty` | Pseudo-terminals (`/dev/ptmx`, `/dev/pts/N`) for terminal emulators |
+| **`compat`** | `compat/linux` | Extra Linux system calls; loaded automatically on first use |
 | **`debug`** | `debug/trace` | Low-level kernel tracing tool |
 
 ---
@@ -164,19 +177,9 @@ Tuxlet includes a custom package manager located at `/usr/bin/tuxpac` that direc
 
 #### 1. Configure Mirrors
 
-Repositories are defined in `/etc/tuxlet/mirror` (one entry per line):
+Repositories are defined in `/etc/tuxlet/mirror` (one entry per line). A ready-made one ships as `/etc/tuxlet/mirror-example`.
 
-```sh
-put /etc/tuxlet/mirror http://deb.debian.org/debian trixie main
-```
-
-**HTTPS Support:** To use `https://` mirrors, first install `curl` via HTTP (it brings `ca-certificates`), then update your mirror file:
-
-```sh
-tuxpac -y
-tuxpac -s curl
-put /etc/tuxlet/mirror https://deb.debian.org/debian trixie main
-```
+**HTTPS Support:** To use `https://` mirrors, first install `curl` via HTTP (it brings `ca-certificates`), then update your mirror file.
 
 #### 2. Package Management Commands
 
@@ -193,8 +196,6 @@ put /etc/tuxlet/mirror https://deb.debian.org/debian trixie main
 | `tuxpac -q [query]` | List installed packages on the system |
 | `tuxpac -i <pkg>` | Show detailed package metadata |
 
-> **Note on Compatibility:** `tuxpac` automatically resolves shared library dependencies (`.so`) and builds runtime symlinks (e.g. `vim`, `awk`, `editor`). Dependency version constraints and maintainer post-install scripts are ignored. Non-essential content like `man` pages and documentation are omitted to save storage space.
-
 ---
 
 ## Advanced Operations
@@ -203,10 +204,9 @@ put /etc/tuxlet/mirror https://deb.debian.org/debian trixie main
 
 Running `modman takeover` instructs Tuxlet OS to stop using the firmware - UEFI Runtime Services or BIOS interrupts - freeing up motherboard firmware memory for user space execution.
 
-⚠️ **PRE-TAKEOVER CHECKLIST:**
 Before invoking takeover mode, ensure:
-1. A **storage module** (`storage/ide`) is active.
-2. An **input module** (`input/ps2`) is loaded.
+1. A **storage module** (`storage/ide`, `storage/ahci`, `storage/nvme` or `storage/usb`) is active.
+2. An **input module** (`input/ps2` or `input/usbkbd`) is loaded.
 3. Your display **`mode`** is configured (video resolution cannot be altered post-takeover).
 
 ```sh

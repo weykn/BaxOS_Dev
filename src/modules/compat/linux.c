@@ -42,6 +42,17 @@ static uint64_t sys_root(uint64_t a, uint64_t b, uint64_t c) {
 /* For the calls that hand back a structure of figures this machine does not
    keep - how much processor time has been used, and the like. Zeroes are
    what a program that has only just started would see anyway. */
+/* sched_getparam(pid, param): every thread here runs at priority 0. */
+static uint64_t sys_sched_getparam(uint64_t pid, uint64_t param, uint64_t c) {
+    (void)pid;
+    (void)c;
+    if (!user_range(param, 4)) {
+        return ERR(EFAULT);
+    }
+    *(int32_t *)param = 0;
+    return 0;
+}
+
 static uint64_t sys_zeroed(uint64_t out, uint64_t b, uint64_t c) {
     (void)b;
     (void)c;
@@ -169,7 +180,10 @@ static uint64_t wait_ready(uint64_t nfds, uint64_t readfds, uint64_t writefds,
 
     uint64_t wanted_out = writefds != 0 ? *(uint64_t *)writefds : 0;
 
-    while ((console_bits | sock_bits | event_bits) != 0 && ready == 0 && writable == 0) {
+    /* With nothing to watch, a timeout is a sleep - which is how top, and
+       many an older program, waits between one look and the next. */
+    while (((console_bits | sock_bits | event_bits) != 0 || timeout != 0) &&
+           ready == 0 && writable == 0) {
         if (console_bits != 0 && console_ready()) {
             ready = console_bits;
         }
@@ -315,7 +329,7 @@ static unsigned mount_of_fd(uint64_t fd) {
     case MOD_MARK:
         return MOUNT_DEV;
     case WRITE_MARK:
-        return mount_named(writer_names[h->writer - 1]);
+        return mount_named(write_name(h));
     default:
         if (h->start <= FOLDER_MARK && h->folder != 0 && fs_file(h->folder - 1, &entry) == 0) {
             char whole[FS_NAME_LEN + 1] = "/";      /* the table's names are from the root */
@@ -850,7 +864,7 @@ static uint64_t sys_access(uint64_t path, uint64_t mode, uint64_t c) {
         return ERR(EFAULT);
     }
     if (proc_command(name) != NULL || proc_folder(name) || proc_net_name(name) != NULL ||
-        dev_named(name) != 0 || dev_folder(name) || mod_named(name, NULL, NULL)) {
+        dev_named(name) != 0 || dev_folder(name) || proc_fd_folder(name) || mod_named(name, NULL, NULL)) {
         return 0;
     }
     if (fs_stat(name, &file) == 0) {
@@ -873,7 +887,7 @@ static uint64_t sys_faccessat(uint64_t dirfd, uint64_t path, uint64_t mode) {
         name = target;
     }
     if (proc_command(name) != NULL || proc_folder(name) || proc_net_name(name) != NULL ||
-        dev_named(name) != 0 || dev_folder(name) || mod_named(name, NULL, NULL) ||
+        dev_named(name) != 0 || dev_folder(name) || proc_fd_folder(name) || mod_named(name, NULL, NULL) ||
         fs_stat(name, &file) == 0) {
         return 0;
     }
@@ -889,20 +903,6 @@ static uint64_t sys_sched_getaffinity(uint64_t pid, uint64_t size, uint64_t mask
     memset((void *)mask, 0, size < 128 ? size : 128);
     *(uint8_t *)mask = 1;
     return 8;
-}
-
-/* Which user a program is, was, and may go back to being - three copies of
-   the same answer, since everything here is root. */
-static uint64_t sys_getresuid(uint64_t real, uint64_t effective, uint64_t saved) {
-    uint64_t of[3] = { real, effective, saved };
-
-    for (unsigned i = 0; i < 3; i++) {
-        if (!user_range(of[i], 4)) {
-            return ERR(EFAULT);
-        }
-        *(uint32_t *)of[i] = 0;
-    }
-    return 0;
 }
 
 /* poll, which is select spelled differently: everything but the keyboard
@@ -1184,6 +1184,18 @@ static uint64_t sys_prctl(uint64_t option, uint64_t value, uint64_t c) {
     if (option == PR_CAPBSET_READ) {
         return value <= CAP_LAST ? 1 : ERR(EINVAL);
     }
+    /* No seccomp here, said as a kernel built without it says it: Firefox
+       and Chromium then run their processes unsandboxed rather than wait for
+       a sandbox broker that never comes. */
+    if (option == 21 || option == 22) {     /* PR_GET_SECCOMP, PR_SET_SECCOMP */
+        return ERR(EINVAL);
+    }
+    if (option == 7) {                      /* PR_GET_KEEPCAPS */
+        return process_creds()->keepcaps;
+    }
+    if (option == 8) {                      /* PR_SET_KEEPCAPS */
+        process_creds()->keepcaps = value != 0;
+    }
     return 0;
 }
 
@@ -1195,9 +1207,8 @@ static uint64_t sys_prlimit64(uint64_t pid, uint64_t resource, uint64_t new_limi
     uint64_t *old = (uint64_t *)arg[3];
 
     (void)pid;
-    if (new_limit != 0) {
-        return ERR(EINVAL);
-    }
+    (void)new_limit;                /* asked to change: told it did. Firefox
+                                       raises its stack's, and stops if it cannot */
     if (old != NULL) {
         if (!user_range(arg[3], 16)) {
             return ERR(EFAULT);
@@ -1242,6 +1253,8 @@ static uint64_t sys_no_xattr(uint64_t a, uint64_t b, uint64_t c) {
 
 #define LINK_MAX_COPY (1024 * 1024)
 
+static char linked[2][64];
+
 /* A second name for a file. The filesystem has one name a file, so the
    second is a copy - which is all a program wants of one it makes to put a
    lock file in place without a race: the name there, holding the same. */
@@ -1273,15 +1286,53 @@ static uint64_t link_copy(const char *from, const char *to) {
     }
     err = fs_write(to, data, file.size);
     mem_free(data);
+    if (err >= 0 && strlen(from) < sizeof linked[0] && strlen(to) < sizeof linked[1]) {
+        strcpy(linked[0], from);
+        strcpy(linked[1], to);
+    }
     return err < 0 ? fs_errno(err) : 0;
+}
+
+/* Two links while both names are there, for the newest pair: a lock taken
+   the way shadow's useradd takes one checks the count came out at 2. */
+static unsigned links_of(const char *name) {
+    struct fs_file file;
+
+    if (name == NULL || linked[0][0] == '\0' ||
+        (strcmp(name, linked[0]) != 0 && strcmp(name, linked[1]) != 0)) {
+        return 1;
+    }
+    return fs_lstat(linked[0], &file) == 0 && fs_lstat(linked[1], &file) == 0 ? 2 : 1;
 }
 
 /* user_string answers in one buffer, so each name is copied out of it
    before the next is asked for. */
 static uint64_t sys_linkat(uint64_t olddir, uint64_t oldpath, uint64_t newdir) {
-    char a[FS_NAME_LEN], b[FS_NAME_LEN];
+    char a[FS_NAME_LEN + 16], b[FS_NAME_LEN], fd[32];
     const char *from = at_path(olddir, user_string(oldpath), a, sizeof a);
 
+    /* The descriptor itself (AT_EMPTY_PATH), or /proc/self/fd/N for it: how
+       an O_TMPFILE file is given its name - here, a copy under that name. */
+    if (from != NULL && from[0] == '\0') {
+        ksprintf(fd, "/proc/self/fd/%u", (unsigned)olddir);
+        from = fd;
+    }
+    if (from != NULL && proc_fd_target(from, a, sizeof a) != NULL) {
+        from = a;
+        /* An O_TMPFILE file's name is the kernel's own, which nothing else
+           knows: it is given the new one, however big it is. */
+        const char *leaf = NULL;
+        struct fs_file there;
+
+        for (const char *c = a; *c != '\0'; c++) {
+            leaf = *c == '/' ? c : leaf;
+        }
+        const char *to = at_path(newdir, user_string(arg[3]), b, sizeof b);
+
+        if (to != NULL && leaf != NULL && memcmp(leaf, "/.tmp", 5) == 0) {
+            return fs_lstat(to, &there) == 0 ? ERR(EEXIST) : fs_errno(fs_rename(a, to));
+        }
+    }
     if (from != NULL && from != a) {
         strcpy(a, from);
         from = a;
@@ -1404,6 +1455,10 @@ static uint64_t sys_readlinkat(uint64_t dirfd, uint64_t path, uint64_t buf) {
         return n;                   /* a link's text: no NUL */
     }
     got = fs_readlink(name, (char *)buf, size);
+    if (got == FS_ENOENT && (fs_folder_at(name, &(unsigned){ 0 }) == 0 || dev_named(name) != 0 ||
+                             dev_folder(name) || proc_folder(name) || proc_command(name) != NULL)) {
+        return ERR(EINVAL);         /* there, just not a link: realpath walks on */
+    }
     return got < 0 ? fs_errno(got) : (uint64_t)got;
 }
 
@@ -1499,7 +1554,7 @@ static uint64_t stat_of_handle(uint64_t fd, struct stat *st) {
               h->start == FOLDER_MARK ? folder_ino(h->folder) :
               h->start == PROC_MARK ? PROC_INO + h->folder :
               h->start == PROCDIR_MARK ? PROC_INO :
-              h->start == WRITE_MARK ? file_ino(writer_names[h->writer - 1], true) :
+              h->start == WRITE_MARK ? file_ino(write_name(h), true) :
               h->start < FIRST_MARK && h->folder != 0 ? folder_ino(h->folder) : h->start);
     if (h->start == CONSOLE_MARK) {
         /* Not a file at all: a program told this is a regular file reads it
@@ -1572,6 +1627,52 @@ static uint64_t statx_core(uint64_t dirfd, uint64_t path, uint64_t flags);
 /* statx, saying which mount too (STATX_MNT_ID), as a udev library asks. */
 #define STATX_MNT_ID 0x1000
 
+/* chmod: a folder keeps the mode it is given, as a home folder made with
+   mode 0 and then opened up needs. A file's stays as it is. */
+static uint64_t chmod_name(const char *name, uint64_t mode) {
+    unsigned index;
+
+    if (name == NULL) {
+        return ERR(EFAULT);
+    }
+    if (fs_folder_at(name, &index) == 0 && index != 0) {
+        fs_set_mode(name, (unsigned)(S_IFDIR | (mode & 07777)));
+    }
+    return 0;
+}
+
+static uint64_t sys_chmod_(uint64_t path, uint64_t mode, uint64_t c) {
+    (void)c;
+    return chmod_name(user_string(path), mode);
+}
+
+static uint64_t sys_fchmod_(uint64_t fd, uint64_t mode, uint64_t c) {
+    char name[32], target[FS_NAME_LEN + 16];
+
+    (void)c;
+    ksprintf(name, "/proc/self/fd/%u", (unsigned)fd);
+    return proc_fd_target(name, target, sizeof target) != NULL ? chmod_name(target, mode) : 0;
+}
+
+static uint64_t sys_fchmodat_(uint64_t dirfd, uint64_t path, uint64_t mode) {
+    char joined[FS_NAME_LEN];
+
+    return chmod_name(at_path(dirfd, user_string(path), joined, sizeof joined), mode);
+}
+
+/* There is one owner on disk, root - except under /home, where everything
+   belongs to whoever asks, so a user's own files look like their own. */
+static bool owned_by_caller(const char *name, const char *joined) {
+    if (name == NULL) {
+        return false;
+    }
+    if (name == joined && name[0] != '/') {
+        return memcmp(name, "home/", 5) == 0;   /* relative to a folder's descriptor */
+    }
+    return name[0] == '/' ? memcmp(name, "/home/", 6) == 0
+                          : memcmp(fs_cwd(), "home/", 5) == 0;
+}
+
 static uint64_t sys_statx(uint64_t dirfd, uint64_t path, uint64_t flags) {
     uint64_t result = statx_core(dirfd, path, flags);
     struct statx *out = (struct statx *)arg[4];
@@ -1579,10 +1680,18 @@ static uint64_t sys_statx(uint64_t dirfd, uint64_t path, uint64_t flags) {
 
     if (result == 0) {
         char joined[FS_NAME_LEN];
+        const char *name = given != NULL && given[0] != '\0'
+                         ? at_path(dirfd, given, joined, sizeof joined) : NULL;
 
         out->mask |= STATX_MNT_ID;
-        out->rest[0] = given != NULL && given[0] == '\0' ? mount_of_fd(dirfd)
-                     : mount_named(at_path(dirfd, given, joined, sizeof joined));
+        out->rest[0] = name == NULL ? mount_of_fd(dirfd) : mount_named(name);
+        if (out->nlink == 1) {
+            out->nlink = links_of(name);
+        }
+        if (owned_by_caller(name, joined)) {
+            out->uid = process_creds()->uid;
+            out->gid = process_creds()->gid;
+        }
     }
     return result;
 }
@@ -1641,11 +1750,26 @@ static uint64_t statx_core(uint64_t dirfd, uint64_t path, uint64_t flags) {
         out->dev_minor = 1;
         return 0;
     }
-    if (cmd != NULL || proc_folder(name) || which != 0 || dev_folder(name)) {
+    uint32_t puid, pgid;
+
+    if (proc_pid_folder(name, &puid, &pgid) != 0) {
         memset(out, 0, sizeof *out);
         out->mask = STATX_BASIC;
         out->blksize = SECTOR_SIZE;
         out->nlink = 1;
+        out->mode = S_IFDIR | 0555;
+        out->ino = PROC_INO + 0x10000 + (unsigned)proc_pid_folder(name, &puid, &pgid);
+        out->uid = puid;
+        out->gid = pgid;
+        out->dev_minor = 1;
+        return 0;
+    }
+    if (cmd != NULL || proc_folder(name) || which != 0 || dev_folder(name) || proc_fd_folder(name) ||
+        proc_task_links(name) != 0) {
+        memset(out, 0, sizeof *out);
+        out->mask = STATX_BASIC;
+        out->blksize = SECTOR_SIZE;
+        out->nlink = proc_task_links(name) != 0 ? proc_task_links(name) : 1;
         out->mode = (uint16_t)(which != 0 ? S_IFCHR | 0666 :
                                cmd != NULL ? S_IFREG | 0755 : S_IFDIR | 0755);
         out->ino = which != 0 ? DEV_INO + which : PROC_INO;
@@ -1695,7 +1819,24 @@ static uint64_t statx_core(uint64_t dirfd, uint64_t path, uint64_t flags) {
     return 0;
 }
 
+static uint64_t newfstatat_core(uint64_t dirfd, uint64_t path, uint64_t out);
+
 static uint64_t sys_newfstatat(uint64_t dirfd, uint64_t path, uint64_t out) {
+    uint64_t result = newfstatat_core(dirfd, path, out);
+    char joined[FS_NAME_LEN];
+    const char *name = at_path(dirfd, user_string(path), joined, sizeof joined);
+
+    if (result == 0 && owned_by_caller(name, joined)) {
+        ((struct stat *)out)->uid = process_creds()->uid;
+        ((struct stat *)out)->gid = process_creds()->gid;
+    }
+    if (result == 0 && ((struct stat *)out)->nlink == 1) {
+        ((struct stat *)out)->nlink = links_of(name);
+    }
+    return result;
+}
+
+static uint64_t newfstatat_core(uint64_t dirfd, uint64_t path, uint64_t out) {
     struct fs_file file;
     char joined[FS_NAME_LEN];
     const char *name = at_path(dirfd, user_string(path), joined, sizeof joined);
@@ -1724,6 +1865,15 @@ static uint64_t sys_newfstatat(uint64_t dirfd, uint64_t path, uint64_t out) {
         fill_stat((struct stat *)out, 0, true, PROC_INO);
         return 0;
     }
+    uint32_t puid, pgid;
+    int pid = proc_pid_folder(name, &puid, &pgid);
+
+    if (pid != 0) {
+        fill_stat((struct stat *)out, 0, true, PROC_INO + 0x10000 + (unsigned)pid);
+        ((struct stat *)out)->uid = puid;
+        ((struct stat *)out)->gid = pgid;
+        return 0;
+    }
     if (proc_net_name(name) != NULL) {
         fill_stat((struct stat *)out, 0, false, PROC_INO + 2);
         ((struct stat *)out)->mode = S_IFREG | 0444;
@@ -1743,8 +1893,11 @@ static uint64_t sys_newfstatat(uint64_t dirfd, uint64_t path, uint64_t out) {
         ((struct stat *)out)->rdev = rdev_of(dev_named(name));
         return 0;
     }
-    if (dev_folder(name)) {
+    if (dev_folder(name) || proc_fd_folder(name) || proc_task_links(name) != 0) {
         fill_stat((struct stat *)out, 0, true, PROC_INO);
+        if (proc_task_links(name) != 0) {
+            ((struct stat *)out)->nlink = proc_task_links(name);
+        }
         return 0;
     }
     if ((arg[3] & AT_SYMLINK_NOFOLLOW) != 0 && fs_lstat(name, &file) == 0 &&
@@ -1846,6 +1999,73 @@ static uint64_t proc_dents(struct handle *h, uint64_t buf, uint64_t count) {
     return used;
 }
 
+/* /proc itself: self, the machine's files, and a folder for each process -
+   what ps and top walk. */
+static uint64_t pid_dents(struct handle *h, uint64_t buf, uint64_t count) {
+    static const char *const fixed[] = {
+        "self", "cpuinfo", "meminfo", "stat", "uptime", "loadavg", "mounts",
+    };
+    const unsigned nfixed = sizeof fixed / sizeof fixed[0];
+    uint64_t used = 0;
+
+    for (;; h->offset++) {
+        char number[12];
+        int pid = h->offset < nfixed ? 0 : proc_pid_at(h->offset - nfixed);
+
+        if (h->offset >= nfixed && pid == 0) {
+            break;
+        }
+        if (pid != 0) {
+            ksprintf(number, "%u", (unsigned)pid);
+        }
+        const char *name = pid != 0 ? number : fixed[h->offset];
+        size_t length = strlen(name);
+        uint64_t reclen = (sizeof(struct dirent64) + length + 1 + 7) & ~7ull;
+
+        if (used + reclen > count) {
+            break;                  /* the rest waits for the next call */
+        }
+        struct dirent64 *out = (struct dirent64 *)(buf + used);
+
+        out->ino = PROC_INO + 0x10000 + (pid != 0 ? (unsigned)pid : 0x8000 + h->offset);
+        out->off = (int64_t)(h->offset + 1);
+        out->reclen = (uint16_t)reclen;
+        out->type = pid != 0 ? DT_DIR : h->offset == 0 ? DT_LNK : DT_REG;
+        memcpy(out->name, name, length + 1);
+        used += reclen;
+    }
+    return used;
+}
+
+/* /proc/self/fd: a link per descriptor open, named by its number. */
+static uint64_t fd_dents(struct handle *h, uint64_t buf, uint64_t count) {
+    uint64_t used = 0;
+
+    for (; h->offset < PROGRAM_FILES; h->offset++) {
+        char name[12];
+
+        if (handle_of(h->offset) == NULL) {
+            continue;
+        }
+        ksprintf(name, "%u", (unsigned)h->offset);
+        size_t length = strlen(name);
+        uint64_t reclen = (sizeof(struct dirent64) + length + 1 + 7) & ~7ull;
+
+        if (used + reclen > count) {
+            break;
+        }
+        struct dirent64 *out = (struct dirent64 *)(buf + used);
+
+        out->ino = PROC_INO + 0x1000 + h->offset;
+        out->off = (int64_t)(h->offset + 1);
+        out->reclen = (uint16_t)reclen;
+        out->type = DT_LNK;
+        memcpy(out->name, name, length + 1);
+        used += reclen;
+    }
+    return used;
+}
+
 /* /dev, from its table: names as the folder shows them, without "/dev/" -
    or /dev/input, with folder 2, and without "/dev/input/". /dev lists that
    folder as one more entry past the table. */
@@ -1892,6 +2112,12 @@ static uint64_t sys_getdents64(uint64_t fd, uint64_t buf, uint64_t count) {
         return ERR(h == NULL ? EBADF : EFAULT);
     }
     if (h->start == PROCDIR_MARK) {
+        if (h->folder == PROC_FD_FOLDER) {
+            return fd_dents(h, buf, count);
+        }
+        if (h->folder == PROC_PIDS_FOLDER) {
+            return pid_dents(h, buf, count);
+        }
         return h->folder != 0 ? dev_dents(h, buf, count) : proc_dents(h, buf, count);
     }
     if (h->start != FOLDER_MARK) {
@@ -2122,6 +2348,167 @@ static uint64_t sys_time(uint64_t out, uint64_t b, uint64_t c) {
 
 /* ---- the module ----------------------------------------------------------- */
 
+/* fallocate's plain kind: the file at least offset + len long, as on
+   Linux - Chromium sizes the memory it shares this way. Space is never short
+   here, so nothing need be set aside. */
+static uint64_t sys_fallocate(uint64_t fd, uint64_t mode, uint64_t offset) {
+    struct handle *h = handle_of(fd);
+    uint64_t want = offset + syscall_args()[3];
+
+    if (h == NULL) {
+        return ERR(EBADF);
+    }
+    if ((mode & 0x01) == 0 && want > h->size) {    /* not FALLOC_FL_KEEP_SIZE */
+        return fd_truncate(fd, want);
+    }
+    return 0;
+}
+
+/* ---- who a process is ---------------------------------------------------
+ *
+ * Users and groups, kept by the kernel per process (struct creds) and
+ * changed as Linux allows: root to anything, anyone else only among its own
+ * real, effective and saved ids. Nothing on the disk is refused anyone -
+ * this is one person's machine - but a program sees who it runs as, and the
+ * session starts as a user, not root. */
+
+static bool cred_ok(uint32_t want, uint32_t a, uint32_t b, uint32_t c) {
+    return process_creds()->euid == 0 || process_creds()->capable ||
+           want == a || want == b || want == c;
+}
+
+static uint64_t sys_getresuid_(uint64_t r, uint64_t e, uint64_t s) {
+    struct creds *c = process_creds();
+
+    if (!user_range(r, 4) || !user_range(e, 4) || !user_range(s, 4)) {
+        return ERR(EFAULT);
+    }
+    *(uint32_t *)r = c->uid;
+    *(uint32_t *)e = c->euid;
+    *(uint32_t *)s = c->suid;
+    return 0;
+}
+
+static uint64_t sys_getresgid_(uint64_t r, uint64_t e, uint64_t s) {
+    struct creds *c = process_creds();
+
+    if (!user_range(r, 4) || !user_range(e, 4) || !user_range(s, 4)) {
+        return ERR(EFAULT);
+    }
+    *(uint32_t *)r = c->gid;
+    *(uint32_t *)e = c->egid;
+    *(uint32_t *)s = c->sgid;
+    return 0;
+}
+
+static uint64_t sys_getgroups_(uint64_t size, uint64_t list, uint64_t x) {
+    struct creds *c = process_creds();
+
+    (void)x;
+    if (size == 0) {
+        return c->ngroups;
+    }
+    if (size < c->ngroups) {
+        return ERR(EINVAL);
+    }
+    if (!user_range(list, c->ngroups * 4)) {
+        return ERR(EFAULT);
+    }
+    memcpy((void *)list, c->groups, c->ngroups * 4);
+    return c->ngroups;
+}
+
+static uint64_t sys_setgroups_(uint64_t size, uint64_t list, uint64_t x) {
+    struct creds *c = process_creds();
+
+    (void)x;
+    if (c->euid != 0 && !c->capable) {
+        return ERR(EPERM);
+    }
+    if (size > 16 || !user_range(list, size * 4)) {
+        return ERR(size > 16 ? EINVAL : EFAULT);
+    }
+    memcpy(c->groups, (const void *)list, size * 4);
+    c->ngroups = (uint32_t)size;
+    return 0;
+}
+
+static uint64_t sys_setresuid_(uint64_t r, uint64_t e, uint64_t s) {
+    struct creds *c = process_creds();
+    uint32_t nr = (uint32_t)r, ne = (uint32_t)e, ns = (uint32_t)s;
+
+    if ((nr != ~0u && !cred_ok(nr, c->uid, c->euid, c->suid)) ||
+        (ne != ~0u && !cred_ok(ne, c->uid, c->euid, c->suid)) ||
+        (ns != ~0u && !cred_ok(ns, c->uid, c->euid, c->suid))) {
+        return ERR(EPERM);
+    }
+    c->capable |= c->keepcaps && (c->euid == 0 || c->capable);
+    c->uid = nr != ~0u ? nr : c->uid;
+    c->euid = ne != ~0u ? ne : c->euid;
+    c->suid = ns != ~0u ? ns : c->suid;
+    return 0;
+}
+
+static uint64_t sys_setresgid_(uint64_t r, uint64_t e, uint64_t s) {
+    struct creds *c = process_creds();
+    uint32_t nr = (uint32_t)r, ne = (uint32_t)e, ns = (uint32_t)s;
+
+    if ((nr != ~0u && !cred_ok(nr, c->gid, c->egid, c->sgid)) ||
+        (ne != ~0u && !cred_ok(ne, c->gid, c->egid, c->sgid)) ||
+        (ns != ~0u && !cred_ok(ns, c->gid, c->egid, c->sgid))) {
+        return ERR(EPERM);
+    }
+    c->gid = nr != ~0u ? nr : c->gid;
+    c->egid = ne != ~0u ? ne : c->egid;
+    c->sgid = ns != ~0u ? ns : c->sgid;
+    return 0;
+}
+
+static uint64_t sys_setuid_(uint64_t u, uint64_t b, uint64_t x) {
+    struct creds *c = process_creds();
+
+    (void)b;
+    (void)x;
+    if (c->euid == 0) {
+        c->uid = c->euid = c->suid = (uint32_t)u;  /* root gives itself up for good */
+        return 0;
+    }
+    return sys_setresuid_(~0ull, u, ~0ull);
+}
+
+static uint64_t sys_setgid_(uint64_t g, uint64_t b, uint64_t x) {
+    struct creds *c = process_creds();
+
+    (void)b;
+    (void)x;
+    if (c->euid == 0) {
+        c->gid = c->egid = c->sgid = (uint32_t)g;
+        return 0;
+    }
+    return sys_setresgid_(~0ull, g, ~0ull);
+}
+
+static uint64_t sys_setreuid_(uint64_t r, uint64_t e, uint64_t x) {
+    (void)x;
+    return sys_setresuid_(r, e, ~0ull);
+}
+
+static uint64_t sys_setregid_(uint64_t r, uint64_t e, uint64_t x) {
+    (void)x;
+    return sys_setresgid_(r, e, ~0ull);
+}
+
+/* setfsuid/setfsgid: the old one back, which is the effective one here. */
+static uint64_t sys_setfsuid_(uint64_t u, uint64_t b, uint64_t x) {
+    (void)u; (void)b; (void)x;
+    return process_creds()->euid;
+}
+
+static uint64_t sys_setfsgid_(uint64_t g, uint64_t b, uint64_t x) {
+    (void)g; (void)b; (void)x;
+    return process_creds()->egid;
+}
+
 static const uint16_t numbers[] = {
     SYS_FSTAT,
     SYS_IOCTL,
@@ -2197,6 +2584,7 @@ static const uint16_t numbers[] = {
     SYS_SETRESUID,
     SYS_SETRESGID,
     SYS_SETGROUPS,
+    113, 114, 122, 123,                 /* setreuid, setregid, setfsuid, setfsgid */
 };
 
 static const syscall_fn handlers[] = {
@@ -2209,9 +2597,9 @@ static const syscall_fn handlers[] = {
     sys_ok,
     sys_ok,
     sys_ok,
-    sys_ok,
-    sys_ok,
-    sys_ok,
+    sys_chmod_,
+    sys_fchmod_,
+    sys_fchmodat_,
     sys_ok,
     sys_ok,
     sys_ok,
@@ -2238,8 +2626,8 @@ static const syscall_fn handlers[] = {
     sys_gettimeofday,
     sys_time,
     sys_readlink,
-    sys_getresuid,
-    sys_getresuid,
+    sys_getresuid_,
+    sys_getresgid_,
     sys_select,
     sys_pselect6,
     sys_renameat,
@@ -2258,23 +2646,24 @@ static const syscall_fn handlers[] = {
     sys_getrlimit,
     sys_ok,
     sys_ok,
-    sys_ok,
-    sys_ok,
-    sys_zeroed,
-    sys_root,
-    sys_root,
+    sys_fallocate,
     sys_ok,
     sys_zeroed,
+    sys_getgroups_,
+    sys_root,
+    sys_ok,
+    sys_sched_getparam,
     sys_root,
     sys_ok,
     sys_capget,
     sys_ok,
     sys_prctl,
-    sys_ok,
-    sys_ok,
-    sys_ok,
-    sys_ok,
-    sys_ok,
+    sys_setuid_,
+    sys_setgid_,
+    sys_setresuid_,
+    sys_setresgid_,
+    sys_setgroups_,
+    sys_setreuid_, sys_setregid_, sys_setfsuid_, sys_setfsgid_,
 };
 
 static syscall_fn find(uint64_t number) {

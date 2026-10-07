@@ -52,7 +52,7 @@ SECTIONS
     __bss_end = .;
 
     /* KERNEL_BYTES in boot.h: all of it has to fit what the loader takes. */
-    ASSERT(__bss_end <= 0x20000, "the kernel outgrew KERNEL_BYTES")
+    ASSERT(__bss_end <= 0x28000, "the kernel outgrew KERNEL_BYTES")
 
     /DISCARD/ : {
         *(.comment)

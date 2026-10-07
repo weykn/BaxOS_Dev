@@ -103,7 +103,7 @@ bool vm_reserve(uint64_t addr, uint64_t size);
 /* Maps page - one of share.c's - at addr, read-only until written. False if
    something is there already, or the address is not one a shared page may
    go: then the caller makes a private copy as before. */
-bool vm_map_shared(uint64_t addr, uint64_t page);
+bool vm_map_shared(uint64_t addr, uint64_t page, bool writable);
 
 /* Whether the page holding addr is already there. */
 bool vm_mapped(uint64_t addr);
@@ -114,6 +114,7 @@ bool vm_map_device(uint64_t addr, uint64_t phys, uint64_t size);
 
 /* Unmaps that range and hands its pages back. */
 void vm_release(uint64_t addr, uint64_t size);
+void vm_discard(uint64_t addr, uint64_t size);   /* madvise DONTNEED: private pages only */
 
 /* Hands back everything the program in the current region had, keeping the
    region itself. */

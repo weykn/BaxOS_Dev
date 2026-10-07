@@ -24,7 +24,7 @@
    folder rather than Linux's link into the device tree: a udev library
    walks a path a part at a time, and opens none of it as a link. */
 static const char *const folders[] = {
-    "/ctl", "/proc", "/dev", "/etc", "/etc/tuxlet", "/usr", "/usr/lib", "/usr/lib/modules",
+    "/ctl", "/proc", "/dev", "/dev/shm", "/etc", "/etc/tuxlet", "/usr", "/usr/lib", "/usr/lib/modules",
     "/var", "/var/log", "/root", "/tmp",
     "/sys", "/sys/class", "/sys/class/drm", "/sys/class/drm/card0", "/sys/class/graphics",
     "/sys/class/graphics/fb0", "/sys/class/graphics/fb0/device",
@@ -52,6 +52,32 @@ static const char *const links[][2] = {
 /* Where the UEFI loader leaves us, with the boot information it gathered.
    Nothing before vga_start can be shown, so a machine that gets this far and
    fails there has no way to say so. */
+/* Empties folder (a name ending in '/'), and what is in its folders. /tmp
+   is on the disk here, not in memory as on Linux, so what a program left
+   in it - a lock file, a session's cookie - would outlive the machine and
+   stop the next one starting: it is emptied at every start instead. */
+static void empty_folder(const char *folder, unsigned depth) {
+    struct fs_file entry;
+    size_t cursor = 0, index;
+    char path[FS_NAME_LEN + 1];
+
+    while (depth < 8 && (cursor = 0, fs_list(folder, &cursor, &entry, &index)) == 0) {
+        size_t n = strlen(entry.name);
+
+        if (n > 0 && entry.name[n - 1] == '/') {
+            empty_folder(entry.name, depth + 1);
+        }
+        path[0] = '/';
+        strcpy(path + 1, entry.name);
+        if (n > 1 && path[n] == '/') {
+            path[n] = '\0';         /* a folder goes by its name */
+        }
+        if (fs_remove(path) < 0) {
+            break;                  /* stuck: better a full /tmp than no boot */
+        }
+    }
+}
+
 void kernel_main(struct boot_info *info) {
     if (info == NULL || info->magic != BOOT_MAGIC) {
         halt_forever();
@@ -73,6 +99,8 @@ void kernel_main(struct boot_info *info) {
         for (unsigned i = 0; i < sizeof folders / sizeof folders[0]; i++) {
             fs_mkdir(folders[i]);   /* nothing written where it is already there */
         }
+        empty_folder("tmp/", 0);
+        empty_folder("dev/shm/", 0);    /* shared memory by name, no more lasting */
         for (unsigned i = 0; i < sizeof files / sizeof files[0]; i++) {
             if (fs_stat(files[i][0], &there) != 0) {
                 fs_write(files[i][0], files[i][1], strlen(files[i][1]));

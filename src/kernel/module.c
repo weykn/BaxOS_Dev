@@ -123,13 +123,13 @@ static const struct {
     X(dev_folder), X(devices), X(dev_named), X(efi_power_off), X(efi_restart),
     X(event_ready), X(file_ino), X(fs_errno), X(fs_file), X(fs_folder_at),
     X(fs_get_stats), X(fs_inside), X(fs_list), X(fs_lstat), X(fs_readlink), X(fs_rename),
-    X(fs_set_mode), X(fs_symlink), X(is_console), X(is_fifo), X(linux_register),
+    X(fs_set_mode), X(proc_pid_folder), X(proc_pid_at), X(fs_symlink), X(is_console), X(is_fifo), X(linux_register),
     X(mem_get_stats), X(net), X(process_times), X(pipe_left), X(pipe_of), X(proc_at),
     X(proc_command), X(proc_folder), X(proc_net_name), X(proc_read), X(readable),
     X(realtime_ms), X(realtime_us), X(self_us), X(user_string), X(user_us), X(vga_height),
-    X(vga_pixel_height), X(vga_pixel_width), X(vga_width), X(process_writers),
+    X(vga_pixel_height), X(vga_pixel_width), X(vga_width), X(write_name),
     X(input_report), X(input_ready), X(input_keys), X(input_clock), X(console_keys),
-    X(graphics_take), X(thread_id), X(proc_fd_target), X(fs_cwd), X(fd_cloexec), X(files_register), X(file_ops), X(signal_pgrp), X(process_ids), X(ops_named), X(buffer_open), X(pipe_data), X(unix_register), X(pair_new), X(handle_close), X(fd_read), X(fd_write), X(sock_ready), X(tty_foreground), X(tty_set_foreground), X(vga_screen), X(vga_lend), X(vga_lent),
+    X(graphics_take), X(thread_id), X(proc_fd_target), X(proc_fd_folder), X(process_creds), X(fd_truncate), X(proc_task_links), X(fs_cwd), X(fd_cloexec), X(files_register), X(file_ops), X(signal_pgrp), X(process_ids), X(ops_named), X(buffer_open), X(pipe_data), X(unix_register), X(pair_new), X(pair_send), X(pair_recv), X(handle_share), X(pair_flags), X(pair_sender), X(handle_close), X(fd_read), X(fd_write), X(sock_ready), X(tty_foreground), X(tty_set_foreground), X(vga_screen), X(vga_lend), X(vga_lent),
 #ifdef DEBUG
     X(dbg),
 #endif

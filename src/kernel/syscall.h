@@ -40,13 +40,19 @@
    program taken off a Linux system wants several stretches of memory at once
    - itself, its loader, the libraries that loader maps, a heap and a stack -
    and they have to be far enough apart that none of them grows into another.
-   The region is half a terabyte; these are a rounding error of it. */
-#define USER_STACK  0x01040000  /* the stack top, growing down */
-#define USER_EXEC   0x01040000  /* a position-independent program, above it */
-#define USER_INTERP 0x08000000  /* its loader, ld.so */
-#define USER_MMAP   0x10000000  /* what mmap hands out, growing up */
-#define USER_BRK    0x30000000  /* the heap, growing up */
-#define USER_STACK_BYTES 0x40000
+   The region is half a terabyte and a page costs nothing until it is
+   touched, so they are spread wide: a browser is a 300 MB program, maps a
+   few hundred more of libraries, and mmaps and lets go of memory all day -
+   and mmap's addresses only ever move up. */
+#define USER_STACK  0x01040000      /* the stack top, growing down */
+#define USER_EXEC   0x01040000      /* a position-independent program, above it */
+#define USER_INTERP 0x40000000      /* its loader, ld.so: a gigabyte for the program */
+#define USER_MMAP   0x41000000      /* what mmap hands out, growing up */
+#define USER_BRK    0x4000000000ull /* the heap, growing up: 256 GB on */
+#define USER_HIGH   0x5000000000ull /* mmap's second stretch, past 64 GB of heap:
+                                       V8's sandbox, PartitionAlloc's pools and
+                                       Oilpan's cage do not fit below the heap */
+#define USER_STACK_BYTES 0x800000   /* 8 MB, as Linux's default */
 
 /* The stack sits right under the program, in the same two megabytes: one
    page table then describes both, which for a program as small as the
@@ -205,12 +211,20 @@ enum {
     SYS_TIMER_GETTIME   = 224,  /* (timer, itimerspec *) */
     SYS_TIMER_GETOVERRUN = 225,
     SYS_TIMER_DELETE    = 226,
+    SYS_ALARM           = 37,
+    SYS_GETITIMER       = 36,
+    SYS_SETITIMER       = 38,
     SYS_EXECVE     = 59,    /* (path, argv, envp) */
     SYS_WAIT4      = 61,    /* (pid, status *, options, rusage *) */
     SYS_PIPE       = 22,    /* (int fds[2]) */
     SYS_PIPE2      = 293,   /* (int fds[2], flags) */
     SYS_EVENTFD    = 284,   /* (count) */
     SYS_EVENTFD2   = 290,   /* (count, flags): a count to wake a poll with */
+    SYS_INOTIFY_INIT = 253,
+    SYS_INOTIFY_ADD_WATCH = 254,
+    SYS_INOTIFY_RM_WATCH = 255,
+    SYS_INOTIFY_INIT1 = 294,
+    SYS_MEMFD_CREATE = 319,
 
     /* IPv4 sockets: TCP, UDP and ICMP echo, once the network module is in. */
     SYS_SOCKET     = 41,    /* (domain, type, protocol) */
@@ -260,7 +274,7 @@ enum {
 
 /* Descriptors a program may have at once, 0, 1 and 2 - the console -
    counted in. */
-#define PROGRAM_FILES 32
+#define PROGRAM_FILES 1024     /* descriptors a process may have: Linux's default limit */
 
 /* Arguments and environment variables a program can be given, the name it
    was called by counted in. The lists are copied out of the program starting
@@ -285,6 +299,7 @@ struct handle {
     uint32_t size;
     uint32_t offset;        /* where we are in it; in a folder, how far through the index */
     uint32_t folder;        /* the folder's own table entry, one-based */
+    uint32_t ofd;           /* a file's position, shared with its copies: one-based */
 };
 
 #define SOCK_MARK 0xFFFFFFF8u   /* a socket: the network module's number in
@@ -335,6 +350,8 @@ struct process_info {
     char     name[20];
 };
 bool process_info(unsigned index, struct process_info *out);
+/* /proc/<pid>/stat and the like: the length, or -1 if path is not one. */
+size_t process_file(const char *path, char *out, size_t max);
 
 /* What the window's page tables cost, and what a running program has
    borrowed for itself, for the `mem` command. */

@@ -27,7 +27,7 @@
 #define ENTRIES   512
 #define SLOT_SIZE (1ull << 39)      /* what one top-level entry covers */
 
-#define SPACES 32                   /* processes at once */
+#define SPACES 128                  /* processes at once */
 
 /* Pages are bought from the firmware a chunk at a time rather than one at a
    time. A call to firmware costs about the same whatever it is for, and a C
@@ -525,6 +525,7 @@ bool vm_fault(uint64_t addr) {
             fresh = (uint64_t *)page;
         } else if (!(low_below(page) || mem_firmware_kept(page)) ||
                    (fresh = page_from(level)) == NULL) {
+            dbg("vm: low page %x not ours: below %u kept %u\n", page, (uint64_t)low_below(page), (uint64_t)mem_firmware_kept(page));
             return false;           /* someone's, and in use: not to be hidden */
         }
         *at = (uint64_t)fresh | PRESENT | WRITE | USER | owned;
@@ -551,7 +552,7 @@ bool vm_mapped(uint64_t addr) {
     return at != NULL && (*at & PRESENT) != 0;
 }
 
-bool vm_map_shared(uint64_t addr, uint64_t page) {
+bool vm_map_shared(uint64_t addr, uint64_t page, bool writable) {
     uint64_t *at;
 
     /* Not under a program at a fixed address: its pages are the ones at their
@@ -560,7 +561,9 @@ bool vm_map_shared(uint64_t addr, uint64_t page) {
         (*at & PRESENT)) {
         return false;
     }
-    *at = page | PRESENT | USER | SHARED;
+    /* Writable is memory processes share on purpose (MAP_SHARED): every
+       write is everyone's, so it is never copied. */
+    *at = page | PRESENT | USER | SHARED | (writable ? WRITE : 0);
     __asm__ volatile("invlpg (%0)" : : "r"(addr) : "memory");
     return true;
 }
@@ -631,6 +634,26 @@ void vm_release(uint64_t addr, uint64_t size) {
         uint64_t *at = entry_for(page, false);
 
         if (at != NULL && (*at & PRESENT)) {
+            low_page_back(level, *at);
+            *at = 0;
+        }
+    }
+    flush_tlb();
+}
+
+/* Private pages under addr .. addr + size given back (madvise DONTNEED):
+   touched again they come back empty, or refilled from their file. A shared
+   page, and a device's, stay. */
+void vm_discard(uint64_t addr, uint64_t size) {
+    struct space *level = cur;
+
+    if (!vm_holds(addr, size)) {
+        return;
+    }
+    for (uint64_t page = addr; page < addr + size; page += VM_PAGE) {
+        uint64_t *at = entry_for(page, false);
+
+        if (at != NULL && (*at & PRESENT) && !(*at & (SHARED | DEVICE))) {
             low_page_back(level, *at);
             *at = 0;
         }

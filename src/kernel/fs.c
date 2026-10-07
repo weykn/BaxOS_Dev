@@ -846,31 +846,57 @@ int fs_file(size_t index, struct fs_file *file) {
     return file->name[0] != '\0' ? 0 : FS_ENOENT;
 }
 
+#define LIST_RUN 64     /* index sectors read in one call while listing */
+
 int fs_list(const char *folder, size_t *cursor, struct fs_file *file, size_t *index) {
     uint32_t inside = hash_of(folder, strlen(folder));
+    uint32_t run_first = 0, run_count = 0;
+    char *run;
+    int err = FS_ENOENT;
 
     if (load_table() < 0) {
         return FS_EIO;
     }
     /* Through the index, record by record: the folder's hash says which
-       entries might be in it, and only those are read. */
+       entries might be in it, and only those are read. The index is read a
+       run of sectors at a time, not one by one: a call costs the same
+       whatever it reads, and on a disk with a system installed the index is
+       a thousand sectors - one call each was seconds for every folder
+       listed, modman's at boot among them. */
+    run = mem_alloc(LIST_RUN * SECTOR_SIZE);
     for (; *cursor < (size_t)head.index_sectors * RECORDS; (*cursor)++) {
+        uint32_t at = (uint32_t)(*cursor / RECORDS);
         const struct record *r;
 
-        if (load_sector(head.index_lba + (uint32_t)(*cursor / RECORDS)) < 0) {
-            return FS_EIO;
+        if (run != NULL) {
+            if (run_count == 0 || at < run_first || at >= run_first + run_count) {
+                run_first = at;
+                run_count = head.index_sectors - at < LIST_RUN ? head.index_sectors - at : LIST_RUN;
+                if (ata_read_many(head.index_lba + at, run_count, run) < 0) {
+                    err = FS_EIO;
+                    break;
+                }
+            }
+            r = &((const struct record *)(run + (size_t)(at - run_first) * SECTOR_SIZE))[*cursor % RECORDS];
+        } else {
+            if (load_sector(head.index_lba + at) < 0) {
+                err = FS_EIO;
+                break;
+            }
+            r = &((const struct record *)sector)[*cursor % RECORDS];
         }
-        r = &((const struct record *)sector)[*cursor % RECORDS];
         if (r->entry == 0 || r->entry == GONE || r->parent != inside) {
             continue;
         }
         *index = r->entry - 1;
         if (fs_file(*index, file) == 0 && fs_inside(folder, file->name) != NULL) {
             (*cursor)++;
-            return 0;
+            err = 0;
+            break;
         }
     }
-    return FS_ENOENT;
+    mem_free(run);
+    return err;
 }
 
 static int stat_at(const char *path, bool follow, struct fs_file *file) {

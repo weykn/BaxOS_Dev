@@ -36,6 +36,7 @@
 #define ECHILD 10
 #define ENOSPC 28
 #define EPERM   1
+#define EDEADLK 35
 #define ENOTEMPTY 39
 #define ENFILE 23
 #define EPIPE  32
@@ -55,6 +56,8 @@
 #define EOPNOTSUPP      95
 #define ENOTSOCK        88
 #define ENOTCONN        107
+#define EMSGSIZE        90
+#define ENOBUFS         105
 #define ECONNREFUSED    111
 #define EADDRINUSE      98
 
@@ -66,7 +69,8 @@
 #define PIPE_MARK    0xFFFFFFFAu    /* one end of a pipe */
 #define DEV_MARK     0xFFFFFFF9u    /* one of the made-up files in /dev */
 #define MOD_MARK     0xFFFFFFF7u    /* a module's own: its files slot in size */
-#define FIRST_MARK   MOD_MARK       /* below this, a start is a sector */
+#define MEM_MARK     0xFFFFFFF6u    /* a file in memory only (memfd_create): its pages its ofd's */
+#define FIRST_MARK   MEM_MARK       /* below this, a start is a sector */
 
 /* Files a module makes under /dev - ipc/pty's /dev/ptmx and /dev/pts/N. A
  * descriptor on one is MOD_MARK, with the module's slot in size; folder and
@@ -155,6 +159,10 @@ struct times {
     uint64_t sys;               /* how long the kernel worked for it */
     uint64_t children_wall;     /* how long its finished children ran */
     uint64_t children_user, children_sys;   /* and what of it was which */
+    uint64_t user;              /* how long it ran its own code: nothing
+                                   takes the processor from a program
+                                   between syscalls, so that is the gaps */
+    uint64_t left;              /* when its last syscall returned */
 };
 
 /* The running process's, through these: every process has its own. */
@@ -165,9 +173,7 @@ struct times *process_times(void);
 #define TERMIOS_OLD 36
 #define TERMIOS_NEW 44
 
-#define WRITERS 4
-char (*process_writers(void))[FS_NAME_LEN];
-#define writer_names (process_writers())
+const char *write_name(const struct handle *h);   /* a file open for writing: its name */
 
 /* The working directory, for a relative path in the *at calls. */
 #define AT_FDCWD (-100)
@@ -206,6 +212,26 @@ const char  *proc_net_name(const char *path);
 /* /proc/self/fd/N, and /proc/<own pid>/fd/N: the path descriptor N is open
    on, into out (at least FS_NAME_LEN + 16 bytes) - or NULL for any other name. */
 const char  *proc_fd_target(const char *name, char *out, size_t max);
+uint64_t     fd_truncate(uint64_t fd, uint64_t length);   /* ftruncate */
+/* A process's user and groups: real, effective, saved. 0 is root. */
+struct creds {
+    uint32_t uid, euid, suid, gid, egid, sgid, ngroups;
+    uint32_t groups[16];
+    uint8_t  keepcaps;              /* PR_SET_KEEPCAPS: root's rights outlive
+                                       giving up uid 0, until the next execve */
+    uint8_t  capable;               /* so kept */
+    uint16_t umask_off;             /* umask, as how it differs from 022 - so
+                                       a fresh process's zero is the usual */
+};
+struct creds *process_creds(void);
+bool         proc_fd_folder(const char *name);   /* /proc/self/fd, or /proc/<own pid>/fd */
+int          proc_pid_folder(const char *name, uint32_t *uid, uint32_t *gid);
+                                                 /* /proc/<pid>: its pid and owner, or 0 */
+int          proc_pid_at(unsigned index);        /* the index'th live process's pid, or 0 */
+
+unsigned     proc_task_links(const char *name);  /* /proc/self/task's link count, or 0 */
+#define PROC_FD_FOLDER 4                         /* its PROCDIR_MARK folder */
+#define PROC_PIDS_FOLDER 5                       /* /proc itself's */
 uint32_t     file_ino(const char *name, bool follow);
 bool         is_fifo(const struct fs_file *file);
 uint64_t     self_us(void);

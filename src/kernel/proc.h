@@ -30,6 +30,7 @@ const struct proc_cmd *proc_command(const char *path);
 
 /* Whether a path names /ctl itself. */
 bool proc_folder(const char *path);
+void process_maps(char *out, size_t max);  /* syscall.c: /proc/self/maps */
 
 /* What reading the file gives: its name and usage, one line. Returns how
    many bytes that is, and copies at most max of them from offset on. */

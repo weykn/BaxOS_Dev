@@ -330,11 +330,19 @@ static uint64_t sys_getpeername(uint64_t fd, uint64_t addr, uint64_t lenp) {
     return name_call(fd, addr, lenp, true);
 }
 
+#define SO_PASSCRED 16
+#define SCM_CREDENTIALS 2
+#define SOCK_SEQPACKET 5
+
 static uint64_t sys_setsockopt(uint64_t fd, uint64_t level, uint64_t name) {
-    (void)fd;
-    (void)level;
-    (void)name;
-    return 0;                       /* nothing here to tune */
+    uint64_t value = syscall_args()[3];
+
+    /* Who sends, with each message: Chromium's zygote learns its children's
+       pids this way. Everything else here has nothing to tune. */
+    if (level == SOL_SOCKET && name == SO_PASSCRED && user_range(value, 4)) {
+        pair_flags(fd, *(const int32_t *)value != 0);
+    }
+    return 0;
 }
 
 static uint64_t sys_getsockopt(uint64_t fd, uint64_t level, uint64_t name) {
@@ -351,7 +359,7 @@ static uint64_t sys_getsockopt(uint64_t fd, uint64_t level, uint64_t name) {
     }
     switch (name) {
     case SO_TYPE:
-        value[0] = SOCK_STREAM;
+        value[0] = (pair_flags(fd, -1) & 2) != 0 ? SOCK_SEQPACKET : SOCK_STREAM;
         break;
     case SO_SNDBUF:
     case SO_RCVBUF:
@@ -378,27 +386,59 @@ static uint64_t sys_shutdown(uint64_t fd, uint64_t how, uint64_t c) {
     return handle_of(fd) != NULL ? 0 : ERR(EBADF);
 }
 
-/* sendmsg and recvmsg: the iovecs, written or read through the pair. What
-   rides along in the control part - descriptors, credentials - is not
-   passed; a reader is told there was none. */
+/* sendmsg and recvmsg: the iovecs, written or read through the pair, and
+   the descriptors in the control part (SCM_RIGHTS) passed with them - the
+   kernel holds them until they are read. Credentials are not passed. */
+#define SCM_RIGHTS       1
+#define MSG_CTRUNC       0x8
+#define MSG_TRUNC        0x20
+#define MSG_DONTWAIT     0x40
+#define MSG_CMSG_CLOEXEC 0x40000000
+#define PASS_FDS         16
+
+struct cmsghdr {
+    uint64_t len;
+    int32_t  level, type;
+};
+
 static uint64_t sys_sendmsg(uint64_t fd, uint64_t msg, uint64_t flags) {
     const struct msghdr *m = (const struct msghdr *)msg;
-    uint64_t done = 0;
+    struct handle fds[PASS_FDS];
+    uint32_t nfd = 0;
+    uint64_t result;
 
-    (void)flags;
-    if (!user_range(msg, sizeof *m) || !user_range(m->iov, m->iovlen * sizeof(struct iovec))) {
+    if (!user_range(msg, sizeof *m) || !user_range(m->iov, m->iovlen * sizeof(struct iovec)) ||
+        (m->controllen != 0 && !user_range(m->control, m->controllen))) {
         return ERR(EFAULT);
     }
-    for (uint64_t i = 0; i < m->iovlen; i++) {
-        const struct iovec *v = (const struct iovec *)m->iov + i;
-        uint64_t n = v->len != 0 ? fd_write(fd, v->base, v->len) : 0;
+    for (uint64_t at = 0; m->control != 0 && at + sizeof(struct cmsghdr) <= m->controllen;) {
+        const struct cmsghdr *c = (const struct cmsghdr *)(m->control + at);
 
-        if ((int64_t)n < 0) {
-            return done > 0 ? done : n;
+        if (c->len < sizeof *c || at + c->len > m->controllen) {
+            break;
         }
-        done += n;
+        if (c->level == SOL_SOCKET && c->type == SCM_RIGHTS) {
+            const int32_t *given = (const int32_t *)(c + 1);
+
+            for (uint64_t i = 0; i < (c->len - sizeof *c) / 4; i++) {
+                if (nfd == PASS_FDS || !handle_share((uint64_t)(uint32_t)given[i], &fds[nfd])) {
+                    while (nfd > 0) {
+                        handle_close(&fds[--nfd]);
+                    }
+                    return ERR(nfd == PASS_FDS ? EINVAL : EBADF);
+                }
+                nfd++;
+            }
+        }
+        at += (c->len + 7) & ~7ull;
     }
-    return done;
+    result = pair_send(fd, m->iov, m->iovlen, fds, nfd, (flags & MSG_DONTWAIT) != 0);
+    if ((int64_t)result < 0) {
+        while (nfd > 0) {
+            handle_close(&fds[--nfd]);
+        }
+    }
+    return result;
 }
 
 static uint64_t sys_recvmsg(uint64_t fd, uint64_t msg, uint64_t flags) {
@@ -409,32 +449,69 @@ static uint64_t sys_recvmsg(uint64_t fd, uint64_t msg, uint64_t flags) {
     if (sock_of(h) != NULL && sock_of(h)->uevent) {
         return ERR(EAGAIN);         /* no device has come or gone */
     }
-    (void)flags;
-    if (!user_range(msg, sizeof *m) || !user_range(m->iov, m->iovlen * sizeof(struct iovec))) {
+    struct handle fds[PASS_FDS];
+    uint32_t nfd = 0;
+    bool cut = (flags & MSG_DONTWAIT) != 0;
+
+    if (!user_range(msg, sizeof *m)) {
         return ERR(EFAULT);
     }
-    for (uint64_t i = 0; i < m->iovlen; i++) {
-        const struct iovec *v = (const struct iovec *)m->iov + i;
-
-        if (v->len == 0) {
-            continue;
-        }
-        if (done > 0 && !readable(h)) {
-            break;                  /* what there was is all there is: no waiting for more */
-        }
-        uint64_t n = fd_read(fd, v->base, v->len);
-
-        if ((int64_t)n < 0) {
-            return done > 0 ? done : n;
-        }
-        done += n;
-        if (n < v->len) {
-            break;
-        }
+    done = pair_recv(fd, m->iov, m->iovlen, fds, &nfd, &cut);
+    if ((int64_t)done < 0) {
+        return done;
     }
-    m->controllen = 0;
-    m->flags = 0;
+    m->flags = cut ? MSG_TRUNC : 0;
     m->namelen = 0;
+    uint64_t room = m->control != 0 && user_range(m->control, m->controllen) ? m->controllen : 0;
+    uint64_t need = sizeof(struct cmsghdr) + 4 * (uint64_t)nfd;
+
+    /* Who sent it, where the reader asked (SO_PASSCRED): after any
+       descriptors, as its own message. */
+    uint64_t creds = (pair_flags(fd, -1) & 1) != 0 ? sizeof(struct cmsghdr) + 12 : 0;
+    uint64_t rights = nfd != 0 ? (need + 7) & ~7ull : 0;
+
+    if (creds != 0 && room >= rights + creds) {
+        struct cmsghdr *c = (struct cmsghdr *)(m->control + rights);
+        uint32_t *who = (uint32_t *)(c + 1);
+
+        c->len = creds;
+        c->level = SOL_SOCKET;
+        c->type = SCM_CREDENTIALS;
+        who[0] = (uint32_t)pair_sender;
+        who[1] = who[2] = 0;        /* root */
+    } else {
+        creds = 0;
+    }
+    if (nfd == 0) {
+        m->controllen = creds;
+    } else if (room < need) {
+        while (nfd > 0) {
+            handle_close(&fds[--nfd]);      /* no room for them: they are lost */
+        }
+        m->flags |= MSG_CTRUNC;
+        m->controllen = 0;
+    } else {
+        struct cmsghdr *c = (struct cmsghdr *)m->control;
+        int32_t *got = (int32_t *)(c + 1);
+
+        c->len = need;
+        c->level = SOL_SOCKET;
+        c->type = SCM_RIGHTS;
+        for (uint32_t i = 0; i < nfd; i++) {
+            uint64_t made = give_handle(fds[i]);
+
+            if ((int64_t)made < 0) {
+                handle_close(&fds[i]);
+                got[i] = -1;
+                continue;
+            }
+            if ((flags & MSG_CMSG_CLOEXEC) != 0) {
+                fd_cloexec(made, true);
+            }
+            got[i] = (int32_t)made;
+        }
+        m->controllen = rights + ((creds + 7) & ~7ull);
+    }
     return done;
 }
 

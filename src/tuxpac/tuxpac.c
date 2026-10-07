@@ -50,11 +50,11 @@
 #define NBUF    16384               /* the socket */
 #define LINE    5120                /* a line of the index */
 #define MIRRORS 8
-#define PLAN    256                 /* packages one command installs */
-#define WANTS   512                 /* dependencies one round looks for */
+#define PLAN    1024                /* packages one command installs */
+#define WANTS   2048                /* dependencies one round looks for */
 #define VER     40
-#define WTEXT   16384
-#define NAMES   8192
+#define WTEXT   65536
+#define NAMES   32768
 #define CONF    4096
 #define POST    16384               /* a postinst, for its alternatives */
 #define PATH    256                 /* a path */
@@ -784,6 +784,27 @@ static bool db_save(const char *extra) {
     return true;
 }
 
+/* A package newly installed: its line onto the end of the list, rather than
+   the whole list written again - which, with dpkg's status after it, was
+   most of what installing a hundred small packages cost. dpkg's status is
+   written once, before the scripts that read it (configure). */
+static bool db_add(const char *line) {
+    long fd;
+    size_t n = strlen(line);
+
+    mkdirs(LIB);
+    if ((fd = sys_open(DB, O_WRONLY | O_CREAT | O_APPEND, 0644)) < 0 ||
+        sys_write((int)fd, line, n) != (long)n) {
+        if (fd >= 0) {
+            sys_close((int)fd);
+        }
+        fail("tuxpac: " DB ": cannot write\n");
+        return false;
+    }
+    sys_close((int)fd);
+    return db_load();
+}
+
 static int find_inst(const char *name, uint32_t n) {
     for (uint32_t i = 0; i < ndb; i++) {
         if (!db[i].gone && same(db[i].name, (uint32_t)strlen(db[i].name), name, n)) {
@@ -1029,8 +1050,11 @@ static char    *list;
 static uint32_t list_len, list_cap;
 static const char *unpacking;       /* the package whose scripts are being kept */
 
-/* The maintainer scripts dpkg keeps, and the triggers file. */
-static const char *const scripts[] = { "preinst", "postinst", "prerm", "postrm", "triggers" };
+/* The maintainer scripts dpkg keeps, the triggers file, and debconf's two:
+   its frontend runs config and loads templates from beside the script it
+   is handed, and a question it has no template for fails the script. */
+static const char *const scripts[] = { "preinst", "postinst", "prerm", "postrm", "triggers",
+                                       "config", "templates" };
 
 /* Where package pkg's script is kept. */
 static void script_path(char *out, const char *pkg, const char *script) {
@@ -1719,6 +1743,7 @@ static void status_write(void) {
 
     mkdirs("/var/lib/dpkg/info");
     mkdirs("/var/lib/dpkg/updates");
+    mkdirs("/var/lib/dpkg/triggers");   /* dpkg-trigger's lock goes in it */
     mkdirs("/var/lib/dpkg/alternatives");
     mkdirs("/etc/alternatives");
     out_open(&o, STATUS);
@@ -1952,7 +1977,7 @@ static bool install(uint32_t off, char flag) {
         *u = '\0';
         unpacked_len = (uint32_t)(u - unpacked);
     }
-    return db_save(entry);
+    return k >= 0 ? db_save(entry) : db_add(entry);
 }
 
 /* ---- configuring ---------------------------------------------------------- *
@@ -2049,6 +2074,10 @@ static void triggers(void) {
    made from the script's own lines. */
 static void configure(void) {
     char sp[PATH];
+
+    if (unpacked_len > 0) {
+        status_write();             /* what the scripts below ask dpkg about */
+    }
 
     for (char *c = unpacked; c < unpacked + unpacked_len;) {
         char *name = c, *old;

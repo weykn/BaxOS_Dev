@@ -23,7 +23,7 @@
    wherever the firmware has room. The kernel is position-independent and
    applies its own relocations first thing, so no address is fixed - a
    fixed one is exactly what a firmware short of memory has already used. */
-#define KERNEL_BYTES  0x20000
+#define KERNEL_BYTES  0x28000
 
 struct boot_info {
     uint64_t magic;

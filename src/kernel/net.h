@@ -142,6 +142,16 @@ unsigned sock_ready(const struct handle *h);
 /* Two connected socketpair ends, not yet anyone's descriptors - flags is
    socket()'s, for O_NONBLOCK. False if there is no room. */
 bool pair_new(struct handle out[2], uint32_t flags);
+/* A pair end's sendmsg and recvmsg: the program's iovecs at iov, and the
+   descriptors passed with them (SCM_RIGHTS) - at most 16 a message. On the
+   way in, *cut says MSG_DONTWAIT; on the way out, that a message was cut. */
+uint64_t pair_send(uint64_t fd, uint64_t iov, uint64_t n, const struct handle *fds, uint32_t nfd,
+                   bool nonblock);
+uint64_t pair_recv(uint64_t fd, uint64_t iov, uint64_t n, struct handle *fds, uint32_t *nfd,
+                   bool *cut);
+bool     handle_share(uint64_t fd, struct handle *out);   /* fd, held again, to send */
+int      pair_flags(uint64_t fd, int on);       /* bit 0 SO_PASSCRED (on: set it, <0 leave), bit 1 packets */
+extern int pair_sender;                         /* who sent what recvmsg last took */
 
 /* Lets go of a handle no descriptor holds: one queued and never taken. */
 void handle_close(struct handle *h);

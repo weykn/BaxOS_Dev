@@ -8,7 +8,7 @@ DEFAULT REL
 SECTION .text
 GLOBAL user_enter, user_resume, user_exit, syscall_entry, trap_stubs, page_fault_entry
 GLOBAL user_frame, user_cs, user_ss, user_flags, thread_switch
-EXTERN syscall_dispatch, page_fault, trap_report, tss, process_exit
+EXTERN syscall_dispatch, page_fault, trap_signal, tss, process_exit
 
 ; A program's RFLAGS, in user_flags below: the always-one bit, and IF while
 ; the firmware is running. Interrupts have to stay on in ring 3 then: the
@@ -227,33 +227,79 @@ syscall_entry:
 
 ; Every CPU exception but the page fault lands here: one stub per vector, all
 ; the same size, so that the C side can install them from a single symbol.
-; Each says which vector it was and then ends the program, as Linux would with
-; a signal - an illegal instruction and a general protection fault are worth
-; telling apart, and used to be indistinguishable.
-TRAP_STRIDE equ 16
+; Each puts a zero where the processor pushed no error code, so every frame is
+; alike, saves the registers whole (struct trap_regs) and asks trap_signal -
+; which sends the program the signal Linux would (SIGSEGV, SIGILL, SIGTRAP,
+; SIGFPE, SIGBUS): to its handler, the frame changed to run it, or, with
+; none, the end of it. A handler is how Firefox's JavaScript and Chromium's
+; crash reporter work, and what a debugger is told.
+TRAP_STRIDE equ 32
 
-ALIGN 16
+ALIGN 32
 trap_stubs:
 %assign vector 0
 %rep 32
     ALIGN TRAP_STRIDE
+%if vector == 8 || (vector >= 10 && vector <= 14) || vector == 17 || vector == 21 || vector == 29 || vector == 30
+%else
+    push 0                          ; no error code: a zero in its place
+%endif
     push rdi
+    push rsi
     mov edi, vector
-    mov rsi, rsp                    ; the saved RDI, then the CPU's own frame
     jmp trap_common
 %assign vector vector + 1
 %endrep
 
+%macro SAVE_REST 0
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+%endmacro
+
+%macro RESTORE_ALL 0
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    pop rsi
+    pop rdi
+    add rsp, 8                          ; the error code
+%endmacro
+
 trap_common:
+    SAVE_REST
     cld                                 ; the program may have left DF set
     ; With no program running there is no frame to go back to, and the fault
     ; is the kernel's own. Stopping leaves whatever it was on screen to read,
     ; where returning would run off a stack that was never set up.
     cmp qword [kernel_rsp], 0
     je .stop
-    call trap_report                    ; EDI is still the vector
-    mov edi, KILLED
-    call process_exit                   ; every thread of it, not only this one
+    mov rsi, rsp                        ; the registers; EDI is still the vector
+    sub rsp, 8                          ; the frame, the code and fifteen pushes: 8 off
+    call trap_signal                    ; returns only to run a handler
+    add rsp, 8
+    RESTORE_ALL
+    iretq
 .stop:
     cli
     hlt
@@ -261,34 +307,20 @@ trap_common:
 
 ; A page fault is normally a program touching a page of its window for the
 ; first time: page_fault(address) maps one in and returns, and the access is
-; retried. For anything else it ends the program itself. It can strike in
-; the middle of kernel code too, so everything a C call may clobber is kept.
+; retried. One it cannot answer is the program's SIGSEGV. It can strike in
+; the middle of kernel code too, so every register is kept, in the same
+; frame as the other exceptions'.
 page_fault_entry:
-    push rax
-    push rcx
-    push rdx
-    push rsi
     push rdi
-    push r8
-    push r9
-    push r10
-    push r11
-    sub rsp, 8                          ; the CPU's frame and nine pushes leave RSP 8 off
+    push rsi
+    SAVE_REST
     cld
     mov rdi, cr2                        ; the address that faulted
-    mov rsi, [rsp + 88]                 ; and the instruction, past the error code
+    mov rsi, rsp                        ; and the registers
+    sub rsp, 8
     call page_fault
     add rsp, 8
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rax
-    add rsp, 8                          ; the error code
+    RESTORE_ALL
     iretq
 
 SECTION .data

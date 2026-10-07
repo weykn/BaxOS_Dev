@@ -360,18 +360,69 @@ static void cpu_name(char *vendor, char *brand) {
         brand[n] = s[n];
         n++;
     }
+    while (n > 0 && brand[n - 1] == ' ') {
+        n--;                        /* and some on the right */
+    }
     brand[n] = '\0';
+}
+
+/* The flags line of /proc/cpuinfo, Linux's names for what CPUID says - what
+   a program reads to decide whether it can run (SSE3 is "pni"). Only what the
+   kernel lets programs use: AVX and its kin need XSAVE turned on, and it is
+   left off, so they are not claimed even where the processor has them. */
+static void cpu_flags(char *p) {
+    static const struct { uint8_t leaf, reg, bit; const char *name; } known[] = {
+        /* leaf 1 EDX (reg 3) */
+        { 0, 3, 0, "fpu" }, { 0, 3, 1, "vme" }, { 0, 3, 2, "de" }, { 0, 3, 3, "pse" },
+        { 0, 3, 4, "tsc" }, { 0, 3, 5, "msr" }, { 0, 3, 6, "pae" }, { 0, 3, 7, "mce" },
+        { 0, 3, 8, "cx8" }, { 0, 3, 9, "apic" }, { 0, 3, 11, "sep" }, { 0, 3, 12, "mtrr" },
+        { 0, 3, 13, "pge" }, { 0, 3, 14, "mca" }, { 0, 3, 15, "cmov" }, { 0, 3, 16, "pat" },
+        { 0, 3, 17, "pse36" }, { 0, 3, 19, "clflush" }, { 0, 3, 23, "mmx" }, { 0, 3, 24, "fxsr" },
+        { 0, 3, 25, "sse" }, { 0, 3, 26, "sse2" }, { 0, 3, 28, "ht" },
+        /* leaf 0x80000001 EDX */
+        { 2, 3, 11, "syscall" }, { 2, 3, 20, "nx" }, { 2, 3, 26, "pdpe1gb" }, { 2, 3, 27, "rdtscp" },
+        { 2, 3, 29, "lm" },
+        /* leaf 1 ECX (reg 2) */
+        { 0, 2, 0, "pni" }, { 0, 2, 1, "pclmulqdq" }, { 0, 2, 9, "ssse3" }, { 0, 2, 13, "cx16" },
+        { 0, 2, 19, "sse4_1" }, { 0, 2, 20, "sse4_2" }, { 0, 2, 22, "movbe" }, { 0, 2, 23, "popcnt" },
+        { 0, 2, 25, "aes" }, { 0, 2, 30, "rdrand" }, { 0, 2, 31, "hypervisor" },
+        /* leaf 0x80000001 ECX */
+        { 2, 2, 0, "lahf_lm" }, { 2, 2, 5, "abm" }, { 2, 2, 6, "sse4a" }, { 2, 2, 8, "3dnowprefetch" },
+        /* leaf 7 EBX (reg 1) */
+        { 1, 1, 0, "fsgsbase" }, { 1, 1, 3, "bmi1" }, { 1, 1, 8, "bmi2" }, { 1, 1, 9, "erms" },
+        { 1, 1, 18, "rdseed" }, { 1, 1, 19, "adx" }, { 1, 1, 23, "clflushopt" }, { 1, 1, 29, "sha_ni" },
+    };
+    uint32_t r[3][4] = { { 0 } };
+
+    __asm__ volatile("cpuid" : "=a"(r[0][0]), "=b"(r[0][1]), "=c"(r[0][2]), "=d"(r[0][3]) : "a"(1));
+    __asm__ volatile("cpuid" : "=a"(r[1][0]), "=b"(r[1][1]), "=c"(r[1][2]), "=d"(r[1][3]) : "a"(7), "c"(0));
+    __asm__ volatile("cpuid" : "=a"(r[2][0]), "=b"(r[2][1]), "=c"(r[2][2]), "=d"(r[2][3]) : "a"(0x80000001));
+    strcpy(p, "flags\t\t:");
+    p += strlen(p);
+    for (unsigned i = 0; i < sizeof known / sizeof known[0]; i++) {
+        if (r[known[i].leaf][known[i].reg] & (1u << known[i].bit)) {
+            ksprintf(p, " %s", known[i].name);
+            p += strlen(p);
+        }
+    }
+    strcpy(p, "\n");
 }
 
 size_t proc_linux(const char *path, char *out, size_t max) {
     static const char *const names[] = {
         "/proc/uptime", "/proc/meminfo", "/proc/cpuinfo",
         "/sys/devices/virtual/dmi/id/product_name", "/sys/devices/virtual/dmi/id/product_version",
-        "/sys/class/drm/card0/modes",
+        "/sys/class/drm/card0/modes", "/proc/mounts", "/proc/self/mounts",
+        "/proc/sys/fs/inotify/max_user_watches", "/proc/sys/fs/inotify/max_user_instances",
+        "/proc/self/maps",
     };
-    char text[512], *p = text;
+    char text[1024], *p = text;
     unsigned which = 0;
+    size_t own = process_file(path, out, max);
 
+    if (own != (size_t)-1) {
+        return own;
+    }
     while (which < sizeof names / sizeof names[0] && strcmp(path, names[which]) != 0) {
         which++;
     }
@@ -397,10 +448,37 @@ size_t proc_linux(const char *path, char *out, size_t max) {
     } else if (which == 2) {
         char vendor[13], brand[48];
 
+        uint32_t sig, unused;
+
         cpu_name(vendor, brand);
-        ksprintf(p, "processor\t: 0\nvendor_id\t: %s\nmodel name\t: %s\n"
-                 "cpu MHz\t\t: %u.000\ncpu cores\t: 1\n\n",
-                 vendor, brand, (unsigned)(efi_tsc_hz() / 1000000));
+        __asm__ volatile("cpuid" : "=a"(sig), "=b"(unused), "=c"(unused), "=d"(unused) : "a"(1));
+        unsigned family = (sig >> 8 & 0xF) + (((sig >> 8 & 0xF) == 0xF) ? (sig >> 20 & 0xFF) : 0);
+        unsigned model = (sig >> 4 & 0xF) | ((sig >> 8 & 0xF) >= 6 ? (sig >> 12 & 0xF0) : 0);
+
+        ksprintf(p, "processor\t: 0\nvendor_id\t: %s\ncpu family\t: %u\nmodel\t\t: %u\n"
+                 "model name\t: %s\nstepping\t: %u\ncpu MHz\t\t: %u.000\n"
+                 "physical id\t: 0\nsiblings\t: 1\ncore id\t\t: 0\ncpu cores\t: 1\n",
+                 vendor, family, model, brand, sig & 0xF, (unsigned)(efi_tsc_hz() / 1000000));
+        p += strlen(p);
+        cpu_flags(p);
+        p += strlen(p);
+        ksprintf(p, "bogomips\t: %u.00\naddress sizes\t: 39 bits physical, 48 bits virtual\n\n",
+                 (unsigned)(efi_tsc_hz() / 500000));
+        p = text;
+    } else if (which == 6 || which == 7) {
+        /* What is mounted where, as the compat module answers statfs: the
+           disk at /, and Linux's own filesystems over the kernel's files. */
+        strcpy(p, "/dev/root / ext4 rw,relatime 0 0\n"
+                  "proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n"
+                  "sysfs /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0\n"
+                  "devtmpfs /dev devtmpfs rw,nosuid,relatime 0 0\n"
+                  "devpts /dev/pts devpts rw,nosuid,noexec,relatime 0 0\n"
+                  "tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0\n"
+                  "tmpfs /run tmpfs rw,nosuid,nodev 0 0\n");
+    } else if (which == 10) {
+        process_maps(p, sizeof text);
+    } else if (which == 8 || which == 9) {
+        strcpy(p, which == 8 ? "8192\n" : "128\n");
     } else if (which == 5) {
         ksprintf(p, "%ux%u\n", vga_pixel_width(), vga_pixel_height());
     } else if (efi_machine(which - 3)[0] != '\0') {
