@@ -47,3 +47,7 @@ void console_keys(bool on);
    much of them the program asked for or handed over. */
 void console_get(void *out, size_t size);
 void console_set(const void *in, size_t size);
+
+/* The process that last changed them, 0 once they are reset: they are put
+   back when it ends, however it ends, so the shell after it reads a line. */
+extern int console_changer;

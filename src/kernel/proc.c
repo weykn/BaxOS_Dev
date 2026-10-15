@@ -152,9 +152,15 @@ void proc_print(const char *text) {
    that never comes. */
 static char greeting[160];
 
+/* greet <text> keeps it; greet alone shows it - tsh does, after the boot
+   script. */
 static void cmd_greet(char *args) {
     size_t n = strlen(args);
 
+    if (n == 0) {
+        proc_greet();
+        return;
+    }
     n = n < sizeof greeting - 1 ? n : sizeof greeting - 1;
     memcpy(greeting, args, n);
     greeting[n] = '\0';
@@ -281,6 +287,7 @@ static void cmd_mem(char *args) {
     PART("kernel stack", m.stack);
     PART("page tables", m.page_tables);
     PART("console", m.console);
+    PART("kernel heap", m.heap);
     if (m.modules > 0) {
         PART("modules", m.modules);
     }
@@ -414,7 +421,8 @@ size_t proc_linux(const char *path, char *out, size_t max) {
         "/sys/devices/virtual/dmi/id/product_name", "/sys/devices/virtual/dmi/id/product_version",
         "/sys/class/drm/card0/modes", "/proc/mounts", "/proc/self/mounts",
         "/proc/sys/fs/inotify/max_user_watches", "/proc/sys/fs/inotify/max_user_instances",
-        "/proc/self/maps",
+        "/proc/self/maps", "/proc/version", "/proc/sys/kernel/osrelease",
+        "/proc/sys/kernel/ostype", "/proc/sys/kernel/pid_max", "/proc/self/environ",
     };
     char text[1024], *p = text;
     unsigned which = 0;
@@ -477,6 +485,12 @@ size_t proc_linux(const char *path, char *out, size_t max) {
                   "tmpfs /run tmpfs rw,nosuid,nodev 0 0\n");
     } else if (which == 10) {
         process_maps(p, sizeof text);
+    } else if (which == 11) {
+        strcpy(p, "Linux version 1 (tuxlet) #1\n");
+    } else if (which >= 12 && which <= 14) {
+        strcpy(p, which == 12 ? "1\n" : which == 13 ? "Linux\n" : "32768\n");
+    } else if (which == 15) {
+        text[0] = '\0';            /* what a program was started with is its own */
     } else if (which == 8 || which == 9) {
         strcpy(p, which == 8 ? "8192\n" : "128\n");
     } else if (which == 5) {
@@ -502,8 +516,7 @@ static const struct proc_cmd commands[] = {
     { "modman", "[enable|disable <module>|auto <category>|takeover]", module_command },
     { "clear",  "",                  cmd_clear },
     { "echo",   "[text]",            cmd_echo },
-    { "greet",  "<text>",            cmd_greet },
-    { "tsh",    "[script]",          shell_tsh },
+    { "greet",  "[text]",            cmd_greet },
     { "reboot", "",                  cmd_reboot },
     { "poweroff", "",                cmd_poweroff },
 };

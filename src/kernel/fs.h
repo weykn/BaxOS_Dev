@@ -28,7 +28,7 @@
 #define FS_MAGIC  0x39465842u       /* "BXF9": the table, and an index to find names in it */
 #define FS_SECTOR 512               /* bytes in a sector, here and on disk */
 
-#define FS_NAME_LEN  120    /* a whole path, including the NUL: an entry is 128 */
+#define FS_NAME_LEN  248    /* a whole path, including the NUL: an entry is 256 */
 #define FS_LINKS     40     /* links followed in one path, as Linux allows */
 #define FS_LINK_LEN  128    /* a link's target, including the NUL */
 #define FS_LINK      0x80000000u    /* in an entry's size: it is a link */

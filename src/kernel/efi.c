@@ -16,6 +16,7 @@
 #include "vga.h"
 #include "bios.h"
 #include "share.h"
+#include "pci.h"
 
 /* The kernel's side of the firmware.
  *
@@ -216,11 +217,25 @@ const char *efi_machine(unsigned which) {
     return which < 2 ? machine[which] : "";
 }
 
+/* efi_call.asm's stack for the firmware: boot services data, so leaving the
+   firmware frees it with the rest of its memory. */
+#define EFI_STACK_PAGES 32
+extern uint64_t efi_stack;
+
 void efi_init(struct boot_info *info) {
     kept = *info;
     boot = &kept;
     if (bios()) {
         bios_init(boot);
+    } else {
+        uint64_t at = 0;
+
+        /* The firmware's interrupts only while it is called (efi_call). */
+        __asm__ volatile("cli");
+        if (!EFI_ERROR(EFI_CALL(boot->system->boot->allocate_pages, EFI_ALLOCATE_ANY,
+                                4 /* boot services data */, EFI_STACK_PAGES, &at))) {
+            efi_stack = at + EFI_STACK_PAGES * 4096;
+        }
     }
     smbios_read();
 }
@@ -240,12 +255,12 @@ uint64_t efi_free_kib(void) {
 
     /* Asked once for the size, then for the map: the pool it goes in may add
        an entry or two of its own. */
-    bs->get_memory_map(&size, map, &key, &stride, &version);
+    EFI_CALL(bs->get_memory_map, &size, map, &key, &stride, &version);
     size += 4 * stride;
-    if (EFI_ERROR(bs->allocate_pool(EFI_LOADER_DATA, size, (void **)&map))) {
+    if (EFI_ERROR(EFI_CALL(bs->allocate_pool, EFI_LOADER_DATA, size, (void **)&map))) {
         return 0;
     }
-    if (!EFI_ERROR(bs->get_memory_map(&size, map, &key, &stride, &version))) {
+    if (!EFI_ERROR(EFI_CALL(bs->get_memory_map, &size, map, &key, &stride, &version))) {
         for (efi_uintn at = 0; at < size; at += stride) {
             const struct efi_memory_descriptor *d = (const void *)((char *)map + at);
 
@@ -254,7 +269,7 @@ uint64_t efi_free_kib(void) {
             }
         }
     }
-    bs->free_pool(map);
+    EFI_CALL(bs->free_pool, map);
     return pages * 4;
 }
 
@@ -304,7 +319,7 @@ const char *efi_leave(void) {
 
     /* The map, asked for until ExitBootServices takes it: anything the
        firmware does in between - even allocating this - changes it. */
-    bs->get_memory_map(&size, NULL, &key, &stride, &version);
+    EFI_CALL(bs->get_memory_map, &size, NULL, &key, &stride, &version);
     room = size + 16 * stride;
     map = mem_pages((room + 4095) / 4096);
     if (map == 0) {
@@ -315,7 +330,7 @@ const char *efi_leave(void) {
     uint64_t top = vga_framebuffer_end();
 
     size = room;
-    if (!EFI_ERROR(bs->get_memory_map(&size, (void *)map, &key, &stride, &version))) {
+    if (!EFI_ERROR(EFI_CALL(bs->get_memory_map, &size, (void *)map, &key, &stride, &version))) {
         for (efi_uintn at = 0; at < size; at += stride) {
             const struct efi_memory_descriptor *d = (const void *)(map + at);
             uint64_t end = d->physical + d->pages * 4096;
@@ -329,13 +344,14 @@ const char *efi_leave(void) {
     }
     for (unsigned tries = 0; ; tries++) {
         size = room;
-        if (EFI_ERROR(bs->get_memory_map(&size, (void *)map, &key, &stride, &version))) {
+        if (EFI_ERROR(EFI_CALL(bs->get_memory_map, &size, (void *)map, &key, &stride, &version))) {
             if (tries == 0) {
                 mem_pages_free(map, (room + 4095) / 4096);
             }
             return "no memory map";
         }
-        if (!EFI_ERROR(bs->exit_boot_services(boot->image, key))) {
+        if (!EFI_ERROR(EFI_CALL(bs->exit_boot_services, boot->image, key))) {
+            efi_stack = 0;          /* its memory is anybody's now */
             break;
         }
         if (tries == 3) {
@@ -414,7 +430,7 @@ char keyboard_poll_char(char (*idle)(void)) {
     if (bios()) {
         return bios_key();
     }
-    if (EFI_ERROR(in->read_key(in, &key))) {
+    if (EFI_ERROR(EFI_CALL(in->read_key, in, &key))) {
         return 0;
     }
     if (key.unicode_char == 0) {
@@ -483,7 +499,7 @@ static int read_now(uint32_t lba, unsigned count, void *buffer) {
     while (count > 0) {
         unsigned n = count < block_run ? count : block_run;
 
-        if (EFI_ERROR(disk->read_blocks(disk, boot->media_id, lba,
+        if (EFI_ERROR(EFI_CALL(disk->read_blocks, disk, boot->media_id, lba,
                                         (efi_uintn)n * 512, buffer))) {
             if (block_run > BLOCK_RUN_MIN) {
                 block_run /= 2;     /* more than this driver will take */
@@ -540,7 +556,7 @@ int ata_write_many(uint32_t lba, unsigned count, const void *buffer) {
     while (count > 0) {
         unsigned n = count < block_run ? count : block_run;
 
-        if (EFI_ERROR(disk->write_blocks(disk, boot->media_id, lba,
+        if (EFI_ERROR(EFI_CALL(disk->write_blocks, disk, boot->media_id, lba,
                                          (efi_uintn)n * 512, buffer))) {
             if (block_run > BLOCK_RUN_MIN) {
                 block_run /= 2;
@@ -571,7 +587,7 @@ void ata_sync(void) {
     if (disk_base != 0) {
         disk_driver->flush();
     } else if (disk != NULL) {
-        disk->flush_blocks(disk);
+        EFI_CALL(disk->flush_blocks, disk);
     }
 }
 
@@ -607,7 +623,7 @@ uint64_t efi_uptime_ms(void) {
     if (ticks_per_second == 0) {
         uint64_t from = rdtsc();
 
-        boot->system->boot->stall(CALIBRATE_US);
+        EFI_CALL(boot->system->boot->stall, CALIBRATE_US);
         ticks_per_second = (rdtsc() - from) * (1000000 / CALIBRATE_US);
         if (ticks_per_second == 0) {
             ticks_per_second = 1;       /* a counter that does not count */
@@ -640,7 +656,7 @@ static efi_status get_time(struct efi_time *now) {
     efi_status status;
 
     vm_firmware_view(true);
-    status = boot->system->runtime->get_time(now, NULL);
+    status = EFI_CALL(boot->system->runtime->get_time, now, NULL);
     vm_firmware_view(false);
     return status;
 }
@@ -704,7 +720,7 @@ void efi_power_off(void) {
         return;
     }
     vm_firmware_view(true);
-    boot->system->runtime->reset_system(EFI_RESET_SHUTDOWN, EFI_SUCCESS, 0, NULL);
+    EFI_CALL(boot->system->runtime->reset_system, EFI_RESET_SHUTDOWN, EFI_SUCCESS, 0, NULL);
 }
 
 void efi_restart(void) {
@@ -714,7 +730,7 @@ void efi_restart(void) {
         return;
     }
     vm_firmware_view(true);
-    boot->system->runtime->reset_system(EFI_RESET_COLD, EFI_SUCCESS, 0, NULL);
+    EFI_CALL(boot->system->runtime->reset_system, EFI_RESET_COLD, EFI_SUCCESS, 0, NULL);
 }
 
 /* ---- handing devices over ---------------------------------------------------
@@ -735,7 +751,7 @@ static efi_handle pci_handle(uint32_t at) {
     efi_handle *handles, found = NULL;
     efi_uintn count = 0;
 
-    if (EFI_ERROR(bs->locate_handle_buffer(2 /* by protocol */, &guid, NULL, &count,
+    if (EFI_ERROR(EFI_CALL(bs->locate_handle_buffer, 2 /* by protocol */, &guid, NULL, &count,
                                            &handles))) {
         return NULL;
     }
@@ -743,18 +759,18 @@ static efi_handle pci_handle(uint32_t at) {
         void **io;
         efi_uintn seg, bus, dev, fn;
 
-        if (EFI_ERROR(bs->handle_protocol(handles[i], &guid, (void **)&io))) {
+        if (EFI_ERROR(EFI_CALL(bs->handle_protocol, handles[i], &guid, (void **)&io))) {
             continue;
         }
         efi_status (EFIAPI *location)(void *, efi_uintn *, efi_uintn *, efi_uintn *,
                                       efi_uintn *) = io[PCI_IO_GET_LOCATION];
 
-        if (!EFI_ERROR(location(io, &seg, &bus, &dev, &fn)) && seg == 0 &&
+        if (!EFI_ERROR(EFI_CALL(location, io, &seg, &bus, &dev, &fn)) && seg == 0 &&
             (uint32_t)(bus << 16 | dev << 11 | fn << 8) == at) {
             found = handles[i];
         }
     }
-    bs->free_pool(handles);
+    EFI_CALL(bs->free_pool, handles);
     return found;
 }
 
@@ -770,20 +786,20 @@ static void find_disk(void) {
     if (sector == NULL) {
         return;
     }
-    if (!EFI_ERROR(bs->locate_handle_buffer(2, &guid, NULL, &count, &handles))) {
+    if (!EFI_ERROR(EFI_CALL(bs->locate_handle_buffer, 2, &guid, NULL, &count, &handles))) {
         for (efi_uintn i = 0; i < count && boot->disk == NULL; i++) {
             struct efi_block_io *disk;
 
-            if (EFI_ERROR(bs->handle_protocol(handles[i], &guid, (void **)&disk)) ||
+            if (EFI_ERROR(EFI_CALL(bs->handle_protocol, handles[i], &guid, (void **)&disk)) ||
                 !disk->media->present || disk->media->block_size != 512 ||
-                EFI_ERROR(disk->read_blocks(disk, disk->media->media_id, FS_LBA, 512,
+                EFI_ERROR(EFI_CALL(disk->read_blocks, disk, disk->media->media_id, FS_LBA, 512,
                                             sector)) || *sector != FS_MAGIC) {
                 continue;
             }
             boot->disk = disk;
             boot->media_id = disk->media->media_id;
         }
-        bs->free_pool(handles);
+        EFI_CALL(bs->free_pool, handles);
     }
     mem_free(sector);
 }
@@ -799,13 +815,17 @@ void efi_pci(uint32_t at, bool take) {
            write it; and the firmware's disk is looked for again after, as
            it may have been on this device and gone with its driver. */
         ata_sync();
-        efi_status st = boot->system->boot->disconnect_controller(handle, NULL, NULL);
+        efi_status st = EFI_CALL(boot->system->boot->disconnect_controller, handle, NULL, NULL);
 
         dbg("efi: pci %x released: %x\n", (uint64_t)at, st);
         (void)st;
+        /* A firmware driver that stops puts the device's attributes back
+           as it found them - on real machines, with its memory decoding
+           and bus mastering off - so they are turned on again. */
+        pci_write(at, 0x04, (pci_read(at, 0x04) & 0xFFFF) | 0x6);
         find_disk();
         return;
     }
-    boot->system->boot->connect_controller(handle, NULL, NULL, 1);
+    EFI_CALL(boot->system->boot->connect_controller, handle, NULL, NULL, 1);
     find_disk();
 }

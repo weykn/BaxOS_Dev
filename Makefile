@@ -84,6 +84,23 @@ PCFLAGS  := -std=gnu11 -Oz -Wall -Wextra -ffreestanding -fno-builtin -nostdlib -
             -ffunction-sections -fdata-sections -fcf-protection=none -Wa,-mx86-used-note=no \
             -Wl,--gc-sections,--build-id=none,-z,noexecstack,-z,noseparate-code,-z,norelro -s
 
+# tsh and tuxlet-coreutils (ls, cat, cp, ...) are /usr/bin on the disk,
+# built here too, as TEF64: the bytes a program runs as behind a 16-byte
+# header, loaded where position-independent programs go and never relocated
+# - src/tef/tef.ld refuses to link one that would need it. src/tef/tef.c is
+# what they have of a C library.
+TEFFLAGS := -std=gnu11 -Oz -Wall -Wextra -Isrc/tef -ffreestanding -fno-builtin -nostdlib \
+            -fpie -fvisibility=hidden -mno-red-zone -fno-stack-protector \
+            -fno-asynchronous-unwind-tables -ffunction-sections -fdata-sections \
+            -fcf-protection=none -Wa,-mx86-used-note=no -static-pie \
+            -Wl,--no-dynamic-linker,--no-warn-rwx-segments,--gc-sections,--build-id=none,-z,norelro,-z,noexecstack \
+            -Wl,-T,src/tef/tef.ld
+TSH       := $(BUILD)/tsh
+COREUTILS := $(patsubst src/coreutils/%.c,$(BUILD)/coreutils/%,$(wildcard src/coreutils/*.c))
+TEF_DEPS  := src/tef/tef.c src/tef/tef.h src/tef/tef.ld Makefile
+tef_link   = @mkdir -p $(@D) && $(CC) $(TEFFLAGS) $< src/tef/tef.c -o $@.elf && \
+             $(OBJCOPY) -O binary $@.elf $@ && rm -f $@.elf && echo "TEF64 $@: $$(stat -c %s $@) bytes"
+
 KASMS := $(shell find src/kernel -name '*.asm' ! -name start.asm)
 KOBJS := $(KSRCS:src/%.c=$(BUILD)/%.o) $(KASMS:src/%.asm=$(BUILD)/%.o)
 
@@ -155,6 +172,12 @@ $(TUXPAC): $(wildcard src/tuxpac/*.c src/tuxpac/*.h) Makefile
 	@mkdir -p $(@D)
 	$(CC) $(PCFLAGS) $(filter %.c,$^) -o $@
 
+$(TSH): src/tsh/tsh.c $(TEF_DEPS)
+	$(tef_link)
+
+$(BUILD)/coreutils/%: src/coreutils/%.c $(TEF_DEPS)
+	$(tef_link)
+
 $(KERNEL_ELF): $(START_OBJ) $(KOBJS) src/kernel/kernel.ld
 	$(CC) $(CFLAGS) $(LDFLAGS) $(START_OBJ) $(KOBJS) -o $@
 
@@ -185,10 +208,13 @@ $(MKFS): tools/mkfs.c src/kernel/fs.c src/kernel/fs.h src/kernel/ata.h
 
 # The filesystem partition is updated in place rather than recreated, so files
 # saved from inside Tuxlet OS survive a rebuild. `make clean` wipes them.
-$(FS_IMG): $(KERNEL_BIN) $(MKFS) $(DISK_FILES) $(MODULES) $(TUXPAC) $(SIZE_FILE)
+# The coreutils go on with "?": only onto a disk without them, so that a
+# rebuild leaves the GNU ones a package put in their place.
+$(FS_IMG): $(KERNEL_BIN) $(MKFS) $(DISK_FILES) $(MODULES) $(TUXPAC) $(TSH) $(COREUTILS) $(SIZE_FILE)
 	$(MKFS) $@ $(shell numfmt --from=iec $(FREE)) $(DISK_ROOT) $(KERNEL_BIN) $(DISK_FILES) \
 	    $(foreach m,$(MODULES),usr/lib/$(m:$(BUILD)/%=%)=$(m)) \
-	    usr/bin/tuxpac=$(TUXPAC)
+	    usr/bin/tuxpac=$(TUXPAC) usr/bin/tsh=$(TSH) \
+	    $(foreach c,$(COREUTILS),?usr/bin/$(notdir $(c))=$(c))
 
 # Laid end to end, with nothing between: the GPT (sectors 0-33), the EFI
 # system partition sized to the loader - plus 64 sectors for FAT12's own

@@ -102,11 +102,13 @@ sudo dd if=build/TuxletOS.img of=/dev/sdX bs=4M conv=fsync
 
 ### Shell (`tsh`) Basics
 
-Tuxlet boots into `tsh`, a lightweight built-in shell.
+Tuxlet boots into `tsh` (`/usr/bin/tsh`), a lightweight shell the kernel starts as its login shell.
 
-* **Built-in Commands:** `cd`, `ls`, `cat`, `cp`, `mv`, `rm`, `mkdir`, `put`, `export`, `exit`, `help`.
+* **Built-in Commands:** `cd`, `export`, `exit`, `help`.
+* **tuxlet-coreutils:** `ls`, `cat`, `cp`, `mv`, `rm`, `mkdir [-p] [-m mode]` and `put` are programs in `/usr/bin`, replaced by the GNU ones when a package installs them.
 * **Writing Files:** Use `put <file> [text]` to write a line of text.
 * **Running Scripts:** Execute `tsh <script_path>`.
+* **TEF64:** `tsh` and the coreutils are TEF64 files, Tuxlet's own executable format: the raw bytes of the program behind a 16-byte header (`"TEF64"`, entry, memory size), loaded with no relocation. `tsh` is under 3 KB, each coreutil under 1 KB.
 * **Process Controls:**
 * `Ctrl + C`: Sends a interrupt signal to the foreground application.
 * `Ctrl + C` (3x repeatedly): Forcefully terminates a non-responsive process.
@@ -130,8 +132,7 @@ System control executables are located in `/ctl`:
 | `mem` | `mem [all\|top]` | Displays current system memory allocation and usage. |
 | `mode` / `scale` / `font` | Standard options | Configures frame-buffer resolution, UI scaling, and console font. |
 | `clear` / `echo` | Text output | Clears terminal screen or prints text; Supports `{bold}`, `{n}` *(newline)* and `{uptime}`. |
-| `greet` | `greet <text>` | Prints a welcome line, with the same markup as `echo`. |
-| `tsh` | `tsh [script]` | Starts a shell, or runs a script. |
+| `greet` | `greet [text]` | Sets the welcome line, with the same markup as `echo`; alone, prints it. |
 | `modman` | Management | Loads, unloads, and inspects module states (see details below). |
 | `reboot` / `poweroff` | Power control | Restarts or safely shuts down the machine. |
 
@@ -166,6 +167,7 @@ modman auto <category>   # Auto-detect and load compatible hardware drivers
 |  | `network/virtio` | Para-virtualized VirtIO network driver |
 | **`ipc`** | `ipc/unix` | `AF_UNIX` stream sockets and device-event netlink |
 |  | `ipc/pty` | Pseudo-terminals (`/dev/ptmx`, `/dev/pts/N`) for terminal emulators |
+| **`sched`** | `sched/timer` | Timer interrupt for programs (after `modman takeover`): Ctrl-C stops busy loops, programs share the CPU |
 | **`compat`** | `compat/linux` | Extra Linux system calls; loaded automatically on first use |
 | **`debug`** | `debug/trace` | Low-level kernel tracing tool |
 

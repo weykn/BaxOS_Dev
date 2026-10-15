@@ -185,12 +185,17 @@ int main(int argc, char **argv) {
            the build directory - at a name of its own on the disk. */
         const char *path = argv[i];
         const char *mark = strchr(argv[i], '=');
+        bool seed = mark != NULL && path[0] == '?';    /* "?name=path": only if
+                                                          the disk has none */
+        struct fs_file there;
+
+        path += seed;
         char given[FS_NAME_LEN];
         const char *name;
 
-        if (mark != NULL && (size_t)(mark - argv[i]) < sizeof given) {
-            memcpy(given, argv[i], (size_t)(mark - argv[i]));
-            given[mark - argv[i]] = '\0';
+        if (mark != NULL && (size_t)(mark - path) < sizeof given) {
+            memcpy(given, path, (size_t)(mark - path));
+            given[mark - path] = '\0';
             name = given;
             path = mark + 1;
         } else {
@@ -200,6 +205,9 @@ int main(int argc, char **argv) {
         if (strlen(name) >= FS_NAME_LEN) {
             fprintf(stderr, "%s: path is over %d characters\n", name, FS_NAME_LEN - 1);
             return 1;
+        }
+        if (seed && fs_stat(name, &there) == 0) {
+            continue;
         }
         make_folders(name);
 

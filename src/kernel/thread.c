@@ -23,6 +23,7 @@ struct thread {
     int      exit_code;
     uint64_t futex;                 /* where it waits, 0 if nowhere */
     uint64_t sigmask;               /* the signals it has blocked: each thread its own */
+    uint64_t restore[3];            /* rt_sigreturn's RCX and R11 to put back, if [0] */
     uint64_t clear_tid;
     /* What belongs to whoever is running, put aside while it is not. */
     uint64_t fs_base, gs_base, kernel_rsp, args[6];
@@ -156,6 +157,10 @@ void thread_yield(void) {
         current->exiting = false;
         process_exit(current->exit_code);
     }
+}
+
+uint64_t *thread_restore(void) {
+    return current->restore;
 }
 
 uint64_t *thread_sigmask(void) {
@@ -293,6 +298,15 @@ unsigned thread_count(void *proc) {
         n += all[i] != NULL && !all[i]->dead && all[i]->proc == proc;
     }
     return n;
+}
+
+size_t thread_stacks(void) {
+    size_t n = 0;
+
+    for (unsigned i = 0; i < THREADS; i++) {
+        n += all[i] != NULL && all[i] != &first;
+    }
+    return n * THREAD_STACK_BYTES;
 }
 
 void *thread_process(void) {

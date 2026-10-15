@@ -1,17 +1,18 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 /* Threads: what clone(CLONE_THREAD) makes, each with a kernel stack of its
  * own, sharing its process's memory and descriptors - and the first thread
  * of every process, which is what a fork makes.
  *
- * Nothing interrupts a running thread - there is no timer - so another runs
- * only when this one waits in the kernel: every wait (futex, poll, select, a
- * socket, sleeping, a key, a pipe, a child) calls thread_yield, which passes
- * the processor round every thread there is, of every process. A thread
- * spinning in its own code without a syscall keeps it.
+ * Nothing interrupts the kernel, so another thread runs when this one waits
+ * in it: every wait (futex, poll, select, a socket, sleeping, a key, a pipe,
+ * a child) calls thread_yield, which passes the processor round every thread
+ * there is, of every process. A thread spinning in its own code without a
+ * syscall keeps it - unless sched/timer is loaded, whose tick yields for it.
  *
  * A process's first thread is its leader; its exit ends the rest. */
 
@@ -36,6 +37,10 @@ void thread_yield(void);
 /* The running thread's blocked signals, as rt_sigprocmask has them. */
 uint64_t *thread_sigmask(void);
 
+/* Registers rt_sigreturn puts back that a syscall's return would not -
+   RCX and R11, when [0] is set - kept with the thread until it does. */
+uint64_t *thread_restore(void);
+
 /* Whether this is the process's only thread, and whether it is the only
    thread there is at all - nothing else that could run while it waits. */
 bool thread_alone(void);
@@ -52,6 +57,7 @@ uint64_t thread_stack_left(const void *here);
 
 /* Threads alive in proc, and what each one's kernel stack costs. */
 unsigned thread_count(void *proc);
+size_t   thread_stacks(void);        /* every thread's but the kernel's own, in bytes */
 #define THREAD_STACK_BYTES (4 * 4096)
 
 /* A process, as the threads know it: syscall.c's, and opaque here. The

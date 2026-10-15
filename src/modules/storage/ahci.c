@@ -216,6 +216,9 @@ static void handoff(void) {
 static bool try_controller(void) {
     uint32_t ports;
 
+    if (reg(CAP) == 0xFFFFFFFFu) {
+        return false;                   /* its registers do not answer */
+    }
     handoff();
     set(GHC, reg(GHC) | GHC_AE);
     ports = reg(PI);

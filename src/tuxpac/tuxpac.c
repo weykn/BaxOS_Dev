@@ -35,6 +35,7 @@
 
 #define MIRROR  "/etc/tuxlet/mirror"
 #define LIB     "/var/lib/tuxpac"
+#define INFO    "/var/lib/dpkg/info"  /* each package's scripts, where dpkg keeps them */
 #define INDEX   LIB "/index"
 #define DB      LIB "/installed"
 #define CACHE   "/var/cache/tuxpac"
@@ -1058,7 +1059,7 @@ static const char *const scripts[] = { "preinst", "postinst", "prerm", "postrm",
 
 /* Where package pkg's script is kept. */
 static void script_path(char *out, const char *pkg, const char *script) {
-    format(out, LIB "/%s.%s", pkg, script);
+    format(out, INFO "/%s.%s", pkg, script);
 }
 
 /* Unpacked by nobody's choice on a small machine. */
@@ -1214,7 +1215,7 @@ static void tar_entry(void) {
                 continue;
             }
             script_path(sp, unpacking, scripts[i]);
-            mkdirs(LIB);
+            mkdirs(INFO);
             tar.fd = (int)sys_open(sp, O_WRONLY | O_CREAT | O_TRUNC, 0755);
             tar.kind = strcmp(scripts[i], "postinst") == 0 ? K_POST : K_SCRIPT;
             if (tar.fd < 0) {
@@ -2014,7 +2015,7 @@ static bool touched(const char *name, uint32_t n) {
         if (len < sizeof pkg) {
             memcpy(pkg, c, len);
             pkg[len] = '\0';
-            format(lp, LIB "/%s.%s", pkg, *name == '/' ? "list" : "triggers");
+            format(lp, *name == '/' ? LIB "/%s.list" : INFO "/%s.triggers", pkg);
             if ((t = load(lp, &size)) != NULL) {
                 for (char *l = t; *l != '\0'; l += span(l, "\n"), l += *l == '\n') {
                     char *what = blanks_past(l + span(l, " \t"));
@@ -2486,6 +2487,43 @@ static void cmd_info(const char *name) {
 
 /* ---- the command ----------------------------------------------------------- */
 
+/* tuxpac kept the scripts in LIB before: they go where dpkg-query looks,
+   which is where ucf, for one, finds its debconf templates. */
+static void move_old_info(void) {
+    static uint8_t dents[2048];
+    struct stat st;
+    char from[PATH], to[PATH];
+    bool moved = true;
+
+    if (sys_stat(LIB "/dpkg.postinst", &st) != 0 || sys_stat(INFO "/dpkg.postinst", &st) == 0) {
+        return;
+    }
+    mkdirs(INFO);
+    while (moved) {                 /* again from the top: the folder changes under it */
+        long dir = sys_open(LIB, O_RDONLY | O_DIRECTORY, 0), got;
+
+        moved = false;
+        while (dir >= 0 && (got = sys_getdents((int)dir, dents, sizeof dents)) > 0) {
+            for (long at = 0; at < got; at += *(uint16_t *)(dents + at + 16)) {
+                const char *name = (const char *)dents + at + 19, *dot = strrchr(name, '.');
+                bool ours = false;
+
+                for (unsigned i = 0; dot != NULL && i < sizeof scripts / sizeof scripts[0]; i++) {
+                    ours = ours || strcmp(dot + 1, scripts[i]) == 0;
+                }
+                if (ours && strlen(name) + sizeof INFO + 1 < sizeof to) {
+                    format(from, LIB "/%s", name);
+                    format(to, INFO "/%s", name);
+                    moved = sys_rename(from, to) == 0 || moved;
+                }
+            }
+        }
+        if (dir >= 0) {
+            sys_close((int)dir);
+        }
+    }
+}
+
 int main(int argc, char **argv) {
     static char words[1024];
     char *args = words, *op = argc > 1 ? argv[1] : "";
@@ -2510,6 +2548,9 @@ int main(int argc, char **argv) {
     fsrc = (struct source){ .buf = fbuf, .cap = FBUF, .fd = -1 };
     nsrc = (struct source){ .buf = nbuf, .cap = NBUF, .fd = -1 };
 
+    if (fbuf != NULL && nbuf != NULL) {
+        move_old_info();
+    }
     if (fbuf == NULL || nbuf == NULL) {
         /* said already */
     } else if (c == 'y' && *args == '\0') {

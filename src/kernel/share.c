@@ -65,9 +65,19 @@ static struct entry *of_frame(uint64_t page, uint32_t **link) {
     return *at != 0 ? &entries[*at - 1] : NULL;
 }
 
-/* Room for twice as many, with both chains built again. */
-static bool grow(void) {
-    uint32_t bigger = room == 0 ? FIRST_ROOM : room * 2;
+/* Room for bigger entries - more or fewer than now, but never fewer than
+   are used - the used ones packed at the front and both chains built
+   again; with none used and bigger 0, nothing at all. */
+static bool resize(uint32_t bigger) {
+    if (bigger == 0) {
+        mem_free(entries);
+        mem_free(by_key);
+        mem_free(by_frame);
+        entries = NULL;
+        by_key = by_frame = NULL;
+        room = free_head = 0;
+        return true;
+    }
     struct entry *e = mem_alloc((size_t)bigger * sizeof *e);
     uint32_t *k = mem_alloc((size_t)bigger * sizeof *k);
     uint32_t *f = mem_alloc((size_t)bigger * sizeof *f);
@@ -81,8 +91,10 @@ static bool grow(void) {
     memset(e, 0, (size_t)bigger * sizeof *e);
     memset(k, 0, (size_t)bigger * sizeof *k);
     memset(f, 0, (size_t)bigger * sizeof *f);
-    if (entries != NULL) {
-        memcpy(e, entries, (size_t)room * sizeof *e);
+    for (uint32_t i = 0, n = 0; i < room; i++) {
+        if (entries[i].refs != 0) {
+            e[n++] = entries[i];
+        }
     }
     mem_free(entries);
     mem_free(by_key);
@@ -107,6 +119,20 @@ static bool grow(void) {
         *head = i + 1;
     }
     return true;
+}
+
+static bool grow(void) {
+    return resize(room == 0 ? FIRST_ROOM : room * 2);
+}
+
+/* After an entry is let go: the table shrinks as what is shared does, and
+   goes once nothing is. */
+static void shrink(void) {
+    if (used == 0) {
+        resize(0);
+    } else if (room > FIRST_ROOM && used < room / 8) {
+        resize(room / 2);
+    }
 }
 
 uint64_t shared_find(uint32_t start, uint32_t index) {
@@ -175,6 +201,7 @@ bool shared_take(uint64_t page) {
     e->next_key = free_head;
     free_head = i + 1;
     used--;
+    shrink();
     return true;
 }
 
@@ -201,9 +228,11 @@ void shared_drop(uint64_t page) {
         unlink_key(i);
     }
     mem_pages_free(page, 1);
+    e->refs = 0;
     e->next_key = free_head;
     free_head = i + 1;
     used--;
+    shrink();
 }
 
 void shared_written(uint32_t lba, unsigned count) {

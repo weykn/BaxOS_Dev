@@ -681,7 +681,7 @@ static void handoff(struct controller *c) {
     uint32_t hcc = rd(c->caps, 0x10);
     unsigned at = (hcc >> 16) << 2;
 
-    while (at != 0) {
+    for (unsigned n = 0; at != 0 && at < 0x10000 && n < 64; n++) {
         uint32_t cap = rd(c->caps, at);
 
         if ((cap & 0xFF) == 1) {
@@ -701,7 +701,7 @@ static void protocols(struct controller *c) {
     uint32_t hcc = rd(c->caps, 0x10);
     unsigned at = (hcc >> 16) << 2;
 
-    while (at != 0) {
+    for (unsigned n = 0; at != 0 && at < 0x10000 && n < 64; n++) {
         uint32_t cap = rd(c->caps, at);
 
         if ((cap & 0xFF) == 2 && (cap >> 24) == 2) {
@@ -718,6 +718,21 @@ static void protocols(struct controller *c) {
 
 static bool usb2_port(struct controller *c, unsigned p) {
     return p >= c->usb2_first && p < (unsigned)c->usb2_first + c->usb2_count;
+}
+
+/* Whether a USB 3 port is still training its link: what is plugged in
+   only shows once it is done, which on a real machine can take a second
+   after the controller's reset. */
+static bool training(struct controller *c) {
+    for (unsigned p = 1; p <= c->ports; p++) {
+        uint32_t sc = rd(c->op, PORTSC(p));
+
+        if (!usb2_port(c, p) && (PORT_PLS(sc) == 7 /* Polling */ ||
+                                 ((sc & PORT_CCS) && !(sc & PORT_PED)))) {
+            return true;
+        }
+    }
+    return false;
 }
 
 static void root_ports(struct controller *c) {
@@ -755,7 +770,7 @@ static bool start_controller(struct controller *c) {
     c->slots = (params1 & 0xFF) < SLOTS ? (params1 & 0xFF) : SLOTS;
     c->csz = (rd(c->caps, 0x10) & 4) ? 64 : 32;
     c->pads = (params2 >> 21 & 0x1F) << 5 | params2 >> 27;
-    if ((rd(c->op, 0x08) & 1) == 0) {
+    if (rd(c->caps, 0) == 0xFFFFFFFFu || (rd(c->op, 0x08) & 1) == 0) {
         return false;                   /* no 4 KiB pages */
     }
     handoff(c);
@@ -823,6 +838,16 @@ static bool host_start(void) {
     /* Long enough for what is plugged in to say so - a USB 3 link takes
        its time to train after a reset - once for all of them. */
     sleep_ms(300);
+    for (uint64_t until = efi_uptime_ms() + 2000; efi_uptime_ms() < until;) {
+        bool any = false;
+
+        for (unsigned i = 0; i < controller_count && !any; i++) {
+            any = up[i] && training(&controllers[i]);
+        }
+        if (!any) {
+            break;
+        }
+    }
     for (unsigned i = 0; i < controller_count; i++) {
         struct controller *c = &controllers[i];
         unsigned before = device_count;

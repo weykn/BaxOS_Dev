@@ -7,13 +7,17 @@
 #include "string.h"
 
 /* On-disk layout: sector FS_LBA, right after the boot sector, is a header
- * saying where everything else is. The file table is a run of 128-byte
- * entries, four to a sector, and an entry never moves while its file exists:
+ * saying where everything else is. The file table is a run of 256-byte
+ * entries, two to a sector, and an entry never moves while its file exists:
  * a program holding a folder open is holding its entry's number. Beside it is
  * an index - a hash table of 12-byte records, a path's hash, its folder's and
  * the entry it names - which is what finds a path: one sector of the index,
  * then the entry's. Everything else is file data, each file one contiguous
  * run of sectors.
+ *
+ * Disks start with the first, narrow, entries: 128 bytes, four to a sector,
+ * a path of up to 119. The first name longer than that copies the table to
+ * wide ones (widen), so a disk only pays for long names once it has one.
  *
  * Nothing of this is kept in memory but the header. What was read lately is
  * in the disk cache like any other sector - the same cache the C library
@@ -26,7 +30,8 @@
 
 #define SECTOR_SIZE  FS_SECTOR
 #define DATA_LBA     (FS_LBA + 1)
-#define PER_SECTOR   (SECTOR_SIZE / sizeof(struct fs_file))
+#define PER_SECTOR   (SECTOR_SIZE / entry_bytes())
+#define NARROW       128            /* an entry on a disk with no long name */
 #define TABLE_FIRST  64             /* entries a new filesystem starts with */
 #define TABLE_STEP   256            /* and how many more each time it fills */
 #define INDEX_FIRST  4              /* index sectors a new one starts with */
@@ -44,6 +49,7 @@ struct header {
     uint32_t index_lba, index_sectors;
     uint32_t index_taken;           /* records in it, removed ones counted */
     uint32_t data_end;              /* nothing has been put at or past this */
+    uint32_t entry_size;            /* 0 for NARROW, else sizeof(struct fs_file) */
 };
 
 /* A record of the index. entry is the entry's number plus one; 0 is a
@@ -85,8 +91,22 @@ static unsigned sectors_for(unsigned size);
 static char lower(char c);
 static int name_cmp(const char *a, const char *b);
 
+static unsigned entry_bytes(void) {
+    return head.entry_size != 0 ? head.entry_size : NARROW;
+}
+
 static unsigned table_sectors(uint32_t size) {
-    return sectors_for(size * (unsigned)sizeof(struct fs_file));
+    return sectors_for(size * entry_bytes());
+}
+
+/* Entry i of a run of table sectors as this disk has them: its name, which
+   is all but the last eight bytes, then start and size. */
+static const char *raw_entry(const char *run, size_t i, uint32_t *start, uint32_t *size) {
+    const char *e = run + i * entry_bytes();
+
+    memcpy(start, e + entry_bytes() - 8, 4);
+    memcpy(size, e + entry_bytes() - 4, 4);
+    return e;
 }
 
 /* FNV-1a over the first n bytes of a name, case folded - which is how disks
@@ -209,7 +229,10 @@ static int read_entry(size_t index, struct fs_file *out) {
         load_sector(head.table_lba + (uint32_t)(index / PER_SECTOR)) < 0) {
         return FS_EIO;
     }
-    *out = ((const struct fs_file *)sector)[index % PER_SECTOR];
+    const char *name = raw_entry(sector, index % PER_SECTOR, &out->start, &out->size);
+
+    memcpy(out->name, name, entry_bytes() - 8);
+    memset(out->name + entry_bytes() - 8, 0, FS_NAME_LEN - (entry_bytes() - 8));
     return 0;
 }
 
@@ -217,18 +240,18 @@ static int read_entry(size_t index, struct fs_file *out) {
    in its sector are read first and go back as they were. */
 static int write_entry(size_t index, const char *name, uint32_t start, uint32_t size) {
     uint32_t lba = head.table_lba + (uint32_t)(index / PER_SECTOR);
-    struct fs_file *entry;
+    char *entry;
 
     if (load_sector(lba) < 0) {
         return FS_EIO;
     }
-    entry = &((struct fs_file *)sector)[index % PER_SECTOR];
+    entry = sector + index % PER_SECTOR * entry_bytes();
     if (name != NULL) {
-        memset(entry->name, 0, FS_NAME_LEN);
-        memcpy(entry->name, name, strlen(name));
+        memset(entry, 0, entry_bytes() - 8);
+        memcpy(entry, name, strlen(name));
     }
-    entry->start = start;
-    entry->size = size;
+    memcpy(entry + entry_bytes() - 8, &start, 4);
+    memcpy(entry + entry_bytes() - 4, &size, 4);
     if (put(lba, 1, sector) < 0) {
         forget();
         return FS_EIO;
@@ -669,7 +692,7 @@ static unsigned allocate(unsigned count, const struct slot *replacing) {
 static unsigned allocate_gap(unsigned count, const struct slot *replacing) {
     uint32_t n = head.table_next + 2, used = 0;
     struct run { uint32_t start, end; } *runs = mem_alloc(n * sizeof *runs);
-    struct fs_file *chunk = mem_alloc(CHUNK * SECTOR_SIZE);
+    char *chunk = mem_alloc(CHUNK * SECTOR_SIZE);
     unsigned start = DATA_LBA;
     bool moved = true;
 
@@ -689,11 +712,13 @@ static unsigned allocate_gap(unsigned count, const struct slot *replacing) {
             break;
         }
         for (uint32_t i = 0; i < k * PER_SECTOR && at * PER_SECTOR + i < head.table_next; i++) {
-            uint32_t bytes = chunk[i].size & ~FS_LINK;
+            uint32_t first, bytes;
+            const char *name = raw_entry(chunk, i, &first, &bytes);
 
-            if (chunk[i].name[0] != '\0' && bytes > 0 &&
+            bytes &= ~FS_LINK;
+            if (name[0] != '\0' && bytes > 0 &&
                 (replacing == NULL || replacing->index != at * PER_SECTOR + i)) {
-                runs[used++] = (struct run){ chunk[i].start, chunk[i].start + sectors_for(bytes) };
+                runs[used++] = (struct run){ first, first + sectors_for(bytes) };
             }
         }
     }
@@ -755,6 +780,49 @@ static long free_entry(void) {
     head.table_lba = at;
     head.table_size = size;
     return (long)head.table_next++;
+}
+
+/* Copies the table to wide entries, which the header then points at: the
+   old run is free again once it does. Nothing else moves - an entry keeps
+   its number, so the index stays as it is. */
+static int widen(void) {
+    unsigned old = table_sectors(head.table_size), half = CHUNK / 2;
+    unsigned count = sectors_for(head.table_size * (unsigned)sizeof(struct fs_file));
+    char *in = mem_alloc(half * SECTOR_SIZE), *out = mem_alloc(CHUNK * SECTOR_SIZE);
+    unsigned at = in != NULL && out != NULL ? allocate(count, NULL) : 0;
+    int err = at == 0 ? FS_ENOSPC : 0;
+
+    for (unsigned i = 0; err == 0 && i < old; i += half) {
+        unsigned n = old - i < half ? old - i : half;
+
+        memset(out, 0, CHUNK * SECTOR_SIZE);
+        if (ata_read_many(head.table_lba + i, n, in) < 0) {
+            err = FS_EIO;
+            break;
+        }
+        for (unsigned e = 0; e < n * (SECTOR_SIZE / NARROW); e++) {
+            struct fs_file *wide = (struct fs_file *)out + e;
+            const char *name = raw_entry(in, e, &wide->start, &wide->size);
+
+            memcpy(wide->name, name, NARROW - 8);
+        }
+        if (put(at + 2 * i, 2 * n, out) < 0) {
+            err = FS_EIO;
+        }
+    }
+    mem_free(in);
+    mem_free(out);
+    if (err == 0) {
+        head.table_lba = at;
+        head.entry_size = sizeof(struct fs_file);
+        err = save_header();
+    }
+    return err;
+}
+
+/* Makes room in the table for name, widening it if it is a long one. */
+static int fit(const char *name) {
+    return strlen(name) < entry_bytes() - 8 ? 0 : widen();
 }
 
 /* Frees entry index onto the list of free ones. */
@@ -939,6 +1007,11 @@ static int store(const char *name, const void *data, size_t size, uint32_t flag)
     if (!parent_exists(full)) {
         return FS_ENOENT;
     }
+    int fat = fit(name);
+
+    if (fat != 0) {
+        return fat;
+    }
     struct slot *file = find(name), old = { 0 };
     bool fresh = file == NULL;
     long index;
@@ -1081,13 +1154,18 @@ int fs_mkdir(const char *path) {
     if (!parent_exists(full)) {
         return FS_ENOENT;
     }
+    int err = fit(full);
+
+    if (err != 0) {
+        return err;
+    }
     long index = free_entry();
     if (index < 0) {
         return FS_ENOSPC;
     }
     /* No sectors at all: that is what lets an empty folder exist, and what
        leaves allocate() nothing to step over. */
-    int err = write_entry((size_t)index, full, 0, 0);
+    err = write_entry((size_t)index, full, 0, 0);
 
     if (err == 0) {
         err = index_add(full, (uint32_t)index);
@@ -1196,7 +1274,7 @@ int fs_get_stats(struct fs_stats *stats) {
     if (load_table() < 0) {
         return FS_EIO;
     }
-    struct fs_file *chunk = mem_alloc(CHUNK * SECTOR_SIZE);
+    char *chunk = mem_alloc(CHUNK * SECTOR_SIZE);
     uint32_t sectors = table_sectors(head.table_next);
 
     if (chunk == NULL) {
@@ -1213,8 +1291,10 @@ int fs_get_stats(struct fs_stats *stats) {
             return FS_EIO;
         }
         for (uint32_t i = 0; i < k * PER_SECTOR && at * PER_SECTOR + i < head.table_next; i++) {
-            if (chunk[i].name[0] != '\0') {
-                stats->used += sectors_for(chunk[i].size & ~FS_LINK);
+            uint32_t first, bytes;
+
+            if (raw_entry(chunk, i, &first, &bytes)[0] != '\0') {
+                stats->used += sectors_for(bytes & ~FS_LINK);
                 stats->files++;
             }
         }
@@ -1306,6 +1386,11 @@ int fs_rename(const char *from, const char *to) {
     struct slot *there;
 
     memcpy(dest, name, strlen(name) + 1);
+    int fat = fit(dest);
+
+    if (fat != 0) {
+        return done(fat);
+    }
     if ((there = find(dest)) != NULL) {
         /* A file already there goes: that is how a program replaces one in
            a single step, writing the new one aside and renaming it over. */

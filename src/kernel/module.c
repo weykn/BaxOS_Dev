@@ -13,6 +13,7 @@
 #include "proc.h"
 #include "shell.h"
 #include "string.h"
+#include "vm.h"
 #include "syscall.h"
 #include "thread.h"
 #include "usb.h"
@@ -117,7 +118,7 @@ static const struct {
     X(mem_free_kib), X(usage_bar), X(net_card), X(disk_driver),
     X(fs_mkdir), X(fs_write_at), X(strcpy),
     X(proc_add), X(proc_remove),
-    X(handle_of), X(give_handle), X(user_range), X(syscall_args), X(interrupt_check),
+    X(handle_of), X(give_handle), X(user_range), X(vm_writable), X(syscall_args), X(interrupt_check),
     X(wait_began), X(wait_ended), X(thread_yield),
     X(at_path), X(console_get), X(console_ready), X(console_set), X(deliverable),
     X(dev_folder), X(devices), X(dev_named), X(efi_power_off), X(efi_restart),
@@ -129,7 +130,7 @@ static const struct {
     X(realtime_ms), X(realtime_us), X(self_us), X(user_string), X(user_us), X(vga_height),
     X(vga_pixel_height), X(vga_pixel_width), X(vga_width), X(write_name),
     X(input_report), X(input_ready), X(input_keys), X(input_clock), X(console_keys),
-    X(graphics_take), X(thread_id), X(proc_fd_target), X(proc_fd_folder), X(process_creds), X(fd_truncate), X(proc_task_links), X(fs_cwd), X(fd_cloexec), X(files_register), X(file_ops), X(signal_pgrp), X(process_ids), X(ops_named), X(buffer_open), X(pipe_data), X(unix_register), X(pair_new), X(pair_send), X(pair_recv), X(handle_share), X(pair_flags), X(pair_sender), X(handle_close), X(fd_read), X(fd_write), X(sock_ready), X(tty_foreground), X(tty_set_foreground), X(vga_screen), X(vga_lend), X(vga_lent),
+    X(graphics_take), X(thread_id), X(proc_fd_target), X(proc_fd_folder), X(process_creds), X(fd_truncate), X(proc_task_links), X(fs_cwd), X(fd_cloexec), X(files_register), X(file_ops), X(signal_pgrp), X(process_ids), X(ops_named), X(buffer_open), X(pipe_data), X(unix_register), X(pair_new), X(pair_send), X(pair_recv), X(handle_share), X(pair_flags), X(pair_sender), X(handle_close), X(fd_read), X(fd_write), X(sock_ready), X(tty_foreground), X(tty_set_foreground), X(vga_screen), X(vga_lend), X(vga_lent), X(tick_register), X(mem_map_io),
 #ifdef DEBUG
     X(dbg),
 #endif
@@ -681,7 +682,13 @@ static __attribute__((noinline)) void auto_enable(const char *cat) {
                     if (!module_named(file.name, strlen(top), name)) {
                         continue;
                     }
-                    if (slot_of(name) < 0 && load_one(name) < 0) {
+                    /* Named while it starts: a driver that hangs on some
+                       machine's hardware says which one it is. */
+                    kprintf("%s\r", name);
+                    int got = slot_of(name) < 0 ? load_one(name) : 0;
+
+                    vga_puts("\033[K");
+                    if (got < 0) {
                         if (strcmp(why, "no device") != 0) {
                             kprintf("modman: %s: %s\n", name, why);
                         }

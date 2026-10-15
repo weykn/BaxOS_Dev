@@ -64,6 +64,7 @@ static struct pty {
     bool     opened;                /* the slave has been, so its going is a hang-up */
     bool     locked;                /* until unlockpt */
     bool     eof;                   /* Ctrl-D on an empty line: the next read is 0 */
+    bool     packet;                /* TIOCPKT: each master read starts with a status byte */
     int      pgrp, sid;             /* its foreground group and its session */
     struct termios t;
     struct winsize size;
@@ -232,7 +233,14 @@ static uint64_t pty_read(struct handle *h, uint64_t buf, uint64_t count) {
         if ((err = wait_for(h, master_can_read)) != 0) {
             return err;
         }
-        return p->out_len == 0 ? ERR(EIO) : take(p->out, &p->out_len, buf, count);
+        if (p->out_len == 0) {
+            return ERR(EIO);
+        }
+        if (p->packet && count > 0) {
+            *(char *)buf = 0;       /* TIOCPKT_DATA: what follows is the slave's */
+            return 1 + take(p->out, &p->out_len, buf + 1, count - 1);
+        }
+        return take(p->out, &p->out_len, buf, count);
     }
     if ((err = wait_for(h, slave_can_read)) != 0) {
         return err;
@@ -349,6 +357,7 @@ static void pty_stat(struct handle *h, uint32_t *mode, uint32_t *rdev) {
 #define TIOCSPTLCK  0x40045431u
 #define TIOCGPTLCK  0x80045439u
 #define TIOCGPTPEER 0x5441
+#define TIOCPKT     0x5420
 
 static uint64_t slave_open(unsigned n, uint64_t flags);
 
@@ -449,6 +458,12 @@ static uint64_t pty_ioctl(struct handle *h, uint64_t request, uint64_t arg) {
         return 0;
     case TIOCGPTLCK:
         return is_slave(h) ? ERR(ENOTTY) : put_int(arg, p->locked);
+    case TIOCPKT:
+        if (is_slave(h) || !user_range(arg, 4)) {
+            return ERR(is_slave(h) ? ENOTTY : EFAULT);
+        }
+        p->packet = *(const int32_t *)arg != 0;
+        return 0;
     case TIOCGPTPEER:
         return is_slave(h) ? ERR(ENOTTY) : slave_open(h->folder - 1, arg);
     }

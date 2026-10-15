@@ -37,10 +37,10 @@
    A chunk's own first page holds where the chunk before it was, so that the
    whole lot can be handed back at the end without a list of them anywhere
    else. */
-#define CHUNK_FIRST 8               /* what the first one costs a small program:
-                                       the shell's code, data, stack and the
-                                       two tables under them, and the chunk's
-                                       own page */
+#define CHUNK_FIRST 6               /* what the first one costs a small program:
+                                       tsh's one page of code and data, its
+                                       stack, the two tables under them, the
+                                       chunk's own page - and one spare */
 #define CHUNK_MAX   64              /* and a quarter of a megabyte once it is
                                        clearly big: past that the tail of the
                                        last chunk wastes more than the extra
@@ -78,6 +78,13 @@ static uint64_t region;                 /* where it starts */
 #define DEVICE    0x400             /* an entry for a device's memory: nobody's to give back */
 #define SHARED    0x800             /* a file's page every process has in common (share.c):
                                        read-only, copied on the first write */
+/* What the program asked a page to be (vm_protect), in bits the processor
+   ignores - kept in an entry whether or not a page is mapped there yet. The
+   processor's own WRITE and USER bits are what enforce them. */
+#define NOWRITE   (1ull << 52)
+#define NOACCESS  (1ull << 53)
+#define COMMON_RW (1ull << 54)      /* a SHARED page written in common (MAP_SHARED) */
+#define PROT_BITS (NOWRITE | NOACCESS)
 
 static uint64_t *low_pd;            /* the firmware's directory for it */
 static uint64_t *low_orig;          /* what that said before anything changed it -
@@ -496,8 +503,10 @@ bool vm_fault(uint64_t addr) {
            page itself, if nobody else has it any more. */
         uint64_t common = *at & ADDR;
 
+        uint64_t kept = *at & PROT_BITS;
+
         if (level->chunks == 0 && page >= LOW_LIMIT && shared_take(common)) {
-            *at = common | PRESENT | WRITE | USER;
+            *at = common | PRESENT | WRITE | USER | kept;
             level->bought += VM_PAGE;
             __asm__ volatile("invlpg (%0)" : : "r"(page) : "memory");
             return true;
@@ -506,7 +515,7 @@ bool vm_fault(uint64_t addr) {
             return false;
         }
         memcpy(fresh, (const void *)page, VM_PAGE);
-        *at = (uint64_t)fresh | PRESENT | WRITE | USER;
+        *at = (uint64_t)fresh | PRESENT | WRITE | USER | kept;
         __asm__ volatile("invlpg (%0)" : : "r"(page) : "memory");
         shared_drop(common);
         return true;
@@ -528,7 +537,7 @@ bool vm_fault(uint64_t addr) {
             dbg("vm: low page %x not ours: below %u kept %u\n", page, (uint64_t)low_below(page), (uint64_t)mem_firmware_kept(page));
             return false;           /* someone's, and in use: not to be hidden */
         }
-        *at = (uint64_t)fresh | PRESENT | WRITE | USER | owned;
+        *at = (uint64_t)fresh | PRESENT | WRITE | USER | owned | (*at & PROT_BITS);
         __asm__ volatile("invlpg (%0)" : : "r"(page) : "memory");
         memset((void *)page, 0, VM_PAGE);
         return true;
@@ -537,8 +546,101 @@ bool vm_fault(uint64_t addr) {
     if (fresh == NULL) {
         return false;
     }
-    *at = (uint64_t)fresh | PRESENT | WRITE | USER;
+    *at = (uint64_t)fresh | PRESENT | WRITE | USER | (*at & PROT_BITS);
     __asm__ volatile("invlpg (%0)" : : "r"(page) : "memory");
+    return true;
+}
+
+/* An entry made to say what prot asks, mapped or not. */
+static uint64_t protected(uint64_t e, unsigned prot) {
+    uint64_t want = ((prot & 2) == 0 ? NOWRITE : 0) | ((prot & 7) == 0 ? NOACCESS : 0);
+
+    if (!(e & PRESENT)) {
+        return want;                /* nothing mapped: only the wish */
+    }
+    e = (e & ~(PROT_BITS | WRITE | USER)) | want;
+    if (!(want & NOACCESS)) {
+        e |= USER;
+    }
+    if (!(want & NOWRITE) && (!(e & SHARED) || (e & COMMON_RW))) {
+        e |= WRITE;                 /* a page shared to copy stays read-only */
+    }
+    return e;
+}
+
+/* Tables are made to hold the wish for pages not there yet only for a
+   read-only stretch of a few megabytes - a library's relocations, a
+   program's data. A reservation of gigabytes made inaccessible would cost
+   megabytes of tables to say so, and gets it said only where it has some. */
+#define PROTECT_MAKE (16ull << 20)
+
+void vm_protect(uint64_t addr, uint64_t size, unsigned prot) {
+    uint64_t first = addr & ~(uint64_t)(VM_PAGE - 1);
+    bool open = (prot & 2) != 0;
+    bool make = !open && (prot & 7) != 0 && size <= PROTECT_MAKE;
+
+    if (cur == NULL || !vm_holds(first, size) || (open && !cur->protects)) {
+        return;
+    }
+    if (!open) {
+        cur->protects = true;
+    }
+    for (uint64_t page = first; page < addr + size; page += VM_PAGE) {
+        uint64_t *at = entry_for(page, make);
+
+        if (at != NULL) {
+            *at = protected(*at, prot);
+        } else {
+            page |= (1ull << 21) - VM_PAGE;     /* no table: on to the next one */
+        }
+    }
+    flush_tlb();
+}
+
+bool vm_denied(uint64_t addr, bool write, bool user) {
+    uint64_t *at;
+
+    if (cur == NULL || !cur->protects || !vm_holds(addr, 0) ||
+        (at = entry_for(addr, false)) == NULL) {
+        return false;
+    }
+    if ((*at & NOACCESS) && (user || !(*at & PRESENT))) {
+        return true;
+    }
+    return write && (*at & NOWRITE);
+}
+
+void vm_settle(uint64_t addr, uint64_t size) {
+    bool changed = false;
+
+    if (cur == NULL || !cur->protects) {
+        return;
+    }
+    for (uint64_t page = addr & ~(uint64_t)(VM_PAGE - 1); page < addr + size; page += VM_PAGE) {
+        uint64_t *at = vm_holds(page, VM_PAGE) ? entry_for(page, false) : NULL;
+
+        if (at != NULL && (*at & PRESENT) && (*at & PROT_BITS) &&
+            (*at & (WRITE | USER)) != (protected(*at, (*at & NOACCESS) ? 0 : 1) & (WRITE | USER))) {
+            *at = protected(*at, (*at & NOACCESS) ? 0 : 1);
+            changed = true;
+        }
+    }
+    if (changed) {
+        flush_tlb();
+    }
+}
+
+bool vm_writable(uint64_t addr, uint64_t size) {
+    if (cur == NULL || !cur->protects) {
+        return true;
+    }
+    for (uint64_t page = addr & ~(uint64_t)(VM_PAGE - 1); page < addr + size; page += VM_PAGE) {
+        uint64_t *at = vm_holds(page, 0) ? entry_for(page, false) : NULL;
+
+        if (at != NULL && (*at & PROT_BITS)) {
+            return false;
+        }
+    }
     return true;
 }
 
@@ -563,7 +665,7 @@ bool vm_map_shared(uint64_t addr, uint64_t page, bool writable) {
     }
     /* Writable is memory processes share on purpose (MAP_SHARED): every
        write is everyone's, so it is never copied. */
-    *at = page | PRESENT | USER | SHARED | (writable ? WRITE : 0);
+    *at = page | PRESENT | USER | SHARED | (writable ? WRITE | COMMON_RW : 0) | (*at & PROT_BITS);
     __asm__ volatile("invlpg (%0)" : : "r"(addr) : "memory");
     return true;
 }
@@ -655,7 +757,7 @@ void vm_discard(uint64_t addr, uint64_t size) {
 
         if (at != NULL && (*at & PRESENT) && !(*at & (SHARED | DEVICE))) {
             low_page_back(level, *at);
-            *at = 0;
+            *at &= PROT_BITS;       /* gone, but still what it was asked to be */
         }
     }
     flush_tlb();
@@ -763,6 +865,7 @@ static void level_empty(struct space *level, bool whole) {
     /* Nothing of the region is mapped any more, so its chunks are nobody's:
        an idle machine holds none of what the program had. */
     chunks_back(level);
+    level->protects = false;
     if (whole) {
         pages_back_to_firmware((uint64_t)pdpt, 1);
         level->pdpt = NULL;
@@ -855,7 +958,7 @@ static void fork_page(uint64_t *at, uint64_t addr) {
        read-only to both, until one of them writes (vm_fault). */
     if (!(*at & SHARED) && addr >= LOW_LIMIT && cur->chunks == 0 && fork_to->chunks == 0 &&
         shared_adopt(*at & ADDR)) {
-        *at = (*at & ADDR) | PRESENT | USER | SHARED;
+        *at = (*at & (ADDR | PROT_BITS | USER)) | PRESENT | SHARED;
         cur->bought -= VM_PAGE;
     }
     if (*at & SHARED) {
@@ -868,7 +971,7 @@ static void fork_page(uint64_t *at, uint64_t addr) {
         return;
     }
     memcpy(page, (const void *)addr, VM_PAGE);
-    *to = (uint64_t)page | PRESENT | WRITE | USER;
+    *to = (uint64_t)page | (*at & (PRESENT | WRITE | USER | PROT_BITS));
 }
 
 bool vm_fork(struct space *child) {
@@ -885,6 +988,7 @@ bool vm_fork(struct space *child) {
     }
     fork_to = child;
     fork_failed = false;
+    child->protects = cur->protects;
     walk(cur, fork_page);
     flush_tlb();                    /* the parent's pages it now shares are read-only */
     if (fork_failed) {

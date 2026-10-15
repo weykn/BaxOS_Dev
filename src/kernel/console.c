@@ -10,6 +10,7 @@
 #include "proc.h"
 #include "shell.h"
 #include "string.h"
+#include "syscall.h"
 #include "thread.h"
 #include "vga.h"
 
@@ -135,7 +136,7 @@ static void gather(void) {
 /* The next key, waiting for one - or 0 once a signal has been typed. */
 static char take_key(void) {
     gather();
-    while (typed_n == 0 && signalled == 0) {
+    while (typed_n == 0 && signalled == 0 && !signal_waiting()) {
         /* While other threads can run, the wait is theirs as well as the
            keyboard's. */
         if (thread_only()) {
@@ -145,7 +146,7 @@ static char take_key(void) {
         }
         gather();
     }
-    if (signalled != 0) {
+    if (signalled != 0 || signal_waiting()) {
         return 0;
     }
     char c = typed[0];
@@ -174,6 +175,7 @@ int console_signal(void) {
 }
 
 void console_reset(void) {
+    console_changer = 0;
     memset(&settings, 0, sizeof settings);
     typed_n = 0;
     signalled = 0;
@@ -195,7 +197,10 @@ void console_get(void *out, size_t size) {
     memcpy(out, &settings, size > sizeof settings ? sizeof settings : size);
 }
 
+int console_changer;
+
 void console_set(const void *in, size_t size) {
+    console_changer = program_pid();
     memcpy(&settings, in, size > sizeof settings ? sizeof settings : size);
     vga_set_crlf((settings.oflag & (OPOST | ONLCR)) == (OPOST | ONLCR));
 }
@@ -516,7 +521,7 @@ static int edit_line(void) {
         char c = take_key(), other = 0;
         bool tab = false;
 
-        if (c == 0 && signalled != 0) {
+        if (c == 0 && (signalled != 0 || signal_waiting())) {
             have = pos = 0;
             return -1;              /* the line goes with it */
         }
@@ -610,7 +615,7 @@ uint64_t console_read(char *buf, uint64_t count) {
         do {
             char c = take_key();
 
-            if (c == 0 && signalled != 0) {
+            if (c == 0 && (signalled != 0 || signal_waiting())) {
                 return n > 0 ? n : CONSOLE_SIGNAL;
             }
             if (c == '\n' && (settings.iflag & ICRNL) == 0) {

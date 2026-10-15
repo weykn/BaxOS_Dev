@@ -18,6 +18,7 @@
 #include "linux.h"
 #include "input.h"
 #include "module.h"
+#include "shell.h"
 
 #define MSR_EFER  0xC0000080
 #define MSR_STAR  0xC0000081
@@ -41,6 +42,9 @@ static uint64_t write_protect(bool on);
 static uint64_t arg[6];
 
 /* For thread.c, which keeps each thread's while another runs. */
+extern uint64_t user_flags, full_rcx, full_r11;    /* syscall_entry.asm */
+extern uint8_t  full_return;
+
 uint64_t *syscall_args(void) {
     return arg;
 }
@@ -182,6 +186,7 @@ struct process {
     int      pid, ppid, pgid, sid;  /* ppid 0: nobody waits for it */
     bool     zombie;                /* ended, its status not yet collected */
     bool     borrowed;              /* a vfork's child, in its parent's memory */
+    bool     compat;                /* it has made a call of compat/linux's */
     int      status;                /* as wait4 reports it, once ended */
     struct space own, *space;
     struct handle *files;           /* its descriptors, mem_alloc'd: a page's */
@@ -218,7 +223,7 @@ static int fg_pgrp;                 /* the group the keyboard's signals go to */
 struct process;
 static void signal_to(struct process *p, uint64_t sig);
 
-#define FIRST_FILES   ((4096 - 16) / sizeof(struct handle))   /* a page's worth */
+#define FIRST_FILES   32            /* to start: most programs never have more */
 #define handles       (proc->files)
 #define file_room     (proc->files_room)
 #define TOUCHED(fd)   (proc->ofd_touched[(fd) / 64] & 1ull << ((fd) % 64))
@@ -308,6 +313,9 @@ static struct process *proc_find(int pid) {
     return NULL;
 }
 
+static void ofd_trim(void);
+static void pipe_trim(void);
+
 static void proc_free(struct process *p) {
     for (unsigned i = 0; i < PROCESSES; i++) {
         if (procs[i] == p) {
@@ -319,6 +327,8 @@ static void proc_free(struct process *p) {
     mem_free(p->files_old);
     mem_free(p->cmdline);
     mem_free(p);
+    ofd_trim();
+    pipe_trim();
 }
 
 /* A new one, empty; NULL if there is no room. Ended ones nobody will wait
@@ -463,7 +473,7 @@ size_t process_file(const char *path, char *out, size_t max) {
     }
     if (p == NULL || (strcmp(rest, "stat") != 0 && strcmp(rest, "status") != 0 &&
                       strcmp(rest, "statm") != 0 && strcmp(rest, "cmdline") != 0 &&
-                      strcmp(rest, "comm") != 0)) {
+                      strcmp(rest, "comm") != 0 && strcmp(rest, "oom_score_adj") != 0)) {
         return (size_t)-1;
     }
     if (out == NULL) {
@@ -484,6 +494,8 @@ size_t process_file(const char *path, char *out, size_t max) {
     }
     if (strcmp(rest, "comm") == 0) {
         ksprintf(text, "%s\n", p->name);
+    } else if (strcmp(rest, "oom_score_adj") == 0) {
+        strcpy(text, "0\n");
     } else if (strcmp(rest, "statm") == 0) {
         ksprintf(text, "%u %u 0 0 0 %u 0\n", (unsigned)pages, (unsigned)pages, (unsigned)pages);
     } else if (strcmp(rest, "status") == 0) {
@@ -509,14 +521,24 @@ size_t process_file(const char *path, char *out, size_t max) {
     return len < max ? len : max;
 }
 
-/* Whether any program at all is still running. */
-static bool any_process(void) {
+/* Whether a program still running has called compat/linux. tsh never
+   does, so with only the shell left the module goes. */
+static bool any_linux(void) {
     for (unsigned i = 0; i < PROCESSES; i++) {
-        if (procs[i] != NULL && !procs[i]->zombie) {
+        if (procs[i] != NULL && !procs[i]->zombie && procs[i]->compat) {
             return true;
         }
     }
     return false;
+}
+
+static bool linux_ours;             /* the kernel loaded compat/linux, or tried to */
+
+static void linux_unneeded(void) {
+    if (linux_ours && !any_linux()) {
+        module_drop(LINUX_MODULE);
+        linux_ours = false;
+    }
 }
 
 
@@ -626,13 +648,41 @@ struct mobj {
     uint32_t refs;                  /* the open files that have it */
     uint32_t room;
     uint64_t *frame;                /* room of them, 0 where nothing is yet */
+    uint32_t entry;                 /* the file's table entry, one-based, 0 for none */
+    bool     written;               /* mapped writable: the pages are newer than the disk */
 };
 
 static struct ofd {
     uint32_t refs, offset, size;
     struct mobj *mem;
     char *name;                     /* a file open for writing: what it is written back to */
-} ofds[OFDS];
+    uint32_t entry;                 /* and its table entry, one-based: which file it is */
+} *ofds;                            /* OFDS of them while anything has one */
+
+/* A free one, the table made first if there is none: OFDS if not. */
+static unsigned ofd_slot(void) {
+    if (ofds == NULL && (ofds = mem_alloc(OFDS * sizeof *ofds)) != NULL) {
+        memset(ofds, 0, OFDS * sizeof *ofds);
+    }
+    for (unsigned i = 0; ofds != NULL && i < OFDS; i++) {
+        if (ofds[i].refs == 0) {
+            return i;
+        }
+    }
+    return OFDS;
+}
+
+/* The table goes once nothing has anything open: an idle machine has
+   no use for it. */
+static void ofd_trim(void) {
+    for (unsigned i = 0; ofds != NULL && i < OFDS; i++) {
+        if (ofds[i].refs != 0) {
+            return;
+        }
+    }
+    mem_free(ofds);
+    ofds = NULL;
+}
 
 /* The name a file open for writing goes back to - kept with the open file,
    not the process, so every descriptor of it has it: a dup's, a fork's, one
@@ -662,8 +712,28 @@ static struct mobj *mobj_new(void) {
     return m;
 }
 
+/* A file's pages written through a mapping go back to it once nothing has
+   it open any more. */
+static void mobj_write_back(struct mobj *m) {
+    struct fs_file file;
+    char path[FS_NAME_LEN + 1] = "/";
+
+    if (!m->written || m->entry == 0 || fs_file(m->entry - 1, &file) != 0) {
+        return;
+    }
+    strcpy(path + 1, file.name);
+    for (uint32_t i = 0; i < m->room && (uint64_t)i * PAGE_SIZE < file.size; i++) {
+        uint64_t n = file.size - (uint64_t)i * PAGE_SIZE;
+
+        if (m->frame[i] != 0) {
+            fs_write_at(path, i * PAGE_SIZE, (const void *)m->frame[i], n < PAGE_SIZE ? n : PAGE_SIZE);
+        }
+    }
+}
+
 static void mobj_free(struct mobj *m) {
     if (m != NULL && --m->refs == 0) {
+        mobj_write_back(m);
         for (uint32_t i = 0; i < m->room; i++) {
             if (m->frame[i] != 0) {
                 shared_drop(m->frame[i]);
@@ -715,6 +785,64 @@ static uint64_t mobj_page(struct mobj *m, uint32_t index, bool make) {
     return m->frame[index];
 }
 
+/* The pages a file on the disk is mapped into, by whichever opening of it
+   mapped it first - every opening has the same ones, as Linux's page
+   cache has it, so what one writes another's mapping sees. */
+static struct mobj *file_mem(uint32_t entry) {
+    for (unsigned i = 0; entry != 0 && ofds != NULL && i < OFDS; i++) {
+        if (ofds[i].refs != 0 && ofds[i].entry == entry && ofds[i].name != NULL &&
+            ofds[i].mem != NULL) {
+            return ofds[i].mem;
+        }
+    }
+    return NULL;
+}
+
+/* A file grown or cut through one opening: every opening of it sees its
+   new size - SQLite's reader of a log another connection appends to. */
+static void file_sized(const struct handle *h, uint32_t size) {
+    uint32_t entry = h->ofd != 0 ? ofds[h->ofd - 1].entry : 0;
+
+    for (unsigned i = 0; entry != 0 && i < OFDS; i++) {
+        if (ofds[i].refs != 0 && ofds[i].entry == entry && ofds[i].name != NULL) {
+            ofds[i].size = size;
+        }
+    }
+}
+
+/* A write to a file that is mapped: into the pages it is mapped from too. */
+static void file_mem_put(const struct handle *h, uint64_t offset, const char *data, uint64_t count) {
+    struct mobj *m = h->ofd != 0 ? file_mem(ofds[h->ofd - 1].entry) : NULL;
+
+    for (uint64_t done = 0; m != NULL && done < count;) {
+        uint64_t at = offset + done, k = PAGE_SIZE - at % PAGE_SIZE;
+        uint64_t page = mobj_page(m, (uint32_t)(at / PAGE_SIZE), false);
+
+        k = k < count - done ? k : count - done;
+        if (page != 0) {
+            memcpy((char *)page + at % PAGE_SIZE, data + done, k);
+        }
+        done += k;
+    }
+}
+
+/* A read of one: what a writable mapping has put in its pages is newer than
+   what the disk says. */
+static void file_mem_get(const struct handle *h, uint64_t offset, char *data, uint64_t count) {
+    struct mobj *m = h->ofd != 0 ? file_mem(ofds[h->ofd - 1].entry) : NULL;
+
+    for (uint64_t done = 0; m != NULL && m->written && done < count;) {
+        uint64_t at = offset + done, k = PAGE_SIZE - at % PAGE_SIZE;
+        uint64_t page = mobj_page(m, (uint32_t)(at / PAGE_SIZE), false);
+
+        k = k < count - done ? k : count - done;
+        if (page != 0) {
+            memcpy(data + done, (const char *)page + at % PAGE_SIZE, k);
+        }
+        done += k;
+    }
+}
+
 /* A memory file's bytes in and out, at its position. */
 static uint64_t mem_io(struct handle *h, uint64_t buf, uint64_t count, bool in) {
     struct mobj *m = h->ofd != 0 ? ofds[h->ofd - 1].mem : NULL;
@@ -756,18 +884,15 @@ static uint64_t mem_io(struct handle *h, uint64_t buf, uint64_t count, bool in) 
 #define MFD_CLOEXEC 1
 
 static uint64_t sys_memfd_create(uint64_t name, uint64_t flags, uint64_t c) {
-    unsigned slot = OFDS;
+    unsigned slot = ofd_slot();
     struct mobj *m;
 
     (void)name;
     (void)c;
-    for (unsigned i = 0; i < OFDS && slot == OFDS; i++) {
-        slot = ofds[i].refs == 0 ? i : slot;
-    }
     if (slot == OFDS || (m = mobj_new()) == NULL) {
         return ERR(slot == OFDS ? ENFILE : ENOMEM);
     }
-    ofds[slot] = (struct ofd){ 1, 0, 0, m, NULL };
+    ofds[slot] = (struct ofd){ 1, 0, 0, m, NULL, 0 };
 
     struct handle h = { .start = MEM_MARK, .ofd = slot + 1 };
     uint64_t fd = give_handle(h);
@@ -782,11 +907,8 @@ static uint64_t sys_memfd_create(uint64_t name, uint64_t flags, uint64_t c) {
 /* /proc/self/fd/N opened again, N a memory file: another open file of the
    same memory - Chromium's read-only view of what it shares. */
 static uint64_t mem_reopen(const struct handle *of) {
-    unsigned slot = OFDS;
+    unsigned slot = ofd_slot();
 
-    for (unsigned i = 0; i < OFDS && slot == OFDS; i++) {
-        slot = ofds[i].refs == 0 ? i : slot;
-    }
     if (slot == OFDS) {
         return ERR(ENFILE);
     }
@@ -798,7 +920,7 @@ static uint64_t mem_reopen(const struct handle *of) {
         return ERR(ENOMEM);
     }
     was->mem->refs++;
-    ofds[slot] = (struct ofd){ 1, 0, was->size, was->mem, NULL };
+    ofds[slot] = (struct ofd){ 1, 0, was->size, was->mem, NULL, 0 };
 
     struct handle h = { .start = MEM_MARK, .ofd = slot + 1, .size = was->size };
     uint64_t fd = give_handle(h);
@@ -862,12 +984,11 @@ struct handle *handle_of(uint64_t fd) {
         return NULL;
     }
     if (h->ofd == 0 && ofd_kind(h)) {
-        for (unsigned i = 0; i < OFDS; i++) {
-            if (ofds[i].refs == 0) {
-                ofds[i] = (struct ofd){ 1, h->offset, h->size, NULL, NULL };
-                h->ofd = i + 1;
-                break;
-            }
+        unsigned i = ofd_slot();
+
+        if (i < OFDS) {
+            ofds[i] = (struct ofd){ 1, h->offset, h->size, NULL, NULL, 0 };
+            h->ofd = i + 1;
         }
     }
     /* Loaded once a syscall: after that the descriptor is the newer of the
@@ -958,8 +1079,8 @@ static struct pipe {
     int      last_pid;              /* who wrote to it last */
     char    *made_from;             /* a /proc file's name, to make it again
                                        when it is read from the start again */
-} *pipes;                           /* PIPES of them, mem_alloc'd at start: too many
-                                       for the kernel's own image */
+} *pipes;                           /* PIPES of them, mem_alloc'd while any is open: too
+                                       many for the kernel's own image */
 
 static void handle_release(struct handle *h);
 struct iovec {
@@ -1110,10 +1231,27 @@ void *pipe_data(const struct handle *h) {
 static unsigned pipe_slot(void) {
     unsigned slot = 0;
 
+    if (pipes == NULL && (pipes = mem_alloc(PIPES * sizeof *pipes)) != NULL) {
+        memset(pipes, 0, PIPES * sizeof *pipes);
+    }
+    if (pipes == NULL) {
+        return PIPES;
+    }
     while (slot < PIPES && pipes[slot].refs > 0) {
         slot++;
     }
     return slot;
+}
+
+/* The same for the pipes', which are made when one is first needed. */
+static void pipe_trim(void) {
+    for (unsigned i = 0; pipes != NULL && i < PIPES; i++) {
+        if (pipes[i].refs != 0) {
+            return;
+        }
+    }
+    mem_free(pipes);
+    pipes = NULL;
 }
 
 /* The name of a /proc/net file the network module has - or the whole path
@@ -1179,7 +1317,7 @@ static uint64_t pipe_put(struct pipe *p, const char *from, uint64_t count) {
         count = PIPE_CAP - p->len;
     }
     if (p->len + count > p->size) {
-        uint32_t want = p->size;
+        uint32_t want = p->size != 0 ? p->size : PIPE_FIRST;
         void *bigger = NULL;
 
         while (want < p->len + count) {
@@ -1245,6 +1383,13 @@ static uint64_t pipe_read(struct pipe *p, char *to, uint64_t count) {
     p->taken += count;
     if (p->read_at == p->len) {
         p->read_at = p->len = 0;    /* all read: a pair is written to again */
+        /* and its memory goes until it is: an X server holds dozens of
+           these, idle most of the time */
+        if (p->made_from == NULL) {
+            mem_free(p->data);
+            p->data = NULL;
+            p->size = 0;
+        }
     }
     return count;
 }
@@ -1326,9 +1471,11 @@ static uint64_t write_to(struct handle *h, uint64_t text, uint64_t length) {
                         (const void *)text, length) < 0) {
             return ERR(EIO);
         }
+        file_mem_put(h, h->offset, (const char *)text, length);
         h->offset += (uint32_t)length;
         if (h->offset > h->size) {
             h->size = h->offset;
+            file_sized(h, h->size);
         }
         return length;
     }
@@ -1350,6 +1497,9 @@ static uint64_t write_to(struct handle *h, uint64_t text, uint64_t length) {
                 return pair_put(h, p, &one, 1, NULL, 0, false);
             }
             return p == NULL ? ERR(EPIPE) : pipe_write(h, p, (const char *)text, length);
+        }
+        if (h->size == PIPE_FILE) {
+            return length;          /* a /proc setting: taken, with nothing here to change */
         }
         return p == NULL || h->size != PIPE_WRITE ? ERR(EBADF)
                                                   : pipe_write(h, p, (const char *)text, length);
@@ -1428,9 +1578,10 @@ void wait_ended(uint64_t began) {
  * ignores one hears nothing of it. One with a handler for SIGINT - a shell,
  * an editor, a pager - has the call it is waiting in end with EINTR, and on
  * the way back out of the syscall its handler runs, on its own stack, in a
- * frame laid out as Linux lays one out; rt_sigreturn puts it back. Nothing
- * preempts a program, so one is told at its next syscall, and checked every
- * so often between waits as well as in them. */
+ * frame laid out as Linux lays one out; rt_sigreturn puts it back. Without
+ * sched/timer nothing preempts a program, so one is told at its next
+ * syscall, and checked every so often between waits as well as in them;
+ * with it, at the next tick as well. */
 
 #define SIGINT       2
 #define SIGQUIT      3
@@ -1541,8 +1692,19 @@ static void signal_fatal(void) {
     }
 }
 
+bool signal_waiting(void) {
+    for (uint64_t sig = 1; proc != NULL && pending != 0 && sig < SIGNALS; sig++) {
+        if ((pending & 1ull << sig) != 0 &&
+            (sig == SIGKILL || ((blocked & 1ull << (sig - 1)) == 0 && !handled(sig) &&
+                                on_signal[sig].handler == SIG_DFL))) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* Whether the keyboard's signals have anyone to go to: a group still
-   running. While nothing has, they are the kernel shell's. */
+   running. While nothing has, they go nowhere. */
 static bool foreground_alive(void) {
     for (unsigned i = 0; i < PROCESSES; i++) {
         if (procs[i] != NULL && !procs[i]->zombie && procs[i]->pgid == fg_pgrp) {
@@ -1614,6 +1776,17 @@ static uint64_t sys_kill(uint64_t pid, uint64_t sig, uint64_t c) {
 static uint64_t sys_tgkill(uint64_t tgid, uint64_t tid, uint64_t sig) {
     (void)tid;
     return sys_kill((uint32_t)tgid, sig, 0);
+}
+
+/* The same with a siginfo of the sender's making - which arrives as a plain
+   signal: a crash handler re-raising what it caught. */
+static uint64_t sys_rt_sigqueueinfo(uint64_t tgid, uint64_t sig, uint64_t info) {
+    (void)info;
+    return sys_kill((uint32_t)tgid, sig, 0);
+}
+
+static uint64_t sys_rt_tgsigqueueinfo(uint64_t tgid, uint64_t tid, uint64_t sig) {
+    return sys_tgkill(tgid, tid, sig);
 }
 
 /* Blocked signals wait in pending until they are let through. SIGKILL and
@@ -1809,6 +1982,14 @@ static uint64_t sys_rt_sigreturn(uint64_t a, uint64_t b, uint64_t c) {
     f->rip = g[G_RIP];
     f->rflags = (f->rflags & ~flags) | (g[G_EFLAGS] & flags);
     blocked = frame->uc.sigmask & ~(1ull << (9 - 1) | 1ull << (19 - 1));
+
+    /* The handler may have interrupted the program anywhere (a fault, the
+       timer), where RCX and R11 were its own: those come back too. */
+    uint64_t *restore = thread_restore();
+
+    restore[0] = 1;
+    restore[1] = g[G_RCX];
+    restore[2] = g[G_R11];
     return g[G_RAX];
 }
 
@@ -1917,7 +2098,14 @@ static uint64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count) {
             return ERR(EIO);
         }
         h->size = file.size;
-        return read_run(h, file.start, buf, count);
+
+        uint32_t from = h->offset;
+        uint64_t got = read_run(h, file.start, buf, count);
+
+        if ((int64_t)got > 0) {
+            file_mem_get(h, from, (char *)buf, got);
+        }
+        return got;
     }
     if (h->start == PROC_MARK) {
         uint64_t got = proc_read(proc_at(h->folder - 1), h->offset, (char *)buf, count);
@@ -2060,16 +2248,15 @@ static uint64_t fifo_open(uint32_t number, uint64_t flags) {
     struct pipe *p;
     uint64_t fd;
 
-    while (slot < PIPES && !(pipes[slot].refs > 0 && pipes[slot].fifo == number)) {
+    while (pipes != NULL && slot < PIPES &&
+           !(pipes[slot].refs > 0 && pipes[slot].fifo == number)) {
         slot++;
     }
-    if (slot == PIPES) {
-        void *data;
-
-        if ((slot = pipe_slot()) == PIPES || (data = mem_alloc(PIPE_FIRST)) == NULL) {
+    if (pipes == NULL || slot == PIPES) {
+        if ((slot = pipe_slot()) == PIPES) {
             return ERR(ENFILE);
         }
-        pipes[slot] = (struct pipe){ .data = data, .size = PIPE_FIRST, .fifo = number };
+        pipes[slot] = (struct pipe){ .fifo = number };
     }
     p = &pipes[slot];
     struct handle h = {
@@ -2298,20 +2485,17 @@ static uint64_t open_name(const char *name, uint64_t flags) {
     if (fs_stat(name, &file) == 0 && is_fifo(&file)) {
         return fifo_open(file_ino(name, true), flags);
     }
-    if ((flags & O_ACCMODE) != O_RDONLY) {
+    if ((flags & O_ACCMODE) != O_RDONLY && proc_net_name(name) == NULL) {
         /* Open for writing. The name is kept, because that is what a write
            goes back to; what is in the file is kept too, unless the program
            asked for it to be thrown away. */
         struct handle h = { .start = WRITE_MARK };
         char scratch[FS_NAME_LEN];
         static unsigned tmpfiles;
-        unsigned slot = OFDS;
+        unsigned slot = ofd_slot();
         size_t length;
         bool empty;
 
-        for (unsigned i = 0; i < OFDS && slot == OFDS; i++) {
-            slot = ofds[i].refs == 0 ? i : slot;
-        }
         if (slot == OFDS) {
             return ERR(ENFILE);
         }
@@ -2355,8 +2539,12 @@ static uint64_t open_name(const char *name, uint64_t flags) {
         h.writer = 1;
         h.size = file.size;
         h.offset = (flags & O_APPEND) != 0 ? file.size : 0;
-        ofds[slot] = (struct ofd){ 1, h.offset, h.size, NULL, kept };
+        ofds[slot] = (struct ofd){ 1, h.offset, h.size, NULL, kept, 0 };
+        fs_entry(name, true, &ofds[slot].entry);
         h.ofd = slot + 1;
+        if (empty) {
+            file_sized(&h, 0);
+        }
 
         uint64_t fd = give_handle(h);
 
@@ -2400,6 +2588,11 @@ static uint64_t open_name(const char *name, uint64_t flags) {
 static uint64_t sys_open(uint64_t path, uint64_t flags, uint64_t mode) {
     (void)mode;
     return with_cloexec(open_name(user_string(path), flags), (flags & O_CLOEXEC) != 0);
+}
+
+static uint64_t sys_creat(uint64_t path, uint64_t mode, uint64_t c) {
+    (void)c;
+    return sys_open(path, O_CREAT | O_WRONLY | O_TRUNC, mode);
 }
 
 /* A relative path, spelled out from a folder a program already has open.
@@ -2682,7 +2875,18 @@ static uint64_t sys_ftruncate(uint64_t fd, uint64_t length, uint64_t c) {
         }
         mem_free(kept);
     }
+    /* Pages it is mapped into read as zeroes past the new end. */
+    struct mobj *m = h->ofd != 0 ? file_mem(ofds[h->ofd - 1].entry) : NULL;
+
+    for (uint32_t i = (uint32_t)(length / PAGE_SIZE); m != NULL && i < m->room; i++) {
+        uint64_t from = i == length / PAGE_SIZE ? length % PAGE_SIZE : 0;
+
+        if (m->frame[i] != 0) {
+            memset((char *)m->frame[i] + from, 0, PAGE_SIZE - from);
+        }
+    }
     h->size = (uint32_t)length;      /* the position stays where it was, as on Linux */
+    file_sized(h, h->size);
     return 0;
 }
 
@@ -3094,8 +3298,15 @@ static uint64_t map_shared_file(struct handle *h, uint64_t at, uint64_t size, ui
     if (o == NULL || offset % PAGE_SIZE != 0) {
         return ERR(o == NULL ? ENFILE : EINVAL);
     }
+    if (o->mem == NULL && o->name != NULL && (o->mem = file_mem(o->entry)) != NULL) {
+        o->mem->refs++;             /* mapped already, by another opening */
+    }
     if (o->mem == NULL && (o->mem = mobj_new()) == NULL) {
         return ERR(ENOMEM);
+    }
+    if (o->name != NULL) {
+        o->mem->entry = o->entry;
+        o->mem->written |= (arg[2] & 2) != 0;
     }
     map_trim(at, size);
     vm_release(at, size);           /* whatever was there before */
@@ -3125,12 +3336,24 @@ static uint64_t map_shared_file(struct handle *h, uint64_t at, uint64_t size, ui
     return at;
 }
 
+static uint64_t map_at(uint64_t addr, uint64_t length);
+
+/* What it may be used for is the last thing set, once the kernel has put
+   whatever belongs there. */
 static uint64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot) {
+    uint64_t at = map_at(addr, length);
+
+    if ((int64_t)at >= 0 && (prot & 2) == 0) {
+        vm_protect(at, length, (unsigned)prot);
+    }
+    return at;
+}
+
+static uint64_t map_at(uint64_t addr, uint64_t length) {
     uint64_t flags = arg[3], fd = arg[4], offset = arg[5];
     uint64_t size = (length + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
     uint64_t at;
 
-    (void)prot;                     /* every page here is already read-write-execute */
     if (size == 0) {
         return ERR(EINVAL);
     }
@@ -3160,6 +3383,7 @@ static uint64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot) {
     if (!fits(at, size)) {
         return ERR(ENOMEM);
     }
+    vm_protect(at, size, 7);        /* whatever was asked of what was there before */
     if ((flags & MAP_ANONYMOUS) != 0) {
         /* New memory is empty memory, and a page of this region arrives empty
            - so somewhere of the program's choosing needs nothing done to it
@@ -3242,6 +3466,15 @@ static uint64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot) {
     return at;
 }
 
+/* Only what a page may be used for changes - nothing is mapped or let go. */
+static uint64_t sys_mprotect(uint64_t addr, uint64_t length, uint64_t prot) {
+    if (addr % PAGE_SIZE != 0) {
+        return ERR(EINVAL);
+    }
+    vm_protect(addr, length, (unsigned)prot);
+    return 0;
+}
+
 static uint64_t sys_munmap(uint64_t addr, uint64_t length, uint64_t c) {
     (void)c;
     map_trim(addr, length);
@@ -3282,7 +3515,7 @@ static void unlinked_open(const char *name) {
     bool there = fs_stat(name, &file) == 0;
     struct mobj *kept = NULL;
 
-    for (unsigned i = 0; i < OFDS; i++) {
+    for (unsigned i = 0; ofds != NULL && i < OFDS; i++) {
         struct ofd *o = &ofds[i];
 
         if (o->refs == 0 || o->name == NULL ||
@@ -3303,6 +3536,7 @@ static void unlinked_open(const char *name) {
         }
         mem_free(o->name);
         o->name = NULL;
+        o->mem->entry = 0;          /* nothing to go back to now */
         kept = kept != NULL ? kept : o->mem;
     }
     /* Opened for reading too, by its name before it went - Chromium's
@@ -3863,8 +4097,10 @@ static uint64_t sys_pwrite64(uint64_t fd, uint64_t text, uint64_t count) {
                     (const void *)text, count) < 0) {
         return ERR(EIO);
     }
+    file_mem_put(h, offset, (const char *)text, count);
     if (offset + count > h->size) {
         h->size = (uint32_t)(offset + count);
+        file_sized(h, h->size);
     }
     return count;
 }
@@ -4151,6 +4387,9 @@ static const uint16_t numbers[] = {
     SYS_EXIT,
     SYS_EXIT_GROUP,
     SYS_OPENAT,
+    SYS_CREAT,
+    SYS_RT_SIGQUEUEINFO,
+    SYS_RT_TGSIGQUEUEINFO,
     SYS_CHDIR,
     SYS_FCHDIR,
     SYS_DUP,
@@ -4206,7 +4445,7 @@ static const syscall_fn handlers[] = {
     sys_close,
     sys_lseek,
     sys_mmap,
-    sys_ok,
+    sys_mprotect,
     sys_munmap,
     sys_brk,
     sys_writev,
@@ -4240,6 +4479,9 @@ static const syscall_fn handlers[] = {
     sys_exit,
     sys_exit_group,
     sys_openat,
+    sys_creat,
+    sys_rt_sigqueueinfo,
+    sys_rt_tgsigqueueinfo,
     sys_chdir,
     sys_fchdir,
     sys_dup,
@@ -4291,9 +4533,6 @@ static const syscall_fn handlers[] = {
 #define SYSCALLS (sizeof numbers / sizeof numbers[0])
 
 void syscall_init(void) {
-    if (pipes == NULL && (pipes = mem_alloc(PIPES * sizeof *pipes)) != NULL) {
-        memset(pipes, 0, PIPES * sizeof *pipes);
-    }
     gdt_init();
     sse_init();
     traps_init();
@@ -4330,7 +4569,6 @@ static unsigned calls;              /* syscalls made, for the look at Ctrl-C */
    call that is its, and drops it once no program is running - unless it
    was enabled by hand, which is then whoever enabled it's to undo. */
 static syscall_fn (*linux_find)(uint64_t number);
-static bool linux_ours;             /* the kernel loaded it, or tried to */
 
 void linux_register(syscall_fn (*find)(uint64_t number)) {
     linux_find = find;
@@ -4372,6 +4610,9 @@ uint64_t syscall_dispatch(uint64_t a, uint64_t b, uint64_t c,
     }
     if (handler == NULL && linux_find != NULL) {
         handler = linux_find(number);
+        if (proc != NULL) {
+            proc->compat = true;
+        }
     }
 
     if (handler != NULL) {
@@ -4410,6 +4651,14 @@ uint64_t syscall_dispatch(uint64_t a, uint64_t b, uint64_t c,
     }
     if (proc != NULL) {
         now_running.left = efi_uptime_us();
+    }
+    uint64_t *restore = thread_restore();
+
+    if (restore[0] != 0) {          /* rt_sigreturn's: nothing switches from here */
+        restore[0] = 0;
+        full_return = 1;
+        full_rcx = restore[1];
+        full_r11 = restore[2];
     }
     return result;
 }
@@ -4512,6 +4761,13 @@ static bool fault_deliver(uint64_t sig, int code, uint64_t addr, unsigned vector
     frame->info.signo = (int32_t)sig;
     frame->info.code = code;
     *(uint64_t *)frame->info.rest = addr;   /* si_addr */
+    if (sig == SIGCHLD) {
+        int32_t *child = (int32_t *)frame->info.rest;
+
+        frame->info.code = 1;       /* CLD_EXITED */
+        child[0] = (int32_t)child_pid;
+        child[2] = (int32_t)child_code;
+    }
 
     r->rdi = sig;
     r->rsi = (uint64_t)&frame->info;
@@ -4525,10 +4781,90 @@ static bool fault_deliver(uint64_t sig, int code, uint64_t addr, unsigned vector
     return true;
 }
 
+/* ---- the timer ---------------------------------------------------------
+ *
+ * With sched/timer loaded a program is interrupted every few milliseconds -
+ * only a program: the kernel runs with interrupts off and stays
+ * cooperative. Each tick is what a syscall would have been: Ctrl-C looked
+ * for, a signal waiting acted on or handed to its handler, and the
+ * processor passed round. A program that never makes a syscall can be
+ * stopped then, and no longer keeps the others from running. */
+
+#define IRQ_STRAY 0x100             /* syscall_entry.asm's stubs */
+#define IRQ_TICK  0x101
+
+extern char tick_entry[], stray_entry[];
+static void (*tick_ack)(void);
+
+bool tick_register(unsigned vector, void (*ack)(void)) {
+    struct desc_ptr idtr;
+
+    if (ack == NULL) {
+        user_flags = 0x002;         /* the gates stay, answering nothing */
+        tick_ack = NULL;
+        return true;
+    }
+    __asm__ volatile("sidt %0" : "=m"(idtr));
+    unsigned gates = (idtr.limit + 1u) / sizeof(struct idt_gate);
+
+    if (!efi_gone() || vector < EXCEPTIONS || vector >= gates) {
+        return false;               /* the firmware's interrupts are still its own */
+    }
+    struct idt_gate *idt = (struct idt_gate *)idtr.base;
+    uint64_t cr0 = write_protect(false);
+
+    /* Every vector past the CPU's own: whatever the firmware left wired to
+       one of its handlers - gone with its memory - is let go instead. */
+    for (unsigned i = EXCEPTIONS; i < gates; i++) {
+        uint64_t handler = (uint64_t)(i == vector ? tick_entry : stray_entry);
+
+        idt[i] = (struct idt_gate){
+            .offset_low = (uint16_t)handler, .selector = kernel_cs, .type = 0x8E,
+            .offset_mid = (uint16_t)(handler >> 16), .offset_high = (uint32_t)(handler >> 32),
+        };
+    }
+    __asm__ volatile("mov %0, %%cr0" : : "r"(cr0) : "memory");
+    tick_ack = ack;
+    user_flags = 0x202;             /* programs run with interrupts on from here */
+    return true;
+}
+
+static void program_tick(struct trap_regs *r) {
+    if (proc == NULL || (r->cs & 3) != 3) {
+        return;
+    }
+    if (now_running.left != 0) {
+        now_running.user += efi_uptime_us() - now_running.left;
+    }
+    struct kernel_mark mark = kernel_began();
+
+    interrupt_check();              /* Ctrl-C; a signal that ends it, ends it */
+    thread_yield();
+    signal_fatal();
+
+    uint64_t sig = deliverable();
+
+    if (sig != 0) {
+        pending &= ~(1ull << sig);
+        fault_deliver(sig, 0x80 /* SI_KERNEL */, 0, 0, r);
+    }
+    kernel_ended(mark);
+    now_running.left = efi_uptime_us();
+}
+
 /* Called by trap_common: the signal the exception is - to the program's
    handler if it has one (and this returns, into it), else its end, as on
    Linux: a shell says "Segmentation fault", "Illegal instruction". */
 void trap_signal(unsigned vector, struct trap_regs *r) {
+    if (vector >= IRQ_STRAY) {
+        if (tick_ack != NULL) {
+            tick_ack();
+        }
+        if (vector == IRQ_TICK) {
+            program_tick(r);
+        }
+        return;
+    }
     uint64_t sig = vector == 0 || vector == 16 || vector == 19 ? SIGFPE :
                    vector == 1 || vector == 3 ? SIGTRAP :
                    vector == 6 ? SIGILL : vector == 17 ? SIGBUS : SIGSEGV;
@@ -4547,15 +4883,19 @@ void trap_signal(unsigned vector, struct trap_regs *r) {
 void page_fault(uint64_t addr, struct trap_regs *r) {
     struct kernel_mark mark = kernel_began();
 
+    bool denied = vm_denied(addr, (r->err & 2) != 0, (r->err & 4) != 0);
+
     /* Something promised to a mapping comes first: the page is not merely
-       empty, it has a stretch of a file that belongs in it. */
-    if (map_fill(addr) || vm_fault(addr)) {
+       empty, it has a stretch of a file that belongs in it. What the program
+       asked of the pages filled is applied once they are. */
+    if (!denied && (map_fill(addr) || vm_fault(addr))) {
+        vm_settle(addr - FILL_PAGES * PAGE_SIZE, 2 * FILL_PAGES * PAGE_SIZE);
         kernel_ended(mark);
         return;
     }
     /* SEGV_MAPERR where nothing is, SEGV_ACCERR where something is that may
        not be touched so - what a JavaScript engine's guard pages rely on. */
-    if (fault_deliver(SIGSEGV, (r->err & 1) != 0 ? 2 : 1, addr, 14, r)) {
+    if (fault_deliver(SIGSEGV, (r->err & 1) != 0 || denied ? 2 : 1, addr, 14, r)) {
         kernel_ended(mark);
         return;
     }
@@ -4765,6 +5105,27 @@ static int load_elf_at(const struct fs_file *file, const struct elf_header *head
     return 0;
 }
 
+/* TEF64, Tuxlet's own executable format (src/tef/tef.ld): the bytes a
+   program runs as, behind a header saying where it starts and how much
+   memory it needs. It goes where a position-independent ELF would and is
+   never relocated - there is nothing in it to relocate. */
+struct tef_header {
+    char     magic[8];      /* "TEF64" */
+    uint32_t entry;         /* from the front of the file */
+    uint32_t size;          /* the file, then zeroes */
+};
+
+static int load_tef(const struct fs_file *file, const struct tef_header *tef,
+                    uint64_t *entry) {
+    uint64_t at = vm_base() + USER_EXEC;
+
+    if (tef->entry >= file->size || tef->size < file->size || !fits(at, tef->size)) {
+        return PROGRAM_EINVAL;
+    }
+    *entry = started_entry = at + tef->entry;
+    return load_segment(file, 0, at, file->size, tef->size);
+}
+
 /* What program_load needs to hold while it works: three hundred bytes of
    headers and paths, borrowed rather than put on the kernel stack, since a
    program may start a program which starts a program. */
@@ -4795,7 +5156,17 @@ int program_load(const struct fs_file *file, uint64_t *entry) {
     started_base = 0;
     started_phdr = started_phent = started_phnum = 0;
 
-    /* Everything on the disk is linked: an ELF, or not a program at all. */
+    /* Everything on the disk is linked: a TEF64, an ELF, or not a program
+       at all. */
+    if (vm_base() != 0 && file->size >= sizeof(struct tef_header) &&
+        read_at(file, 0, &header, sizeof(struct tef_header)) == 0 &&
+        memcmp(header.ident, "TEF64\0\0", 8) == 0) {
+        err = load_tef(file, (const struct tef_header *)&header, entry);
+        if (err == 0) {
+            program_memory_start();
+        }
+        goto done;
+    }
     if (file->size < sizeof header || read_at(file, 0, &header, sizeof header) != 0 ||
         header.ident[0] != 0x7F || header.ident[1] != 'E' ||
         header.ident[2] != 'L' || header.ident[3] != 'F') {
@@ -4985,6 +5356,10 @@ bool program_running(void) {
     return proc != NULL;
 }
 
+int program_pid(void) {
+    return proc != NULL ? proc->pid : 0;
+}
+
 /* Runs the loaded program in the running process, on this thread, until
    the process ends; returns its exit code. */
 static int program_run(uint64_t entry, unsigned argc, const char *const *argv,
@@ -5028,16 +5403,15 @@ static uint64_t sys_pipe2(uint64_t out, uint64_t flags, uint64_t c) {
     uint32_t *fds = (uint32_t *)out;
     unsigned slot;
     uint64_t read_fd, write_fd;
-    void *data = NULL;
 
     (void)c;
     if (!user_range(out, 8)) {
         return ERR(EFAULT);
     }
-    if ((slot = pipe_slot()) == PIPES || (data = mem_alloc(PIPE_FIRST)) == NULL) {
+    if ((slot = pipe_slot()) == PIPES) {
         return ERR(ENFILE);
     }
-    pipes[slot] = (struct pipe){ .data = data, .size = PIPE_FIRST, .refs = 2, .count = 1 };
+    pipes[slot] = (struct pipe){ .refs = 2, .count = 1 };
 
     struct handle h = { .start = PIPE_MARK, .folder = slot + 1,
                         .offset = (uint32_t)flags & O_NONBLOCK };
@@ -5049,7 +5423,6 @@ static uint64_t sys_pipe2(uint64_t out, uint64_t flags, uint64_t c) {
         if ((int64_t)read_fd >= 0) {
             handles[read_fd].used = 0;
         }
-        mem_free(data);
         pipes[slot] = (struct pipe){ 0 };
         return ERR(EMFILE);
     }
@@ -5119,15 +5492,13 @@ bool pair_new(struct handle out[2], uint32_t flags) {
     unsigned slot[2];
 
     for (int i = 0; i < 2; i++) {
-        void *data = (slot[i] = pipe_slot()) < PIPES ? mem_alloc(PIPE_FIRST) : NULL;
-
-        if (data == NULL) {
+        if ((slot[i] = pipe_slot()) == PIPES) {
             if (i == 1) {
                 pipe_drop(&pipes[slot[0]]);
             }
             return false;
         }
-        pipes[slot[i]] = (struct pipe){ .data = data, .size = PIPE_FIRST, .refs = 2, .count = 1 };
+        pipes[slot[i]] = (struct pipe){ .refs = 2, .count = 1 };
     }
     for (int i = 0; i < 2; i++) {
         out[i] = (struct handle){ .used = 1, .start = PIPE_MARK, .folder = slot[i] + 1,
@@ -5470,6 +5841,10 @@ static void process_end(int code) {
     }
     p->status = wait_status(code);
     p->zombie = true;
+    if (console_changer == p->pid) {
+        console_reset();            /* raw, say, and it crashed */
+    }
+    linux_unneeded();
     parent = proc_find(p->ppid);
     if (parent == NULL || parent->zombie) {
         p->ppid = 0;
@@ -6127,10 +6502,7 @@ int program_start(const char *path, unsigned argc, const char *const *argv,
         fg_pgrp = 0;
     }
     mem_free(w);
-    if (linux_ours && !any_process()) {
-        module_drop(LINUX_MODULE);
-        linux_ours = false;
-    }
+    linux_unneeded();
     return err;
 }
 
@@ -6162,6 +6534,7 @@ static uint64_t sys_execve(uint64_t path, uint64_t argv, uint64_t envp) {
         held->words[1] = NULL;
         argc = 1;
     }
+    shell_env_take(envc, held->env);    /* PATH and MODPATH, for the kernel's own use */
 
     /* A kernel built-in is not a file: there is nothing to load, and nothing
        to give a region of its own. It simply runs, and that is the program.
@@ -6170,6 +6543,7 @@ static uint64_t sys_execve(uint64_t path, uint64_t argv, uint64_t envp) {
        there - which is what makes `mem | head` and `uptime > file` work. */
     if ((cmd = proc_command(held->name)) != NULL) {
         void *taken = NULL;
+
 
         if (!is_console(1) &&
             (taken = mem_alloc(PROC_OUT)) != NULL) {
@@ -6216,6 +6590,10 @@ static uint64_t sys_execve(uint64_t path, uint64_t argv, uint64_t envp) {
             mem_free(held);
             return ERR(ENOENT);
         }
+    } else if (memcmp(held->shebang, "\x7F" "ELF", 4) != 0 &&
+               memcmp(held->shebang, "TEF64", 5) != 0) {
+        mem_free(held);
+        return ERR(ENOEXEC);        /* while the caller is still there to hear it */
     }
 
     /* From here the old program is gone: its other threads, its memory - or,

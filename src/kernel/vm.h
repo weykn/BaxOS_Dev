@@ -42,6 +42,8 @@ struct space {
     uint64_t  low_start, low_end;
     uint64_t *low_tables;
     uint64_t  low_owned;        /* pages it has at their own address */
+    bool      protects;         /* a page of it has been made read-only or
+                                   no-access (vm_protect) */
 };
 
 /* A new, empty space; false if there is no room for one. */
@@ -96,6 +98,24 @@ bool vm_holds(uint64_t addr, uint64_t size);
    what the page fault handler calls. A page that was write-protected for
    vm_undo_begin is copied aside here and made writable again. */
 bool vm_fault(uint64_t addr);
+
+/* Linux's PROT_* for the pages under addr .. addr + size, as mmap and
+   mprotect ask: kept in the page entries, mapped or not yet, so a page
+   that arrives later - filled from a file, copied on a write - gets them
+   too (vm_settle). Execute is not told apart from read. */
+void vm_protect(uint64_t addr, uint64_t size, unsigned prot);
+
+/* Whether the protection of the page holding addr refuses a write, or any
+   access from the program itself: a fault that is the program's SIGSEGV
+   rather than a page to bring in. */
+bool vm_denied(uint64_t addr, bool write, bool user);
+
+/* Applies the protections to pages mapped since in addr .. addr + size -
+   after the kernel has filled them, which it needs them writable for. */
+void vm_settle(uint64_t addr, uint64_t size);
+
+/* Whether the program could write to all of addr .. addr + size. */
+bool vm_writable(uint64_t addr, uint64_t size);
 
 /* Maps addr .. addr + size now, zeroed, rounded out to whole pages. */
 bool vm_reserve(uint64_t addr, uint64_t size);

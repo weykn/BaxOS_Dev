@@ -403,7 +403,7 @@ static const struct efi_gop_info *gop_mode(unsigned i) {
     efi_uintn size;
 
     if (gop == NULL || i >= gop->mode->max_mode ||
-        EFI_ERROR(gop->query_mode(gop, i, &size, &mode)) ||
+        EFI_ERROR(EFI_CALL(gop->query_mode, gop, i, &size, &mode)) ||
         mode->pixel_format > EFI_PIXEL_BGRX) {
         return NULL;
     }
@@ -490,7 +490,7 @@ int vga_start(struct boot_info *info) {
        fail the way setting a mode could. Finding the protocol again is only
        so that the mode can be changed later. */
     if (info->system == NULL ||
-        EFI_ERROR(info->system->boot->locate_protocol(&gop_guid, NULL, (void **)&gop))) {
+        EFI_ERROR(EFI_CALL(info->system->boot->locate_protocol, &gop_guid, NULL, (void **)&gop))) {
         gop = NULL;
     }
     /* The firmware's own record of the mode is fresher than the loader's. */
@@ -521,7 +521,7 @@ int vga_set_mode(const char *name) {
         if (mode == NULL || mode->width != w || mode->height != h) {
             continue;
         }
-        if (EFI_ERROR(gop->set_mode(gop, i))) {
+        if (EFI_ERROR(EFI_CALL(gop->set_mode, gop, i))) {
             return -1;
         }
         /* set_mode fills in a fresh framebuffer, which may be somewhere else

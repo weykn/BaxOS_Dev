@@ -8,14 +8,17 @@ DEFAULT REL
 SECTION .text
 GLOBAL user_enter, user_resume, user_exit, syscall_entry, trap_stubs, page_fault_entry
 GLOBAL user_frame, user_cs, user_ss, user_flags, thread_switch
+GLOBAL tick_entry, stray_entry, full_return, full_rcx, full_r11
 EXTERN syscall_dispatch, page_fault, trap_signal, tss, process_exit
 
 ; A program's RFLAGS, in user_flags below: the always-one bit, and IF while
 ; the firmware is running. Interrupts have to stay on in ring 3 then: the
 ; firmware's timers are what drive its keyboard and its USB polling, so a
 ; program running with them off freezes the whole machine rather than just
-; itself. Once the firmware is gone (efi_leave) they go off for good: the
-; kernel polls everything, and none of the firmware's handlers are left.
+; itself. Once the firmware is gone (efi_leave) they go off: the kernel polls
+; everything, and none of the firmware's handlers are left - until
+; sched/timer gives programs a tick of the kernel's own (tick_register). The
+; kernel itself always runs with them off.
 
 ; Ring 3 is entered and returned to with IRETQ rather than SYSRET.
 ;
@@ -100,7 +103,10 @@ user_resume:
 
     push qword [user_ss]                ; the frame IRETQ returns through
     push qword [r15 + 16*8]             ; the program's own stack
-    push qword [r15 + 14*8]             ; its flags
+    mov rcx, [r15 + 14*8]               ; its flags, interrupts as programs have them
+    and rcx, -0x201
+    or rcx, [user_flags]
+    push rcx
     push qword [user_cs]
     push qword [r15 + 15*8]             ; and where it was
 
@@ -212,7 +218,9 @@ syscall_entry:
     ; those in its own order with the selectors between them, so the frame is
     ; built just below them and they are copied across.
     mov rcx, [rsp + 8]                  ; where it was
-    mov r11, [rsp]                      ; its flags
+    mov r11, [rsp]                      ; its flags, interrupts as programs have them
+    and r11, -0x201
+    or r11, [user_flags]
     sub rsp, 40
     mov [rsp], rcx
     mov rcx, [user_cs]
@@ -223,6 +231,15 @@ syscall_entry:
     mov rcx, [user_ss]
     mov [rsp + 32], rcx
     xor ecx, ecx                        ; a syscall may clobber it, and did
+    cmp byte [full_return], 0
+    jne .full
+    iretq
+    ; rt_sigreturn back into code a signal interrupted anywhere - not at a
+    ; syscall - which has RCX and R11 of its own to get back.
+.full:
+    mov byte [full_return], 0
+    mov rcx, [full_rcx]
+    mov r11, [full_r11]
     iretq
 
 ; Every CPU exception but the page fault lands here: one stub per vector, all
@@ -305,6 +322,23 @@ trap_common:
     hlt
     jmp .stop
 
+; Interrupts, which only ever arrive while a program runs: the kernel keeps
+; them off. The timer's (sched/timer) and any other, as trap_signal's
+; vectors past the CPU's own.
+tick_entry:
+    push 0
+    push rdi
+    push rsi
+    mov edi, 0x101
+    jmp trap_common
+
+stray_entry:
+    push 0
+    push rdi
+    push rsi
+    mov edi, 0x100
+    jmp trap_common
+
 ; A page fault is normally a program touching a page of its window for the
 ; first time: page_fault(address) maps one in and returns, and the access is
 ; retried. One it cannot answer is the program's SIGSEGV. It can strike in
@@ -327,6 +361,10 @@ SECTION .data
 user_flags: dq 0x202
 
 SECTION .bss
+full_rcx:   resq 1
+full_r11:   resq 1
+full_return: resb 1
+alignb 8
 user_rsp:   resq 1
 user_frame: resq 1
 user_cs:    resq 1                      ; ring 3's selectors, set by gdt_init

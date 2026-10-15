@@ -1,4 +1,5 @@
 #include "mem.h"
+#include "thread.h"
 
 #include "ata.h"
 #include "driver.h"
@@ -202,8 +203,8 @@ static uint64_t take(size_t count) {
     if (!ours) {
         uint64_t at = 0;
 
-        return EFI_ERROR(firmware()->allocate_pages(EFI_ALLOCATE_ANY, EFI_LOADER_DATA,
-                                                    count, &at)) ? 0 : at;
+        return EFI_ERROR(EFI_CALL(firmware()->allocate_pages, EFI_ALLOCATE_ANY, EFI_LOADER_DATA,
+                                     count, &at)) ? 0 : at;
     }
     if (count == 1 && loose == 0) {
         for (unsigned i = run_count; i-- > 0;) {
@@ -273,8 +274,8 @@ static uint64_t take_below(size_t count, uint64_t limit) {
     if (!ours) {
         uint64_t at = limit - 1;
 
-        return EFI_ERROR(firmware()->allocate_pages(EFI_ALLOCATE_MAX, EFI_LOADER_DATA,
-                                                    count, &at)) ? 0 : at;
+        return EFI_ERROR(EFI_CALL(firmware()->allocate_pages, EFI_ALLOCATE_MAX, EFI_LOADER_DATA,
+                                     count, &at)) ? 0 : at;
     }
     for (unsigned i = run_count; i-- > 0;) {
         uint64_t end = runs[i].at + runs[i].count * PAGE;
@@ -298,8 +299,8 @@ bool mem_take_page(uint64_t page) {
     uint64_t at = page;
 
     if (!ours) {
-        return !EFI_ERROR(firmware()->allocate_pages(EFI_ALLOCATE_ADDRESS,
-                                                     EFI_LOADER_DATA, 1, &at));
+        return !EFI_ERROR(EFI_CALL(firmware()->allocate_pages, EFI_ALLOCATE_ADDRESS,
+                                      EFI_LOADER_DATA, 1, &at));
     }
     return run_take(page);
 }
@@ -319,7 +320,7 @@ void mem_give_page(uint64_t page) {
 
 void mem_pages_free(uint64_t at, size_t count) {
     if (!ours) {
-        firmware()->free_pages(at, count);
+        EFI_CALL(firmware()->free_pages, at, count);
         return;
     }
     if (count == 1 && at >= LOOSE_FLOOR) {
@@ -333,23 +334,113 @@ void mem_pages_free(uint64_t at, size_t count) {
    what the caller gets, so that freeing needs nothing but the pointer. */
 #define HEADER 16
 
+/* Up to a kilobyte, allocations share pages instead: a page of one size -
+   32 bytes to 1024, doubling - holds a struct slab at its front and as many
+   of them after it as fit, each at a multiple of its size. None is ever at
+   HEADER into its page, which is how mem_free tells the two kinds apart.
+   A page goes back as soon as nothing in it is used. */
+#define SMALL_CLASSES 6
+#define SMALL_MAX     (32u << (SMALL_CLASSES - 1))
+
+struct slab {
+    struct slab *next;              /* pages of its size with room, as a list */
+    void        *free;              /* its free ones, through their first word */
+    uint32_t     size, used;
+};
+
+static struct slab *with_room[SMALL_CLASSES];
+static size_t heap_pages;           /* all mem_alloc holds, for `mem` */
+
+static void *small_alloc(size_t bytes) {
+    unsigned c = 0;
+
+    while ((32u << c) < bytes) {
+        c++;
+    }
+    struct slab *s = with_room[c];
+
+    if (s == NULL) {
+        uint64_t page = mem_pages(1);
+        uint32_t size = 32u << c;
+
+        if (page == 0) {
+            return NULL;
+        }
+        heap_pages++;
+        s = (struct slab *)page;
+        /* mem_pages may have had the disk cache free some first, onto
+           this very list: so on to the front of it, not in place of it. */
+        *s = (struct slab){ .next = with_room[c], .size = size };
+        for (uint32_t at = PAGE - size; at >= size && at >= sizeof *s; at -= size) {
+            *(void **)(page + at) = s->free;
+            s->free = (void *)(page + at);
+        }
+        with_room[c] = s;
+    }
+    void *memory = s->free;
+
+    s->free = *(void **)memory;
+    s->used++;
+    if (s->free == NULL) {
+        with_room[c] = s->next;     /* full: off the list */
+    }
+    return memory;
+}
+
+static void small_free(void *memory) {
+    struct slab *s = (struct slab *)((uint64_t)memory & ~(uint64_t)(PAGE - 1));
+    unsigned c = 0;
+
+    while ((32u << c) < s->size) {
+        c++;
+    }
+    if (s->free == NULL) {
+        s->next = with_room[c];     /* had no room: back on the list */
+        with_room[c] = s;
+    }
+    *(void **)memory = s->free;
+    s->free = memory;
+    if (--s->used == 0) {
+        struct slab **at = &with_room[c];
+
+        while (*at != NULL && *at != s) {
+            at = &(*at)->next;
+        }
+        if (*at == s) {
+            *at = s->next;
+        }
+        heap_pages--;
+        mem_pages_free((uint64_t)s, 1);
+    }
+}
+
 void *mem_alloc(size_t bytes) {
+    if (bytes <= SMALL_MAX) {
+        return small_alloc(bytes);
+    }
     size_t count = (bytes + HEADER + PAGE - 1) / PAGE;
     uint64_t at = mem_pages(count);
 
     if (at == 0) {
         return NULL;
     }
+    heap_pages += count;
     *(uint64_t *)at = count;
     return (void *)(at + HEADER);
 }
 
 void mem_free(void *memory) {
-    if (memory != NULL) {
-        uint64_t at = (uint64_t)memory - HEADER;
-
-        mem_pages_free(at, *(uint64_t *)at);
+    if (memory == NULL) {
+        return;
     }
+    if (((uint64_t)memory & (PAGE - 1)) != HEADER) {
+        small_free(memory);
+        return;
+    }
+    uint64_t at = (uint64_t)memory - HEADER;
+
+    heap_pages -= *(uint64_t *)at;
+    mem_pages_free(at, *(uint64_t *)at);
 }
 
 /* ---- the kernel's own page tables -----------------------------------------
@@ -630,6 +721,11 @@ void mem_get_stats(struct mem_stats *stats) {
     stats->data = span(__bss_start, __bss_end) - stats->stack;
     stats->page_tables = (uint32_t)(program_tables() + (own_pages + io_pages) * PAGE);
     stats->console = (uint32_t)vga_memory();
+    /* Less the console's cells, which are mem_alloc'd and counted above. */
+    size_t console_pages = (stats->console + HEADER + PAGE - 1) / PAGE;
+
+    stats->heap = (uint32_t)((heap_pages > console_pages ? heap_pages - console_pages : 0) * PAGE);
+    stats->stack += (uint32_t)thread_stacks();
     stats->disk_cache = disk_cache != NULL ? (uint32_t)disk_cache->memory() : 0;
     stats->modules = module_memory();
     stats->network = net != NULL ? net->memory() : 0;
@@ -641,14 +737,14 @@ void mem_get_stats(struct mem_stats *stats) {
        agree with a program that measured memory while running. The window is
        reported on its own, by whatever wants to show it. */
     stats->kernel_kib = (stats->image + stats->data + stats->stack + stats->page_tables +
-                       stats->console + stats->network + stats->modules +
+                       stats->console + stats->network + stats->modules + stats->heap +
                        1023) / 1024;
 
     /* The stack started out zeroed, so its deepest non-zero byte marks how
        far it has ever grown. */
-    uint32_t untouched = 0;
-    while (untouched < stats->stack && stack_bottom[untouched] == 0) {
+    uint32_t untouched = 0, own = span(stack_bottom, stack_top);
+    while (untouched < own && stack_bottom[untouched] == 0) {
         untouched++;
     }
-    stats->stack_peak = stats->stack - untouched;
+    stats->stack_peak = own - untouched;
 }

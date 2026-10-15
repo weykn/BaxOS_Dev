@@ -21,6 +21,7 @@
 #include "syscall.h"
 #include "thread.h"
 #include "vga.h"
+#include "vm.h"
 
 #define SECTOR_SIZE 512
 #define arg (syscall_args())        /* the call's six, as syscall.c keeps them */
@@ -1210,7 +1211,9 @@ static uint64_t sys_prlimit64(uint64_t pid, uint64_t resource, uint64_t new_limi
     (void)new_limit;                /* asked to change: told it did. Firefox
                                        raises its stack's, and stops if it cannot */
     if (old != NULL) {
-        if (!user_range(arg[3], 16)) {
+        /* Read-only memory is EFAULT, as on Linux - which Chromium relies
+           on to check that what it protected stays protected. */
+        if (!user_range(arg[3], 16) || !vm_writable(arg[3], 16)) {
             return ERR(EFAULT);
         }
         /* How many files may be open matters: a libc moving a descriptor out
@@ -1764,6 +1767,16 @@ static uint64_t statx_core(uint64_t dirfd, uint64_t path, uint64_t flags) {
         out->dev_minor = 1;
         return 0;
     }
+    if (proc_net_name(name) != NULL) {
+        memset(out, 0, sizeof *out);
+        out->mask = STATX_BASIC;
+        out->blksize = SECTOR_SIZE;
+        out->nlink = 1;
+        out->mode = S_IFREG | 0444;
+        out->ino = PROC_INO + 2;
+        out->dev_minor = 1;
+        return 0;
+    }
     if (cmd != NULL || proc_folder(name) || which != 0 || dev_folder(name) || proc_fd_folder(name) ||
         proc_task_links(name) != 0) {
         memset(out, 0, sizeof *out);
@@ -1821,6 +1834,30 @@ static uint64_t statx_core(uint64_t dirfd, uint64_t path, uint64_t flags) {
 
 static uint64_t newfstatat_core(uint64_t dirfd, uint64_t path, uint64_t out);
 
+/* The descriptor /proc/self/fd/N, or /proc/<own pid>/fd/N, names: N, or -1
+   for any other name. */
+static uint64_t fd_named(const char *name) {
+    char self[32];
+    const char *p = NULL;
+    uint64_t fd = 0;
+    int pid, pgid, sid;
+
+    process_ids(&pid, &pgid, &sid);
+    ksprintf(self, "/proc/%u/fd/", (unsigned)pid);
+    if (memcmp(name, "/proc/self/fd/", 14) == 0) {
+        p = name + 14;
+    } else if (memcmp(name, self, strlen(self)) == 0) {
+        p = name + strlen(self);
+    }
+    if (p == NULL || *p == '\0') {
+        return (uint64_t)-1;
+    }
+    for (; *p >= '0' && *p <= '9'; p++) {
+        fd = fd * 10 + (uint64_t)(*p - '0');
+    }
+    return *p == '\0' && handle_of(fd) != NULL ? fd : (uint64_t)-1;
+}
+
 static uint64_t sys_newfstatat(uint64_t dirfd, uint64_t path, uint64_t out) {
     uint64_t result = newfstatat_core(dirfd, path, out);
     char joined[FS_NAME_LEN];
@@ -1849,7 +1886,13 @@ static uint64_t newfstatat_core(uint64_t dirfd, uint64_t path, uint64_t out) {
         return sys_fstat(dirfd, out, 0);
     }
     char target[FS_NAME_LEN + 16];
+    uint64_t fd = fd_named(name);
 
+    /* /proc/self/fd/N is the open file itself, whatever it is - a pipe, a
+       socket, memory - as Linux's stat of it is. */
+    if (fd != (uint64_t)-1 && (arg[3] & AT_SYMLINK_NOFOLLOW) == 0) {
+        return sys_fstat(fd, out, 0);
+    }
     if (proc_fd_target(name, target, sizeof target) != NULL) {
         name = target;
     }
@@ -2541,6 +2584,7 @@ static const uint16_t numbers[] = {
     SYS_FACCESSAT2,
     SYS_STATX,
     SYS_SCHED_GETAFFINITY,
+    SYS_SCHED_SETAFFINITY,
     SYS_NANOSLEEP,
     SYS_NEWFSTATAT,
     SYS_STAT,
@@ -2619,6 +2663,7 @@ static const syscall_fn handlers[] = {
     sys_faccessat,
     sys_statx,
     sys_sched_getaffinity,
+    sys_ok,                         /* sched_setaffinity: one processor anyway */
     sys_nanosleep,
     sys_newfstatat,
     sys_stat,

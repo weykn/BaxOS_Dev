@@ -16,6 +16,21 @@
 
 #define EFIAPI __attribute__((ms_abi))
 
+/* A call into the firmware on a stack big enough for it (efi_call.asm):
+   EFI_CALL(bs->stall, 10) for bs->stall(10). At most five arguments. */
+uint64_t efi_call(const void *fn, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e);
+#define EFI_U_(x) ((uint64_t)(x))
+#define EFI_N_(_1, _2, _3, _4, _5, n, ...) n
+#define EFI_C1_(f, a) efi_call((const void *)(f), EFI_U_(a), 0, 0, 0, 0)
+#define EFI_C2_(f, a, b) efi_call((const void *)(f), EFI_U_(a), EFI_U_(b), 0, 0, 0)
+#define EFI_C3_(f, a, b, c) efi_call((const void *)(f), EFI_U_(a), EFI_U_(b), EFI_U_(c), 0, 0)
+#define EFI_C4_(f, a, b, c, d) \
+    efi_call((const void *)(f), EFI_U_(a), EFI_U_(b), EFI_U_(c), EFI_U_(d), 0)
+#define EFI_C5_(f, a, b, c, d, e) \
+    efi_call((const void *)(f), EFI_U_(a), EFI_U_(b), EFI_U_(c), EFI_U_(d), EFI_U_(e))
+#define EFI_CALL(f, ...) \
+    EFI_N_(__VA_ARGS__, EFI_C5_, EFI_C4_, EFI_C3_, EFI_C2_, EFI_C1_)(f, __VA_ARGS__)
+
 typedef uint64_t efi_status;
 typedef uint64_t efi_uintn;
 typedef void    *efi_handle;

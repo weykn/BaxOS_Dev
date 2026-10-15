@@ -85,6 +85,8 @@ struct mem_stats {
                                so not in kernel_kib */
     uint32_t modules;       /* the loaded modules' own code and data */
     uint32_t network;       /* the network's buffers, the card's and sockets' */
+    uint32_t heap;          /* the rest the kernel has allocated: open files,
+                               pipes, processes, threads' tables */
     uint32_t window;        /* what the running program has, the tables
                                describing it counted in */
     uint32_t kernel_kib;    /* all of the above but the window and the disk cache, in KiB

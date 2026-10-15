@@ -66,6 +66,14 @@ int run_env(const char *path, const char *const *argv, const char *const *extra)
     envp[n] = NULL;
     pid = SC(57, 0, 0, 0);          /* fork */
     if (pid == 0) {
+        /* A maintainer script has nobody to ask, and nothing it leaves
+           running behind it may read the keyboard: its input is nothing. */
+        long null = extra != NULL ? SC(2, "/dev/null", 0, 0) : -1;
+
+        if (null >= 0) {
+            SC(33, null, 0, 0);     /* dup2 onto stdin */
+            SC(3, null, 0, 0);
+        }
         SC(59, path, argv, envp);
         SC(231, 127, 0, 0);         /* exit_group: execve failed */
     }

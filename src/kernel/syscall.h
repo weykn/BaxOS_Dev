@@ -103,6 +103,9 @@ enum {
     SYS_RT_SIGSUSPEND = 130,
     SYS_KILL       = 62,    /* the only process there is, is the caller */
     SYS_TGKILL     = 234,
+    SYS_CREAT      = 85,
+    SYS_RT_SIGQUEUEINFO   = 129,
+    SYS_RT_TGSIGQUEUEINFO = 297,
     SYS_GETTID     = 186,   /* the thread's; the process's for its first */
     SYS_RSEQ       = 334,
     SYS_UNAME      = 63,    /* (struct utsname *) */
@@ -123,6 +126,7 @@ enum {
     SYS_GETEGID    = 108,
     SYS_FUTEX      = 202,   /* a thread waiting on a word (thread.c) */
     SYS_SCHED_GETAFFINITY = 204,
+    SYS_SCHED_SETAFFINITY = 203,
     SYS_STATX      = 332,
     SYS_FACCESSAT  = 269,
     SYS_FACCESSAT2 = 439,
@@ -318,6 +322,10 @@ void fd_cloexec(uint64_t fd, bool on);
 uint64_t give_handle(struct handle h);
 bool     user_range(uint64_t addr, uint64_t size);
 uint64_t *syscall_args(void);
+/* The timer's interrupt (sched/timer): vector lands in the kernel's tick,
+   which calls ack first; NULL takes it away. False before the firmware is
+   left, or for a vector there is no gate for. */
+bool     tick_register(unsigned vector, void (*ack)(void));
 bool     interrupt_check(void);   /* true: a signal is to be handled - end the wait with EINTR */
 uint64_t wait_began(void);
 void     wait_ended(uint64_t began);
@@ -340,6 +348,14 @@ int program_start(const char *path, unsigned argc, const char *const *argv,
 /* Whether the running thread is a program's: what a kernel command called
    from one finds, rather than one the kernel's own shell ran. */
 bool program_running(void);
+
+/* Whether a signal that ends the running process is waiting for it -
+   Ctrl-C taken from the keyboard by another of its group, say, while it
+   waits for a key: the wait ends then too. */
+bool signal_waiting(void);
+
+/* The running process's pid, 0 for the kernel. */
+int program_pid(void);
 
 /* A process, for `mem top`: the index'th one running, false past the last.
    bytes is all it costs: its memory and tables, its record, and its
