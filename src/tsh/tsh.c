@@ -1,4 +1,4 @@
-#include "tef.h"
+#include "tcr.h"
 
 /* tsh, the Tuxlet shell, /usr/bin/tsh.
  *
@@ -138,7 +138,7 @@ static NOINLINE __attribute__((noreturn)) void child(char **argv) {
 }
 
 static NOINLINE void run(char **argv) {
-    int status = 0, pid = tef_vfork();
+    int status = 0, pid = vfork();
 
     if (pid == 0) {
         child(argv);
@@ -315,7 +315,7 @@ int main(int argc, char **argv, char **envp) {
     }
     act.handler = on_signal;
     act.flags = 0x04000000;         /* SA_RESTORER */
-    act.restorer = tef_restorer;
+    act.restorer = tcr_restorer;
     sys(13, 2, (long)&act, 0, 8);   /* rt_sigaction(SIGINT) */
 
     if (argv[0][0] == '-') {

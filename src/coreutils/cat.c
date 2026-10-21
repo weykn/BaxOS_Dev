@@ -1,4 +1,4 @@
-#include "tef.h"
+#include "tcr.h"
 
 /* cat [file...]: the files one after another, or what comes in. */
 

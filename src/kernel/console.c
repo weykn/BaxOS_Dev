@@ -113,8 +113,22 @@ void console_keys(bool on) {
     keys_off = !on;
 }
 
+/* The keyboards are read at most this often. Everything that waits asks
+   whether a key came - every waiting thread, every time round - and asking
+   is a trip to the hardware (the PS/2 controller's ports, a USB controller's
+   registers): with a browser's hundred threads waiting, that was where the
+   time went, and whatever had work to do queued behind it. */
+#define POLL_US 1000
+static uint64_t polled;
+
 static void gather(void) {
+    uint64_t now = efi_uptime_us();
     char c;
+
+    if (now - polled < POLL_US) {
+        return;
+    }
+    polled = now;
 
     while ((c = keyboard_poll_char(idle)) != 0) {
         last_key = efi_uptime_ms();
@@ -130,6 +144,7 @@ static void gather(void) {
         } else if (typed_n < TYPED) {
             typed[typed_n++] = c;
         }
+        thread_stir();
     }
 }
 
@@ -142,7 +157,7 @@ static char take_key(void) {
         if (thread_only()) {
             __asm__ volatile("pause");
         } else {
-            thread_yield();
+            thread_wait(efi_uptime_us() + POLL_US);
         }
         gather();
     }

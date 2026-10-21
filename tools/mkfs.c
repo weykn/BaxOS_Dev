@@ -69,6 +69,15 @@ void mem_free(void *memory) {
     free(memory);
 }
 
+uint64_t mem_pages(size_t count) {
+    return (uint64_t)(uintptr_t)malloc(count * 4096);
+}
+
+void mem_pages_free(uint64_t at, size_t count) {
+    (void)count;
+    free((void *)(uintptr_t)at);
+}
+
 void ata_sync(void) {
     /* The image is an ordinary file; the host writes it back when it pleases. */
 }

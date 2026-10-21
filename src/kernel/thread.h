@@ -34,6 +34,13 @@ int thread_create(const struct user_regs *regs, uint64_t rsp, uint64_t fs, uint6
    if there are any. */
 void thread_yield(void);
 
+/* Lets the others run, sleeping until thread_stir, until_us (0: none) or
+   a short while - for a wait loop, which looks again either way. */
+void thread_wait(uint64_t until_us);
+
+/* Something a wait may be for has happened: every thread_wait looks. */
+void thread_stir(void);
+
 /* The running thread's blocked signals, as rt_sigprocmask has them. */
 uint64_t *thread_sigmask(void);
 
@@ -52,13 +59,13 @@ int thread_id(void);
 /* A fresh id, for a process: pids and tids are one series, as on Linux. */
 int thread_new_id(void);
 
-/* How much kernel stack is left below here. */
-uint64_t thread_stack_left(const void *here);
+/* The most of a thread's kernel stack any has used, in bytes. */
+uint32_t thread_stack_peak(void);
 
 /* Threads alive in proc, and what each one's kernel stack costs. */
 unsigned thread_count(void *proc);
 size_t   thread_stacks(void);        /* every thread's but the kernel's own, in bytes */
-#define THREAD_STACK_BYTES (4 * 4096)
+#define THREAD_STACK_BYTES (2 * 4096)
 
 /* A process, as the threads know it: syscall.c's, and opaque here. The
    running thread's, NULL for the kernel's own. */
@@ -86,6 +93,8 @@ __attribute__((noreturn)) void process_exit(int code);
    says whether a wake has reached it since. thread_wake wakes up to n
    waiting at addr, moving up to move more of them on to addr2, and returns
    how many it woke. */
-void thread_sleep_on(uint64_t addr);
+void thread_sleep_on(uint64_t addr, uint64_t until_us);
+/* A signal for proc: its threads asleep at a futex get to look. */
+void thread_kick(void *proc);
 bool thread_woken(void);
 int  thread_wake(uint64_t addr, int n, uint64_t addr2, int move);

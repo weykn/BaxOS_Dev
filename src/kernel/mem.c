@@ -700,6 +700,13 @@ uint64_t mem_free_kib(void) {
     return efi_free_kib();
 }
 
+uint64_t mem_used_kib(void) {
+    uint64_t gone = efi_boot()->firmware_kib - reclaimed_kib + mem_free_kib() +
+                    (disk_cache != NULL ? disk_cache->memory() / 1024 : 0);
+
+    return efi_boot()->ram_kib > gone ? efi_boot()->ram_kib - gone : 0;
+}
+
 /* ---- what is where ----------------------------------------------------- */
 
 /* Defined by kernel.ld and start.asm; only their addresses mean anything. */
@@ -747,4 +754,5 @@ void mem_get_stats(struct mem_stats *stats) {
         untouched++;
     }
     stats->stack_peak = own - untouched;
+    stats->thread_peak = thread_stack_peak();
 }

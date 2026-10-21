@@ -37,10 +37,10 @@
    A chunk's own first page holds where the chunk before it was, so that the
    whole lot can be handed back at the end without a list of them anywhere
    else. */
-#define CHUNK_FIRST 6               /* what the first one costs a small program:
+#define CHUNK_FIRST 5               /* what the first one costs a small program:
                                        tsh's one page of code and data, its
-                                       stack, the two tables under them, the
-                                       chunk's own page - and one spare */
+                                       stack, the two tables under them and
+                                       the chunk's own page */
 #define CHUNK_MAX   64              /* and a quarter of a megabyte once it is
                                        clearly big: past that the tail of the
                                        last chunk wastes more than the extra
@@ -113,17 +113,27 @@ static void flush_tlb(void) {
 }
 
 /* The firmware write-protects its own tables, CR0.WP, which binds even ring
-   0; editing one means turning that off for as long as the edit takes. */
+   0; editing one means turning that off for as long as the edit takes. Once
+   the kernel is on tables of its own (vm_move) there is no need: a process
+   switch edits them, and two CR0 writes a switch - each one serialising,
+   and a trip out of a virtual machine - were most of what a switch cost. */
+static bool tables_ours;
+
 static uint64_t write_protect_off(void) {
     uint64_t cr0;
 
+    if (tables_ours) {
+        return 0;
+    }
     __asm__ volatile("mov %%cr0, %0" : "=r"(cr0));
     __asm__ volatile("mov %0, %%cr0" : : "r"(cr0 & ~0x10000ull) : "memory");
     return cr0;
 }
 
 static void write_protect_back(uint64_t cr0) {
-    __asm__ volatile("mov %0, %%cr0" : : "r"(cr0) : "memory");
+    if (cr0 != 0) {
+        __asm__ volatile("mov %0, %%cr0" : : "r"(cr0) : "memory");
+    }
 }
 
 static uint64_t *pml4(void) {
@@ -165,7 +175,7 @@ static uint64_t *page_from(struct space *level) {
         uint64_t got = 0;
         struct chunk *head;
 
-        /* Each chunk is twice the one before it, up to a megabyte: a program
+        /* Each chunk is twice the one before it, up to CHUNK_MAX: a program
            that only ever wants a dozen pages is charged for a dozen, and one
            loading a C library gets there in a handful of calls. */
         level->grow = want < CHUNK_MAX ? want * 2 : CHUNK_MAX;
@@ -370,6 +380,8 @@ bool vm_low_used(void) {
 
 void vm_move(uint64_t *top, uint64_t *pd) {
     uint64_t *old = pml4();
+
+    tables_ours = true;
 
     if (slot != 0) {
         top[slot] = old[slot];

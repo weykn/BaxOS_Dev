@@ -7,6 +7,7 @@
 #include "linux.h"
 #include "mem.h"
 #include "string.h"
+#include "thread.h"
 
 #define EVENTS 128                  /* waiting at once; past that the oldest go */
 
@@ -46,6 +47,7 @@ void input_report(unsigned device, unsigned type, unsigned code, int value) {
     q->events[q->tail++ % EVENTS] = (struct event){
         .sec = us / 1000000, .usec = us % 1000000,
         .type = (uint16_t)type, .code = (uint16_t)code, .value = value };
+    thread_stir();
 }
 
 bool input_open(unsigned device) {

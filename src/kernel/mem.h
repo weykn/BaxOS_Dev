@@ -67,6 +67,11 @@ void mem_give_page(uint64_t page);
 /* RAM free right now, in KiB. */
 uint64_t mem_free_kib(void);
 
+/* RAM in use right now, in KiB: everything but what is free, what the
+   firmware keeps for good and what the disk cache has lent - the whole
+   system, as `mem peak` watches it. */
+uint64_t mem_used_kib(void);
+
 
 /* Sizes in bytes unless named otherwise. */
 struct mem_stats {
@@ -79,6 +84,7 @@ struct mem_stats {
     uint32_t data;          /* zero-filled kernel data (.bss), minus the stack */
     uint32_t stack;         /* the kernel stack */
     uint32_t stack_peak;    /* the most of the stack ever in use */
+    uint32_t thread_peak;   /* and of a thread's, the most any has used */
     uint32_t page_tables;   /* the fixed window's, hung off the firmware's */
     uint32_t console;       /* the console's cells, taken from the firmware */
     uint32_t disk_cache;    /* what the disk cache holds: free memory lent out,

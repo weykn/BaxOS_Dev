@@ -669,23 +669,56 @@ static bool parent_exists(char *name) {
    the table for the length of the call, read a chunk at a time, so nothing
    about it has to be remembered in between. The header is the caller's to
    save. */
+/* Room left past a file that grew, this boot. A file is one run of sectors,
+   so one that grows with another after it moves whole to the end: a
+   browser's databases, a page added at a time, were copied megabytes a
+   write - with nothing else running meanwhile - and the copies filled the
+   disk. So one that moves takes half as much again (up to ROOM_MAX), and
+   grows into that in place. Nothing on the disk says so; after a restart
+   the room is only a gap, and finding gaps forgets it all. */
+#define ROOMS    32
+#define ROOM_MAX 32768              /* sectors: 16 MiB */
+
+static struct room {
+    uint32_t index, start, end;
+} rooms[ROOMS];
+static unsigned rooms_next;
+
 static unsigned allocate(unsigned count, const struct slot *replacing) {
+    unsigned extra = 0;
+
     if (replacing != NULL) {
         unsigned have = sectors_for(replacing->size & ~FS_LINK);
 
         if (count <= have) {
             return replacing->start;
         }
+        for (unsigned i = 0; i < ROOMS; i++) {
+            if (rooms[i].index == replacing->index && rooms[i].start == replacing->start &&
+                rooms[i].end != 0 && replacing->start + count <= rooms[i].end) {
+                return replacing->start;
+            }
+        }
         if (replacing->start + have == head.data_end &&
             replacing->start + count <= head.disk_sectors) {
             head.data_end = replacing->start + count;
             return replacing->start;
         }
+        extra = count / 2 < ROOM_MAX ? count / 2 : ROOM_MAX;
     }
-    if (head.data_end + count <= head.disk_sectors) {
-        head.data_end += count;
-        return head.data_end - count;
+    if (head.data_end + count + extra > head.disk_sectors) {
+        extra = 0;
     }
+    if (head.data_end + count + extra <= head.disk_sectors) {
+        unsigned at = head.data_end;
+
+        head.data_end += count + extra;
+        if (extra > 0) {
+            rooms[rooms_next++ % ROOMS] = (struct room){ replacing->index, at, at + count + extra };
+        }
+        return at;
+    }
+    memset(rooms, 0, sizeof rooms);  /* a gap may be one of them */
     return allocate_gap(count, replacing);
 }
 
@@ -840,13 +873,15 @@ static int drop_entry(size_t index, const char *name) {
 }
 
 void fs_cache(bool slow) {
-    char (*page)[SECTOR_SIZE] = slow ? mem_alloc(RECENT_MAX * SECTOR_SIZE) : NULL;
+    /* Eight sectors are one page exactly: from mem_pages, since mem_alloc's
+       header would make them two. */
+    char (*page)[SECTOR_SIZE] = slow ? (void *)mem_pages(1) : NULL;
 
     if (slow && page == NULL) {
         return;
     }
     if (recent != small) {
-        mem_free(recent);
+        mem_pages_free((uint64_t)recent, 1);
     }
     recent = slow ? page : small;
     slots = slow ? RECENT_MAX : RECENT;

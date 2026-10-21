@@ -182,6 +182,9 @@ struct mapping {
     uint32_t start, size;   /* the file: its first sector, and its length */
 };
 
+/* Its arguments as /proc/<pid>/cmdline gives them, kept as it starts. */
+#define CMDLINE_MAX 1024
+
 struct process {
     int      pid, ppid, pgid, sid;  /* ppid 0: nobody waits for it */
     bool     zombie;                /* ended, its status not yet collected */
@@ -204,12 +207,17 @@ struct process {
                                        position this syscall loaded, to write back */
     struct mapping *maps;           /* the file mappings owed, mem_alloc'd: a */
     unsigned maps_room;             /* program with Mesa in it has hundreds */
+    int      peak_of;               /* the pid whose mem peak counts it, 0 if none */
     char     name[TRACE_NAME];      /* the program it runs, as debug/trace names it */
     char     exe[FS_NAME_LEN];      /* and its whole path, links followed: /proc/self/exe */
     struct creds cred;              /* who it runs as: inherited, kept across execve */
-    char    *cmdline;               /* its arguments, each ending in a NUL, as
-                                       /proc/<pid>/cmdline gives them: mem_alloc'd */
     uint32_t cmdline_len;
+    char     cmdline[CMDLINE_MAX];  /* its arguments, each ending in a NUL, as
+                                       /proc/<pid>/cmdline gives them: here
+                                       rather than mem_alloc'd, since the
+                                       record's page has the room spare */
+    struct handle first_files[32];  /* the table it starts with, FIRST_FILES:
+                                       in the page too, for the same reason */
 };
 
 _Static_assert(sizeof(struct process) <= 4096 - 16, "a process is one page");
@@ -224,6 +232,16 @@ struct process;
 static void signal_to(struct process *p, uint64_t sig);
 
 #define FIRST_FILES   32            /* to start: most programs never have more */
+
+_Static_assert(sizeof ((struct process *)0)->first_files == FIRST_FILES * sizeof(struct handle),
+               "first_files holds FIRST_FILES");
+
+/* A descriptor table it is done with: the first one is part of the record. */
+static void files_free(struct process *p, struct handle *table) {
+    if (table != p->first_files) {
+        mem_free(table);
+    }
+}
 #define handles       (proc->files)
 #define file_room     (proc->files_room)
 #define TOUCHED(fd)   (proc->ofd_touched[(fd) / 64] & 1ull << ((fd) % 64))
@@ -262,9 +280,6 @@ void process_switch(void *from, void *to) {
 
 /* The program the running process now runs, for its calls' log: the last
    part of its path, /usr/bin/ls logging as ls. */
-/* Its arguments as /proc/<pid>/cmdline gives them, kept as it starts. */
-#define CMDLINE_MAX 1024
-
 static void process_cmdline(unsigned argc, const char *const *argv) {
     uint32_t n = 0;
 
@@ -272,10 +287,8 @@ static void process_cmdline(unsigned argc, const char *const *argv) {
         n += (uint32_t)strlen(argv[i]) + 1;
     }
     n = n < CMDLINE_MAX ? n : CMDLINE_MAX;
-    mem_free(proc->cmdline);
     proc->cmdline_len = 0;
-    if (n == 0 || (proc->cmdline = mem_alloc(n)) == NULL) {
-        proc->cmdline = NULL;
+    if (n == 0) {
         return;
     }
     for (unsigned i = 0; i < argc && proc->cmdline_len < n; i++) {
@@ -323,9 +336,8 @@ static void proc_free(struct process *p) {
         }
     }
     mem_free(p->maps);
-    mem_free(p->files);
-    mem_free(p->files_old);
-    mem_free(p->cmdline);
+    files_free(p, p->files);
+    files_free(p, p->files_old);
     mem_free(p);
     ofd_trim();
     pipe_trim();
@@ -348,17 +360,23 @@ static struct process *proc_new(void) {
 
     if (p != NULL) {
         memset(p, 0, sizeof *p);
-        if ((p->files = mem_alloc(FIRST_FILES * sizeof *p->files)) == NULL) {
-            procs[slot] = NULL;
-            mem_free(p);
-            return NULL;
-        }
-        memset(p->files, 0, FIRST_FILES * sizeof *p->files);
+        p->files = p->first_files;
         p->files_room = FIRST_FILES;
         p->pid = thread_new_id();
         procs[slot] = p;
     }
     return p;
+}
+
+/* All a process costs: its memory and tables, its record, and its
+   threads' kernel stacks. */
+static uint64_t proc_bytes(struct process *p) {
+    uint64_t bytes = 4096 + (uint64_t)thread_count(p) * THREAD_STACK_BYTES;
+
+    if (!p->borrowed && p->space != NULL) {
+        bytes += p->space->bought + p->space->low_owned * VM_PAGE + VM_PAGE;
+    }
+    return bytes;
 }
 
 bool process_info(unsigned index, struct process_info *out) {
@@ -370,15 +388,88 @@ bool process_info(unsigned index, struct process_info *out) {
         }
         out->pid = p->pid;
         out->ppid = p->ppid;
-        out->bytes = 4096 + (uint64_t)thread_count(p) * THREAD_STACK_BYTES;
-        if (!p->borrowed && p->space != NULL) {
-            out->bytes += p->space->bought + p->space->low_owned * VM_PAGE + VM_PAGE;
-        }
+        out->bytes = proc_bytes(p);
         memcpy(out->name, p->name, sizeof out->name);
         out->name[sizeof out->name - 1] = '\0';
         return true;
     }
     return false;
+}
+
+/* mem peak's watches: each the process that runs the program, and the most
+   it and its children - every process whose peak_of is its pid - and the
+   system have had in use. Looked at on every syscall while there are any:
+   memory is only given back by one, so the look before it sees the most. */
+#define PEAKS 4
+
+static struct peak {
+    int      pid;                   /* 0: a free slot */
+    uint64_t own, system_kib;
+} peaks[PEAKS];
+static unsigned peak_count;
+static bool     peak_exec;          /* mem peak just ran: execve runs its program */
+
+static void peak_sample(void) {
+    uint64_t system = mem_used_kib();
+
+    for (unsigned w = 0; w < PEAKS; w++) {
+        struct peak *k = &peaks[w];
+        uint64_t own = 0;
+
+        if (k->pid == 0) {
+            continue;
+        }
+        for (unsigned i = 0; i < PROCESSES; i++) {
+            if (procs[i] != NULL && !procs[i]->zombie && procs[i]->peak_of == k->pid) {
+                own += proc_bytes(procs[i]);
+            }
+        }
+        k->own = own > k->own ? own : k->own;
+        k->system_kib = system > k->system_kib ? system : k->system_kib;
+    }
+}
+
+bool program_peak(void) {
+    for (unsigned w = 0; proc != NULL && w < PEAKS; w++) {
+        if (peaks[w].pid == 0) {
+            peaks[w] = (struct peak){ .pid = proc->pid };
+            proc->peak_of = proc->pid;
+            peak_count++;
+            peak_exec = true;
+            return true;
+        }
+    }
+    return false;
+}
+
+static uint64_t write_to(struct handle *h, uint64_t text, uint64_t length);
+
+/* The watch on p, if it has one, ended - and what it saw printed, if told. */
+static void peak_end(struct process *p, bool print) {
+    for (unsigned w = 0; w < PEAKS; w++) {
+        if (peaks[w].pid != 0 && peaks[w].pid == p->pid) {
+            char line[64];
+
+            peak_sample();
+            ksprintf(line, "peak: program %u KiB, system %u KiB\n",
+                     (unsigned)((peaks[w].own + 1023) / 1024), (unsigned)peaks[w].system_kib);
+            /* To its stderr - or, if it has closed that, as GNU's tools do
+               on the way out, to its shell's terminal. */
+            struct handle *h = handle_of(2);
+            struct process *parent = proc_find(p->ppid);
+
+            if (h == NULL && parent != NULL && parent->files_room > 2 &&
+                parent->files[2].used != 0 &&
+                (parent->files[2].start == CONSOLE_MARK || parent->files[2].start == MOD_MARK)) {
+                h = &parent->files[2];
+            }
+            if (print) {
+                write_to(h, (uint64_t)line, strlen(line));
+            }
+            peaks[w].pid = 0;
+            peak_count--;
+        }
+    }
 }
 
 /* /proc/<pid>/..., or /proc/self/...: the process, and what follows - NULL
@@ -487,10 +578,10 @@ size_t process_file(const char *path, char *out, size_t max) {
     }
     if (strcmp(rest, "cmdline") == 0) {
         len = p->cmdline_len < max ? p->cmdline_len : max;
-        if (p->cmdline != NULL) {
+        if (p->cmdline_len != 0) {
             memcpy(out, p->cmdline, len);
         }
-        return p->cmdline != NULL ? len : 0;
+        return len;
     }
     if (strcmp(rest, "comm") == 0) {
         ksprintf(text, "%s\n", p->name);
@@ -713,21 +804,44 @@ static struct mobj *mobj_new(void) {
 }
 
 /* A file's pages written through a mapping go back to it once nothing has
-   it open any more. */
+   it open any more: those side by side in the file gathered, up to
+   BACK_PAGES, into one write - a page a write, a shader cache of a megabyte
+   or so held everything up a third of a second. */
+#define BACK_PAGES 16
+
 static void mobj_write_back(struct mobj *m) {
     struct fs_file file;
     char path[FS_NAME_LEN + 1] = "/";
+    uint64_t run, size;
+    uint32_t first = 0, n = 0;
 
     if (!m->written || m->entry == 0 || fs_file(m->entry - 1, &file) != 0) {
         return;
     }
     strcpy(path + 1, file.name);
-    for (uint32_t i = 0; i < m->room && (uint64_t)i * PAGE_SIZE < file.size; i++) {
-        uint64_t n = file.size - (uint64_t)i * PAGE_SIZE;
+    size = file.size;
+    run = mem_pages(BACK_PAGES);
+    for (uint32_t i = 0; i <= m->room; i++) {
+        bool in = i < m->room && (uint64_t)i * PAGE_SIZE < size && m->frame[i] != 0;
 
-        if (m->frame[i] != 0) {
-            fs_write_at(path, i * PAGE_SIZE, (const void *)m->frame[i], n < PAGE_SIZE ? n : PAGE_SIZE);
+        if (n > 0 && (!in || i != first + n || n == BACK_PAGES || run == 0)) {
+            uint64_t from = (uint64_t)first * PAGE_SIZE, bytes = size - from;
+
+            bytes = bytes < (uint64_t)n * PAGE_SIZE ? bytes : (uint64_t)n * PAGE_SIZE;
+            fs_write_at(path, (uint32_t)from, run != 0 ? (const void *)run : (const void *)m->frame[first],
+                        bytes);
+            n = 0;
         }
+        if (in) {
+            first = n == 0 ? i : first;
+            if (run != 0) {
+                memcpy((char *)run + (uint64_t)n * PAGE_SIZE, (const void *)m->frame[i], PAGE_SIZE);
+            }
+            n++;
+        }
+    }
+    if (run != 0) {
+        mem_pages_free(run, BACK_PAGES);
     }
 }
 
@@ -957,7 +1071,7 @@ static void ofd_sync(void) {
         return;
     }
     if (proc->files_old != NULL) {
-        mem_free(proc->files_old);  /* nobody is holding on to it now */
+        files_free(proc, proc->files_old);  /* nobody is holding on to it now */
         proc->files_old = NULL;
     }
     for (unsigned word = 0; word < PROGRAM_FILES / 64; word++) {
@@ -1361,7 +1475,7 @@ static uint64_t pipe_write(const struct handle *h, struct pipe *p, const char *f
         if (interrupt_check()) {
             return done > 0 ? done : ERR(EINTR);
         }
-        thread_yield();
+        thread_wait(0);
     }
     return done;
 }
@@ -1409,7 +1523,7 @@ static uint64_t event_read(struct handle *h, struct pipe *p, uint64_t buf, uint6
         if (interrupt_check()) {
             return ERR(EINTR);
         }
-        thread_yield();
+        thread_wait(0);
     }
     uint64_t took = (h->offset & EFD_SEMAPHORE) != 0 ? 1 : p->count;
 
@@ -1467,9 +1581,10 @@ static uint64_t write_to(struct handle *h, uint64_t text, uint64_t length) {
            program has only been writing and anywhere in it once the program
            has moved about - what a program keeping a scratch file of its own
            does, ed's buffer among them. */
-        if (fs_write_at(write_name(h), h->offset,
-                        (const void *)text, length) < 0) {
-            return ERR(EIO);
+        int err = fs_write_at(write_name(h), h->offset, (const void *)text, length);
+
+        if (err < 0) {
+            return fs_errno(err);
         }
         file_mem_put(h, h->offset, (const char *)text, length);
         h->offset += (uint32_t)length;
@@ -1639,6 +1754,7 @@ static void signal_to(struct process *p, uint64_t sig) {
         return;
     }
     p->signals |= 1ull << sig;
+    thread_kick(p);
 }
 
 /* Sends sig to every process in group pgid; false if there was none. */
@@ -1947,7 +2063,7 @@ static uint64_t sys_rt_sigsuspend(uint64_t mask, uint64_t size, uint64_t c) {
         if (thread_only()) {
             __asm__ volatile("pause");
         } else {
-            thread_yield();
+            thread_wait(0);
         }
     }
     return signal_deliver(ERR(EINTR), old);
@@ -2132,7 +2248,7 @@ static uint64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count) {
             if (interrupt_check()) {
                 return ERR(EINTR);
             }
-            thread_yield();
+            thread_wait(0);
         }
         if (p != NULL && h->size == PIPE_PAIR) {
             if (p->packets || p->nmsgs > 0) {
@@ -2169,7 +2285,7 @@ static uint64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count) {
                     wait_ended(began);
                     return ERR(EINTR);
                 }
-                thread_yield();
+                thread_wait(0);
             }
             wait_ended(began);
             return n;
@@ -2211,7 +2327,7 @@ static bool files_grow(uint32_t need) {
     }
     memset(bigger, 0, room * sizeof *bigger);
     memcpy(bigger, handles, file_room * sizeof *bigger);
-    mem_free(proc->files_old);
+    files_free(proc, proc->files_old);
     proc->files_old = handles;
     handles = bigger;
     file_room = room;
@@ -2524,8 +2640,10 @@ static uint64_t open_name(const char *name, uint64_t flags) {
         if (length + 1 > FS_NAME_LEN) {
             return ERR(EINVAL);
         }
-        if (empty && fs_write(name, NULL, 0) < 0) {
-            return ERR(EACCES);
+        int made = empty ? fs_write(name, NULL, 0) : 0;
+
+        if (made < 0) {
+            return fs_errno(made);  /* ENOENT for a folder not there, as Linux */
         }
         if (fs_stat(name, &file) != 0) {
             return ERR(EACCES);
@@ -3770,14 +3888,14 @@ static uint64_t futex_wait(uint64_t address, uint64_t op, uint32_t value, uint64
     if (until == 0 && thread_alone()) {
         return ERR(EAGAIN);
     }
-    thread_sleep_on(address);
+    thread_sleep_on(address, until * 1000);
     while (!thread_woken()) {
         if (until != 0 && efi_uptime_ms() >= until) {
-            thread_sleep_on(0);
+            thread_sleep_on(0, 0);
             return ERR(ETIMEDOUT);
         }
         if (interrupt_check()) {
-            thread_sleep_on(0);
+            thread_sleep_on(0, 0);
             return ERR(EINTR);
         }
         thread_yield();
@@ -4576,10 +4694,35 @@ void linux_register(syscall_fn (*find)(uint64_t number)) {
 
 /* Called by syscall_entry. Every call is recorded on the way through,
    including the numbers this kernel has no handler for. */
+/* Whether call number on fd may end another's wait - something put in a
+   pipe or a socket, or taken out of the way, an end closed, a connection
+   made - so that every thread_wait looks again. A file on the disk ends
+   nobody's. */
+static bool stirs(uint64_t number, uint64_t fd) {
+    switch (number) {
+    case SYS_EXECVE: case SYS_CONNECT: case SYS_ACCEPT: case SYS_ACCEPT4:
+    case SYS_DUP2: case SYS_DUP3:
+        return true;
+    case SYS_READ: case SYS_WRITE: case SYS_READV: case SYS_WRITEV: case SYS_CLOSE:
+    case SYS_SENDTO: case SYS_RECVFROM: case SYS_SENDMSG: case SYS_RECVMSG:
+    case SYS_SENDMMSG: case SYS_SHUTDOWN: {
+        struct handle *h = handle_of(fd);
+
+        return h != NULL && (h->start == PIPE_MARK || h->start == MOD_MARK ||
+                             h->start == SOCK_MARK);
+    }
+    }
+    return false;
+}
+
 uint64_t syscall_dispatch(uint64_t a, uint64_t b, uint64_t c,
                           uint64_t d, uint64_t e, uint64_t f, uint64_t number) {
     void *entry = tracer != NULL ? tracer->begin((uint32_t)number, a, b, c) : NULL;
     uint64_t result = ERR(ENOSYS);
+
+    if (peak_count > 0) {
+        peak_sample();
+    }
 
     if (proc != NULL && now_running.left != 0) {
         now_running.user += efi_uptime_us() - now_running.left;
@@ -4619,10 +4762,14 @@ uint64_t syscall_dispatch(uint64_t a, uint64_t b, uint64_t c,
         struct kernel_mark mark = kernel_began();
 
         struct user_regs *frame = user_frame;
+        bool stir = stirs(number, a);
 
         result = handler(a, b, c);
         kernel_ended(mark);
         user_frame = frame;         /* a fork's child left its own there */
+        if (stir && (int64_t)result >= 0) {
+            thread_stir();
+        }
     }
 
     /* A program that never waits is asked every so often whether Ctrl-C
@@ -5105,25 +5252,34 @@ static int load_elf_at(const struct fs_file *file, const struct elf_header *head
     return 0;
 }
 
-/* TEF64, Tuxlet's own executable format (src/tef/tef.ld): the bytes a
-   program runs as, behind a header saying where it starts and how much
-   memory it needs. It goes where a position-independent ELF would and is
-   never relocated - there is nothing in it to relocate. */
+/* TEF64, Tuxlet's own executable format (src/tcr/tef64.ld): the bytes a
+   program runs as, behind a header saying how much memory it needs; it
+   starts right after the header. It goes where a position-independent ELF
+   would and is never relocated - there is nothing in it to relocate. */
 struct tef_header {
     char     magic[8];      /* "TEF64" */
-    uint32_t entry;         /* from the front of the file */
     uint32_t size;          /* the file, then zeroes */
 };
 
 static int load_tef(const struct fs_file *file, const struct tef_header *tef,
                     uint64_t *entry) {
     uint64_t at = vm_base() + USER_EXEC;
+    int err;
 
-    if (tef->entry >= file->size || tef->size < file->size || !fits(at, tef->size)) {
+    if (file->size <= sizeof *tef || tef->size < file->size || !fits(at, tef->size)) {
         return PROGRAM_EINVAL;
     }
-    *entry = started_entry = at + tef->entry;
-    return load_segment(file, 0, at, file->size, tef->size);
+    /* Read now rather than promised as an ELF's segments are: the files are
+       a few kilobytes, and a promise would cost the process a page of its
+       own to keep it in. */
+    if (!claim(at, tef->size)) {
+        return FS_ENOSPC;
+    }
+    if ((err = read_at(file, 0, (void *)at, file->size)) < 0) {
+        return err;
+    }
+    *entry = started_entry = at + sizeof *tef;
+    return 0;
 }
 
 /* What program_load needs to hold while it works: three hundred bytes of
@@ -5606,7 +5762,7 @@ static uint64_t pair_put(struct handle *h, struct pipe *p, const struct iovec *i
             if (interrupt_check()) {
                 return ERR(EINTR);
             }
-            thread_yield();
+            thread_wait(0);
             if (pair_out(h) != p) {
                 return ERR(EPIPE);
             }
@@ -5656,7 +5812,7 @@ static uint64_t pair_take(struct handle *h, struct pipe *p, const struct iovec *
         if (interrupt_check()) {
             return ERR(EINTR);
         }
-        thread_yield();
+        thread_wait(0);
     }
     if (cut != NULL) {
         *cut = false;
@@ -5816,6 +5972,7 @@ static int wait_status(int code) {
 static void process_end(int code) {
     struct process *p = proc, *parent;
 
+    peak_end(p, true);              /* while it still has its memory and stderr */
     for (unsigned fd = 0; fd < file_room; fd++) {
         if (handles[fd].used != 0) {
             sys_close(fd, 0, 0);
@@ -5829,6 +5986,7 @@ static void process_end(int code) {
     }
     if (p->borrowed) {
         p->borrowed = false;        /* the parent's again, and it carries on */
+        thread_stir();
     } else if (p->space != NULL) {
         vm_space_free(p->space);
     }
@@ -5841,6 +5999,7 @@ static void process_end(int code) {
     }
     p->status = wait_status(code);
     p->zombie = true;
+    thread_stir();                  /* its parent's wait4, and its pipes' readers */
     if (console_changer == p->pid) {
         console_reset();            /* raw, say, and it crashed */
     }
@@ -5917,7 +6076,7 @@ static uint64_t sys_wait4(uint64_t pid, uint64_t status, uint64_t options) {
             wait_ended(began);
             return ERR(EINTR);
         }
-        thread_yield();
+        thread_wait(0);
     }
 }
 
@@ -5970,6 +6129,7 @@ static uint64_t fork_on(uint64_t stack, bool share) {
         regs.rsp = stack;
     }
     child->ppid = parent->pid;
+    child->peak_of = parent->peak_of;
     child->pgid = parent->pgid;
     child->sid = parent->sid;
     if (child->files_room < parent->files_room) {
@@ -5978,7 +6138,7 @@ static uint64_t fork_on(uint64_t stack, bool share) {
         if (bigger == NULL) {
             return FS_ENOSPC;
         }
-        mem_free(child->files);
+        files_free(child, child->files);
         child->files = bigger;
         child->files_room = parent->files_room;
     }
@@ -5988,10 +6148,8 @@ static uint64_t fork_on(uint64_t stack, bool share) {
     child->map = parent->map;
     child->map_high = parent->map_high;
     child->times = (struct times){ .started = efi_uptime_us(), .left = efi_uptime_us() };
-    if (parent->cmdline != NULL && (child->cmdline = mem_alloc(parent->cmdline_len)) != NULL) {
-        memcpy(child->cmdline, parent->cmdline, parent->cmdline_len);
-        child->cmdline_len = parent->cmdline_len;
-    }
+    memcpy(child->cmdline, parent->cmdline, parent->cmdline_len);
+    child->cmdline_len = parent->cmdline_len;
     memcpy(child->actions, parent->actions, sizeof child->actions);
     if (parent->maps != NULL) {
         /* Its own copy, even sharing memory: an execve empties the child's. */
@@ -6026,7 +6184,7 @@ static uint64_t fork_on(uint64_t stack, bool share) {
 
     /* The parent of a vfork waits: the child is running in its memory. */
     while (share && child->borrowed) {
-        thread_yield();
+        thread_wait(0);
     }
     return (uint64_t)pid;
 }
@@ -6110,7 +6268,7 @@ static uint64_t sys_rt_sigtimedwait(uint64_t set, uint64_t info, uint64_t timeou
     uint64_t until = timeout != 0 ? efi_uptime_ms() + timespec_ms(timeout) : 0;
 
     while ((until == 0 || efi_uptime_ms() < until) && !interrupt_check()) {
-        thread_yield();
+        thread_wait(until * 1000);
     }
     return ERR(deliverable() != 0 ? EINTR : EAGAIN);
 }
@@ -6440,7 +6598,7 @@ int program_start(const char *path, unsigned argc, const char *const *argv,
                   unsigned envc, const char *const *envv) {
     struct {
         char        line[FS_NAME_LEN * 2];
-        const char *words[EXEC_ARGS + 3];
+        const char *words[EXEC_ARGS + 1];   /* to 1 KiB, a slab's */
     } *w = mem_alloc(sizeof *w);
     const char *interp, *extra;
     struct fs_file file;
@@ -6506,6 +6664,36 @@ int program_start(const char *path, unsigned argc, const char *const *argv,
     return err;
 }
 
+/* name as a shell finds it: as it is, if it has a '/' in it, or else in
+   the first folder on PATH with a file of that name. False if none has. */
+static bool path_find(const char *name, char *out) {
+    const char *dirs = shell_env("PATH");
+    struct fs_file file;
+
+    if (strchr(name, '/') != NULL) {
+        if (strlen(name) + 1 > FS_NAME_LEN) {
+            return false;
+        }
+        strcpy(out, name);
+        return true;
+    }
+    while (dirs != NULL && *dirs != '\0') {
+        const char *end = strchr(dirs, ':');
+        size_t n = end != NULL ? (size_t)(end - dirs) : strlen(dirs);
+
+        if (n > 0 && n + strlen(name) + 2 <= FS_NAME_LEN) {
+            memcpy(out, dirs, n);
+            out[n] = '/';
+            strcpy(out + n + 1, name);
+            if (fs_stat(out, &file) == 0 && file.size > 0) {
+                return true;
+            }
+        }
+        dirs = end != NULL ? end + 1 : NULL;
+    }
+    return false;
+}
+
 static uint64_t sys_execve(uint64_t path, uint64_t argv, uint64_t envp) {
     const char *given = user_string(path);
     const struct proc_cmd *cmd;
@@ -6555,8 +6743,29 @@ static uint64_t sys_execve(uint64_t path, uint64_t argv, uint64_t envp) {
             write_to(handle_of(1), (uint64_t)taken, strlen(taken));
             mem_free(taken);
         }
-        mem_free(held);
-        process_exit(0);
+        if (!peak_exec) {
+            mem_free(held);
+            process_exit(0);
+        }
+        /* mem peak <program>: the words after the first two split apart
+           again - joining them put a space where each one's NUL was - and
+           run as any program is, from PATH. */
+        peak_exec = false;
+        for (unsigned i = 2; i < argc; i++) {
+            ((char *)held->words[i])[-1] = '\0';
+        }
+        argc -= 2;
+        memmove(held->words, held->words + 2, (argc + 1) * sizeof held->words[0]);
+        if (!path_find(held->words[0], held->name)) {
+            const char *say[] = { "mem: peak: ", held->words[0], ": not found\n" };
+
+            for (unsigned i = 0; i < 3; i++) {
+                write_to(handle_of(2), (uint64_t)say[i], strlen(say[i]));
+            }
+            peak_end(proc, false);
+            mem_free(held);
+            process_exit(127);
+        }
     }
     if (fs_stat(held->name, &file) != 0 || file.size == 0) {
         mem_free(held);
@@ -6612,6 +6821,7 @@ static uint64_t sys_execve(uint64_t path, uint64_t argv, uint64_t envp) {
         }
         proc->space = &proc->own;
         proc->borrowed = false;     /* its parent carries on */
+        thread_stir();
         vm_space_use(proc->space);
     }
     code = program_load(&file, &entry);

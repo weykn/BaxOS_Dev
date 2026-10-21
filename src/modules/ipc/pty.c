@@ -194,7 +194,7 @@ static uint64_t wait_for(struct handle *h, bool (*test)(const struct pty *p)) {
         if (interrupt_check()) {
             return ERR(EINTR);
         }
-        thread_yield();
+        thread_wait(0);
     }
     return 0;
 }

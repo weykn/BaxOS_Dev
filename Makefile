@@ -85,20 +85,20 @@ PCFLAGS  := -std=gnu11 -Oz -Wall -Wextra -ffreestanding -fno-builtin -nostdlib -
             -Wl,--gc-sections,--build-id=none,-z,noexecstack,-z,noseparate-code,-z,norelro -s
 
 # tsh and tuxlet-coreutils (ls, cat, cp, ...) are /usr/bin on the disk,
-# built here too, as TEF64: the bytes a program runs as behind a 16-byte
-# header, loaded where position-independent programs go and never relocated
-# - src/tef/tef.ld refuses to link one that would need it. src/tef/tef.c is
-# what they have of a C library.
-TEFFLAGS := -std=gnu11 -Oz -Wall -Wextra -Isrc/tef -ffreestanding -fno-builtin -nostdlib \
+# built here too, as TEF64: a header saying how much memory the program
+# needs, then its bytes, loaded where position-independent programs go and never
+# relocated - src/tcr/tef64.ld writes the header and refuses to link a program
+# that would need relocating. src/tcr/tcr.c, TCR, is their C runtime.
+TEFFLAGS := -std=gnu11 -Oz -Wall -Wextra -Isrc/tcr -ffreestanding -fno-builtin -nostdlib \
             -fpie -fvisibility=hidden -mno-red-zone -fno-stack-protector \
             -fno-asynchronous-unwind-tables -ffunction-sections -fdata-sections \
             -fcf-protection=none -Wa,-mx86-used-note=no -static-pie \
             -Wl,--no-dynamic-linker,--no-warn-rwx-segments,--gc-sections,--build-id=none,-z,norelro,-z,noexecstack \
-            -Wl,-T,src/tef/tef.ld
+            -Wl,-T,src/tcr/tef64.ld
 TSH       := $(BUILD)/tsh
 COREUTILS := $(patsubst src/coreutils/%.c,$(BUILD)/coreutils/%,$(wildcard src/coreutils/*.c))
-TEF_DEPS  := src/tef/tef.c src/tef/tef.h src/tef/tef.ld Makefile
-tef_link   = @mkdir -p $(@D) && $(CC) $(TEFFLAGS) $< src/tef/tef.c -o $@.elf && \
+TEF_DEPS  := src/tcr/tcr.c src/tcr/tcr.h src/tcr/tef64.ld Makefile
+tef_link   = @mkdir -p $(@D) && $(CC) $(TEFFLAGS) $< src/tcr/tcr.c -o $@.elf && \
              $(OBJCOPY) -O binary $@.elf $@ && rm -f $@.elf && echo "TEF64 $@: $$(stat -c %s $@) bytes"
 
 KASMS := $(shell find src/kernel -name '*.asm' ! -name start.asm)

@@ -366,6 +366,13 @@ struct process_info {
     char     name[20];
 };
 bool process_info(unsigned index, struct process_info *out);
+
+/* mem peak: once the command returns, the program named after "mem peak"
+   runs in its place, in the same process - and when that ends, the most
+   memory it and every process it started had in use at once, and the
+   whole system had, is printed to its stderr. False if there is no room to
+   watch another. */
+bool program_peak(void);
 /* /proc/<pid>/stat and the like: the length, or -1 if path is not one. */
 size_t process_file(const char *path, char *out, size_t max);
 

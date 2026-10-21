@@ -256,7 +256,7 @@ static uint64_t accept_with(uint64_t fd, uint64_t addr, uint64_t lenp, uint64_t 
         if (interrupt_check()) {
             return ERR(EINTR);
         }
-        thread_yield();
+        thread_wait(0);
     }
     end = k->queue[0];
     end.offset = (end.offset & ~(uint32_t)O_NONBLOCK) | ((uint32_t)flags & O_NONBLOCK);

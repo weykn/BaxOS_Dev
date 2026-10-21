@@ -1,4 +1,4 @@
-#include "tef.h"
+#include "tcr.h"
 
 /* mkdir [-p] [-m mode] <folder...>: -p makes the folders on the way too,
    and is quiet about one that is there. */

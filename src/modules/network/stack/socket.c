@@ -106,7 +106,7 @@ static void sock_wait(const struct handle *h, unsigned want, uint64_t timeout_ms
 
     while ((stack_ops.ready(SOCK(h)) & (want | NET_ERR | NET_HUP)) == 0 &&
            (timeout_ms == 0 || efi_uptime_ms() < until) && !interrupt_check()) {
-        thread_yield();
+        thread_wait(efi_uptime_us() + 1000);    /* the looking is what fetches a packet */
     }
     wait_ended(began);
 }

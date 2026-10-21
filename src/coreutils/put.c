@@ -1,4 +1,4 @@
-#include "tef.h"
+#include "tcr.h"
 
 /* put <file> [text...]: the file holds the text and a newline, or nothing. */
 

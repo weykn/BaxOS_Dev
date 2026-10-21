@@ -1,4 +1,4 @@
-#include "tef.h"
+#include "tcr.h"
 
 /* rm <file...>: files, and folders with nothing in them. */
 

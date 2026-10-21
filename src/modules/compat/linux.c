@@ -104,6 +104,10 @@ static uint64_t sys_times(uint64_t out, uint64_t b, uint64_t c) {
     return efi_uptime_ms() / 10;
 }
 
+/* How long a wait on a network socket sleeps between looks: nothing tells it
+   a packet came, the looking is what fetches it. */
+#define NET_WAIT_US 1000
+
 /* Which of a few descriptors can be read or written without waiting.
  *
  * Every file here is ready the moment it is asked about; the console is
@@ -120,6 +124,7 @@ static uint64_t sys_times(uint64_t out, uint64_t b, uint64_t c) {
 static uint64_t wait_ready(uint64_t nfds, uint64_t readfds, uint64_t writefds,
                            uint64_t exceptfds, uint64_t timeout, int64_t per_ms) {
     uint64_t want = 0, ready = 0, writable = 0, console_bits = 0, sock_bits = 0, event_bits = 0;
+    uint64_t net_bits = 0;
     int64_t until = 0;
 
     if (nfds > PROGRAM_FILES) {
@@ -142,6 +147,8 @@ static uint64_t wait_ready(uint64_t nfds, uint64_t readfds, uint64_t writefds,
         }
         if (handle_of(fd)->start == SOCK_MARK || handle_of(fd)->start == MOD_MARK) {
             sock_bits |= bit & (want | (writefds != 0 ? *(uint64_t *)writefds : 0));
+            net_bits |= handle_of(fd)->start == SOCK_MARK && (handle_of(fd)->offset & SOCK_UNIX) == 0
+                        ? sock_bits & bit : 0;
             continue;
         }
         if (writefds != 0 && (*(uint64_t *)writefds & bit) != 0) {
@@ -219,7 +226,8 @@ static uint64_t wait_ready(uint64_t nfds, uint64_t readfds, uint64_t writefds,
             wait_ended(began);
             return ERR(EINTR);
         }
-        thread_yield();
+        thread_wait(net_bits != 0 ? efi_uptime_us() + NET_WAIT_US
+                                  : timeout != 0 ? (uint64_t)until * 1000 : 0);
     }
     wait_ended(began);
     if (readfds != 0) {
@@ -935,7 +943,7 @@ static uint64_t poll_once(struct pollfd *p, uint64_t count, bool *sockets) {
             unsigned r = h->start == SOCK_MARK ? sock_ready(h)
                        : ops_of(h) != NULL ? ops_of(h)->ready(h) : NET_ERR;
 
-            *sockets = true;
+            *sockets |= h->start == SOCK_MARK && (h->offset & SOCK_UNIX) == 0;
             p[i].revents = (int16_t)(((p[i].events & POLLIN) && (r & NET_IN) ? POLLIN : 0) |
                                      ((p[i].events & POLLOUT) && (r & NET_OUT) ? POLLOUT : 0) |
                                      (r & NET_ERR ? POLLERR : 0) | (r & NET_HUP ? POLLHUP : 0));
@@ -977,7 +985,8 @@ static uint64_t poll_until(uint64_t fds, uint64_t count, int64_t wait_ms) {
             wait_ended(began);
             return ERR(EINTR);
         }
-        thread_yield();
+        thread_wait(sockets ? efi_uptime_us() + NET_WAIT_US
+                            : wait_ms >= 0 ? (uint64_t)until * 1000 : 0);
     }
     wait_ended(began);
     return ready;
@@ -1084,6 +1093,9 @@ static uint64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t fd) {
     return ERR(EINVAL);
 }
 
+/* Whether the last epoll_once watched a network socket. */
+static bool epoll_net;
+
 /* The entries ready now, up to max of them, into out; how many. */
 static uint64_t epoll_once(struct epoll_set *set, struct epoll_event *out, uint64_t max) {
     uint64_t found = 0;
@@ -1103,6 +1115,7 @@ static uint64_t epoll_once(struct epoll_set *set, struct epoll_event *out, uint6
             set->entry[i].events = 0;   /* until epoll_ctl arms it again */
         }
     }
+    epoll_net = sockets;
     return found;
 }
 
@@ -1125,7 +1138,8 @@ static uint64_t epoll_until(uint64_t epfd, uint64_t events, uint64_t max, int64_
             wait_ended(began);
             return ERR(EINTR);
         }
-        thread_yield();
+        thread_wait(epoll_net ? efi_uptime_us() + NET_WAIT_US
+                              : wait_ms >= 0 ? (uint64_t)until * 1000 : 0);
     }
     wait_ended(began);
     return found;
@@ -1661,6 +1675,20 @@ static uint64_t sys_fchmodat_(uint64_t dirfd, uint64_t path, uint64_t mode) {
     char joined[FS_NAME_LEN];
 
     return chmod_name(at_path(dirfd, user_string(path), joined, sizeof joined), mode);
+}
+
+/* fchmodat2: fchmodat with flags. A link has no mode of its own to change,
+   which Linux says as EOPNOTSUPP - what tar, putting one back, expects. */
+static uint64_t sys_fchmodat2_(uint64_t dirfd, uint64_t path, uint64_t mode) {
+    char joined[FS_NAME_LEN];
+    const char *name = at_path(dirfd, user_string(path), joined, sizeof joined);
+    struct fs_file file;
+
+    if ((arg[3] & AT_SYMLINK_NOFOLLOW) != 0 && name != NULL && fs_lstat(name, &file) == 0 &&
+        (file.size & FS_LINK) != 0) {
+        return ERR(EOPNOTSUPP);
+    }
+    return chmod_name(name, mode);
 }
 
 /* There is one owner on disk, root - except under /home, where everything
@@ -2330,8 +2358,7 @@ static void sleep_until(uint64_t until_ms) {
     uint64_t began = wait_began();
 
     while (efi_uptime_ms() < until_ms && !interrupt_check()) {
-        thread_yield();
-        __asm__ volatile("pause");
+        thread_wait(until_ms * 1000);
     }
     wait_ended(began);
 }
@@ -2565,6 +2592,7 @@ static const uint16_t numbers[] = {
     SYS_CHMOD,
     SYS_FCHMOD,
     SYS_FCHMODAT,
+    452,                                /* fchmodat2 */
     SYS_CHOWN,
     SYS_FCHOWN,
     SYS_LCHOWN,
@@ -2644,6 +2672,7 @@ static const syscall_fn handlers[] = {
     sys_chmod_,
     sys_fchmod_,
     sys_fchmodat_,
+    sys_fchmodat2_,
     sys_ok,
     sys_ok,
     sys_ok,

@@ -119,7 +119,7 @@ static const struct {
     X(fs_mkdir), X(fs_write_at), X(strcpy),
     X(proc_add), X(proc_remove),
     X(handle_of), X(give_handle), X(user_range), X(vm_writable), X(syscall_args), X(interrupt_check),
-    X(wait_began), X(wait_ended), X(thread_yield),
+    X(wait_began), X(wait_ended), X(thread_yield), X(thread_wait), X(thread_stir),
     X(at_path), X(console_get), X(console_ready), X(console_set), X(deliverable),
     X(dev_folder), X(devices), X(dev_named), X(efi_power_off), X(efi_restart),
     X(event_ready), X(file_ino), X(fs_errno), X(fs_file), X(fs_folder_at),

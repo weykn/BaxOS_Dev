@@ -1,225 +1,71 @@
-
 ![Tuxlet OS](TUXLET-BANNER.png)
 
 # Tuxlet OS
 
-> A lightweight, custom x86-64 operating system featuring its own kernel, shell, and filesystem while providing ABI compatibility to run unmodified Linux binaries.
+> A small x86-64 operating system with its own kernel, shell and filesystem that runs unmodified Linux programs.
 
 ---
 
 ## Overview
 
-**Tuxlet OS** bridges the gap between educational bare-metal kernels and production operating systems. It implements an independent kernel, custom shell (`tsh`), and native filesystem layout, yet supports standard Linux system calls to run unmodified Debian packages natively.
+Tuxlet OS has its own kernel, its own shell (`tsh`) and its own filesystem, and it answers Linux system calls. Debian's packages therefore install and run on it as they are, with no recompiling. It goes from a bare prompt in a few hundred KB up to an X11 desktop running Firefox.
 
-Designed to be hyper-lightweight, Tuxlet OS requires only **256 KiB of RAM** and **512 KiB of storage** for its core components.
+The kernel keeps only what everything needs. Drivers, networking, Linux extras and IPC are modules that are loaded when the boot script asks for them, so the idle system stays around **512 KB of RAM** and **1 MB on disk**.
 
 ---
 
 ## Key Features
 
-* **Linux ABI Compatibility:** Runs standard, uncompiled Linux programs natively via Linux-style socket calls and `/proc` hooks.
-* **Custom Modular Architecture:** Dedicated kernel, shell (`tsh`), and dynamic loadable modules (storage, USB, input, networking, IPC, Linux compatibility, and debugging).
-* **Modern PC Drivers:** AHCI (SATA), NVMe, USB (xHCI) keyboards and storage sticks, and Realtek gigabit Ethernet alongside the classic IDE / PS/2 drivers.
-* **Graphical Desktop:** `/dev/fb0` and evdev input let Debian's X.Org server, `openbox` and `xterm` run unmodified.
-* **UEFI and BIOS:** One image boots on either firmware, on x86-64 hardware and in virtualized environments (QEMU).
-* **Embedded Package Manager:** Includes `tuxpac`, a dedicated tool for fetching, resolving, and installing Debian main repository packages.
-* **Scriptable Startup:** Simple, human-readable shell scripts (`/etc/tuxlet/boot`) control the initial boot sequence.
-* **Bare-Metal Takeover:** Ability to leave the firmware (UEFI or BIOS) behind to reclaim memory once essential drivers are initialized.
+* **Linux ABI:** Unmodified Linux ELF programs run directly: glibc, `fork`/`exec`, signals, pipes, threads, `mmap`, sockets, `epoll`, `/proc` and `/dev`.
+* **Modular kernel:** Storage, USB, input, networking, IPC, Linux compatibility and tracing are loadable modules, managed with `modman`.
+* **Modern PC drivers:** AHCI (SATA), NVMe, xHCI (USB keyboards and sticks) and Realtek gigabit Ethernet, alongside IDE, PS/2, e1000, RTL8139 and VirtIO.
+* **Graphical desktop:** `/dev/fb0` and evdev input let Debian's X.Org server, `openbox`, terminals and browsers run unmodified.
+* **UEFI and BIOS:** The same image boots on either firmware, on real hardware or in QEMU.
+* **Package manager:** `tuxpac` fetches, resolves and installs packages from Debian's main repository, over HTTP or HTTPS.
+* **Own executable format:** `tsh` and the coreutils are [TEF64](doc/tef64.md) programs built on [TCR](doc/tcr.md), Tuxlet's own C runtime. `tsh` takes a single page.
+* **Scriptable boot:** `/etc/tuxlet/boot` is a plain `tsh` script that loads drivers and starts whatever the machine should run.
+* **Firmware takeover:** Once its own drivers are up, the kernel can leave the firmware behind and reclaim its memory.
 
 ---
 
 ## System Requirements
 
-| Resource | Minimum Requirement | Notes |
+| Resource | Minimum | Notes |
 | --- | --- | --- |
-| **CPU** | x86-64 | Standard 64-bit architecture |
+| **CPU** | x86-64 | Any 64-bit PC |
 | **Firmware** | UEFI or BIOS | The same image boots on both |
-| **Memory** | **256 KiB** | System allocation (excluding firmware overhead) |
-| **Disk** | **512 KiB** | Core system image size (excluding user files) |
+| **Memory** | **512 KB** | The OS's own use; the firmware needs its share on top |
+| **Disk** | **1 MB** | The core image, without user files or packages |
 
 ---
 
-## Building & Running
-
-### Prerequisites
-
-Ensure you have the required build tools and target tools installed on your host system:
-
-* **Compiler & Toolchain:** `gcc`, `nasm`, `x86_64-w64-mingw32-gcc`
-* **Disk Utilities:** `mtools`, `gptfdisk`
-* **Emulator (Optional):** `qemu-system-x86_64` with `edk2-ovmf` (UEFI firmware image) or SeaBIOS (bundled with QEMU, for `BOOT=bios`)
-
-### Build Commands
+## Quick Start
 
 ```bash
-# Build the core image (outputs to build/TuxletOS.img)
-make
-
-# Boot the image inside QEMU
-make run
-
-# Boot QEMU with extended memory and networking enabled
-make run MEM=64M NET=e1000
-
-# Boot QEMU with BIOS (SeaBIOS) instead of UEFI
-make run BOOT=bios
-
-# Allocate 16 MiB of writeable free space on the target disk image
-make FREE=16M
-
-# Compile with debugging enabled (outputs to QEMU debug port)
-make DEBUG=1
-
-# Clean build artifacts
-make clean
+make        # build/TuxletOS.img
+make run    # boot it in QEMU
 ```
 
-> **Tip:** Any files placed inside the `src/disk/` directory are automatically copied onto the root filesystem image during build.
-
-### Makefile Variables
-
-| Variable | Default | Allowed Values | Description |
-| --- | --- | --- | --- |
-| `MEM` | `39M` | Any valid QEMU memory size (e.g., `64M`, `1G`) | Sets RAM for the QEMU instance. |
-| `NET` | `none` | `none`, `e1000`, `rtl8139`, `virtio` | Network interface driver. |
-| `BOOT` | `uefi` | `uefi`, `bios` | Firmware for `make run`: OVMF (UEFI) or SeaBIOS (BIOS). The same image boots either way. |
-| `FREE` | `1M` | Size notation (e.g., `16M`, `100M`) | Extra unallocated disk space appended to the final image. |
-| `DEBUG` | *Off* | `1` | Enables verbose debug output to the QEMU debug port. |
-
-### Flashing to Real Hardware
-
-To write the compiled disk image directly to a USB stick or target disk:
-
-```bash
-sudo dd if=build/TuxletOS.img of=/dev/sdX bs=4M conv=fsync
-```
-
-> ⚠️ **WARNING:** This command will permanently overwrite all existing data on `/dev/sdX`. Verify your target drive path using `lsblk` before proceeding.
-
----
-
-## Usage Guide
-
-### Shell (`tsh`) Basics
-
-Tuxlet boots into `tsh` (`/usr/bin/tsh`), a lightweight shell the kernel starts as its login shell.
-
-* **Built-in Commands:** `cd`, `export`, `exit`, `help`.
-* **tuxlet-coreutils:** `ls`, `cat`, `cp`, `mv`, `rm`, `mkdir [-p] [-m mode]` and `put` are programs in `/usr/bin`, replaced by the GNU ones when a package installs them.
-* **Writing Files:** Use `put <file> [text]` to write a line of text.
-* **Running Scripts:** Execute `tsh <script_path>`.
-* **TEF64:** `tsh` and the coreutils are TEF64 files, Tuxlet's own executable format: the raw bytes of the program behind a 16-byte header (`"TEF64"`, entry, memory size), loaded with no relocation. `tsh` is under 3 KB, each coreutil under 1 KB.
-* **Process Controls:**
-* `Ctrl + C`: Sends a interrupt signal to the foreground application.
-* `Ctrl + C` (3x repeatedly): Forcefully terminates a non-responsive process.
-* `Ctrl + \`: Immediately quits the process.
-
-To access kernel commands and binaries, ensure your shell environment variables are exported:
+A fresh image boots to a bare `tsh` prompt. Set up the environment first, or run `/usr/bin/tsh /etc/tuxlet/setup` for a full install:
 
 ```sh
 export PATH=/ctl:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
 export MODPATH=/usr/lib/modules
 ```
 
----
-
-### Kernel Commands
-
-System control executables are located in `/ctl`:
-
-| Command | Usage | Description |
-| --- | --- | --- |
-| `mem` | `mem [all\|top]` | Displays current system memory allocation and usage. |
-| `mode` / `scale` / `font` | Standard options | Configures frame-buffer resolution, UI scaling, and console font. |
-| `clear` / `echo` | Text output | Clears terminal screen or prints text; Supports `{bold}`, `{n}` *(newline)* and `{uptime}`. |
-| `greet` | `greet [text]` | Sets the welcome line, with the same markup as `echo`; alone, prints it. |
-| `modman` | Management | Loads, unloads, and inspects module states (see details below). |
-| `reboot` / `poweroff` | Power control | Restarts or safely shuts down the machine. |
+Files placed in `src/disk/` are copied onto the root filesystem as they are when the image is built.
 
 ---
 
-### Kernel Modules
+## Documentation
 
-Modules are loaded on demand via `modman`:
-
-```sh
-modman enable <module>   # Load a module
-modman disable <module>  # Unload a module
-modman auto <category>   # Auto-detect and load compatible hardware drivers
-```
-
-#### Available Driver Matrix
-
-| Category | Module | Provided Feature / Service |
-| --- | --- | --- |
-| **`storage`** | `storage/ide` | Low-level IDE disk controller support |
-|  | `storage/ahci` | SATA disks on an AHCI controller |
-|  | `storage/nvme` | NVMe SSDs |
-|  | `storage/usb` | USB sticks and disks (bulk-only mass storage) |
-|  | `storage/cache` | In-memory block cache (exposes `cache` command) |
-| **`usb`** | `usb/xhci` | USB 3 (xHCI) host controller, used by the USB class drivers |
-| **`input`** | `input/ps2` | PS/2 keyboard and mouse support |
-|  | `input/usbkbd` | USB keyboard support (needs `usb/xhci`) |
-| **`network`** | `network/stack` | TCP/IP network protocol stack (exposes `net` command) |
-|  | `network/e1000` | Intel e1000 Gigabit NIC driver |
-|  | `network/rtl8139` | Realtek RTL8139 Fast Ethernet driver |
-|  | `network/rtl8169` | Realtek RTL8168/8111 Gigabit and RTL8125 2.5G Ethernet driver |
-|  | `network/virtio` | Para-virtualized VirtIO network driver |
-| **`ipc`** | `ipc/unix` | `AF_UNIX` stream sockets and device-event netlink |
-|  | `ipc/pty` | Pseudo-terminals (`/dev/ptmx`, `/dev/pts/N`) for terminal emulators |
-| **`sched`** | `sched/timer` | Timer interrupt for programs (after `modman takeover`): Ctrl-C stops busy loops, programs share the CPU |
-| **`compat`** | `compat/linux` | Extra Linux system calls; loaded automatically on first use |
-| **`debug`** | `debug/trace` | Low-level kernel tracing tool |
-
----
-
-### Package Management (`tuxpac`)
-
-Tuxlet includes a custom package manager located at `/usr/bin/tuxpac` that directly parses and installs standard Debian binary archives (`.deb`).
-
-#### 1. Configure Mirrors
-
-Repositories are defined in `/etc/tuxlet/mirror` (one entry per line). A ready-made one ships as `/etc/tuxlet/mirror-example`.
-
-**HTTPS Support:** To use `https://` mirrors, first install `curl` via HTTP (it brings `ca-certificates`), then update your mirror file.
-
-#### 2. Package Management Commands
-
-| Command | Action |
+| Document | Contents |
 | --- | --- |
-| `tuxpac -y` | Sync local package indexes with configured mirrors |
-| `tuxpac -s <pkg>` | Install a package along with its required dependencies |
-| `tuxpac -e` | Install Debian essential packages |
-| `tuxpac -re` | Remove Debian essential packages |
-| `tuxpac -r <pkg>` | Remove a package and unneeded orphaned dependencies |
-| `tuxpac -n <pkg>` | Purge a package along with its configuration files |
-| `tuxpac -u [pkg]` | Upgrade a specific package or all installed software |
-| `tuxpac -f <query>` | Search available repository packages |
-| `tuxpac -q [query]` | List installed packages on the system |
-| `tuxpac -i <pkg>` | Show detailed package metadata |
-
----
-
-## Advanced Operations
-
-### Firmware Takeover
-
-Running `modman takeover` instructs Tuxlet OS to stop using the firmware - UEFI Runtime Services or BIOS interrupts - freeing up motherboard firmware memory for user space execution.
-
-Before invoking takeover mode, ensure:
-1. A **storage module** (`storage/ide`, `storage/ahci`, `storage/nvme` or `storage/usb`) is active.
-2. An **input module** (`input/ps2` or `input/usbkbd`) is loaded.
-3. Your display **`mode`** is configured (video resolution cannot be altered post-takeover).
-
-```sh
-modman enable storage/ide
-modman enable input/ps2
-modman takeover
-```
-
-### Boot Configuration
-
-The startup lifecycle is fully scriptable using `tsh`:
-
-1. **`/etc/tuxlet/boot`**: Executes first upon system initialization. Use this script to load necessary driver modules, set display resolutions, and mount filesystems.
-2. **`/etc/tuxlet/shell`**: Executes immediately after `boot`. If this script is omitted, Tuxlet defaults to spawning an interactive `tsh` prompt.
+| [Building & Running](doc/building.md) | Prerequisites, make targets and variables, flashing a USB stick |
+| [Shell (`tsh`)](doc/shell.md) | Built-ins, tuxlet-coreutils, scripts, keys, environment |
+| [Kernel Commands](doc/kernel-commands.md) | The `/ctl` commands: `mem`, `modman`, `mode`, ... |
+| [Kernel Modules](doc/modules.md) | `modman` and every driver module |
+| [Package Management (`tuxpac`)](doc/tuxpac.md) | Mirrors, HTTPS and the package commands |
+| [Advanced Operations](doc/advanced.md) | Firmware takeover and the boot scripts |
+| [TEF64](doc/tef64.md) | Tuxlet executable format |
+| [TCR](doc/tcr.md) | Tuxlet C runtime |

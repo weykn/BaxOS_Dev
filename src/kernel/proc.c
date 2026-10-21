@@ -248,6 +248,8 @@ static void mem_top(void) {
     color(COL_TEXT);
 }
 
+#define MEM_USAGE "<usage|all|top|peak <program>>"
+
 static void cmd_mem(char *args) {
     struct mem_stats m;
     const char *word = str_word(&args);
@@ -255,6 +257,19 @@ static void cmd_mem(char *args) {
 
     if (strcmp(word, "top") == 0) {
         mem_top();
+        return;
+    }
+    /* The program runs once this returns, in this process: execve's. */
+    if (strcmp(word, "peak") == 0) {
+        if (*args == '\0') {
+            error("usage: mem " MEM_USAGE "\n");
+        } else if (!program_peak()) {
+            error("mem: peak: too many at once\n");
+        }
+        return;
+    }
+    if (!all && strcmp(word, "usage") != 0) {
+        error("usage: mem " MEM_USAGE "\n");
         return;
     }
 
@@ -310,7 +325,7 @@ static void cmd_mem(char *args) {
     for (unsigned i = 0; i < n; i++) {
         detail(parts[i].label, parts[i].bytes);
         if (strcmp(parts[i].label, "kernel stack") == 0) {
-            kprintf(", %u at peak", m.stack_peak);
+            kprintf(", %u at peak, %u in a thread", m.stack_peak, m.thread_peak);
         }
         vga_putc('\n');
     }
@@ -423,6 +438,7 @@ size_t proc_linux(const char *path, char *out, size_t max) {
         "/proc/sys/fs/inotify/max_user_watches", "/proc/sys/fs/inotify/max_user_instances",
         "/proc/self/maps", "/proc/version", "/proc/sys/kernel/osrelease",
         "/proc/sys/kernel/ostype", "/proc/sys/kernel/pid_max", "/proc/self/environ",
+        "/proc/self/mountinfo",
     };
     char text[1024], *p = text;
     unsigned which = 0;
@@ -473,16 +489,31 @@ size_t proc_linux(const char *path, char *out, size_t max) {
         ksprintf(p, "bogomips\t: %u.00\naddress sizes\t: 39 bits physical, 48 bits virtual\n\n",
                  (unsigned)(efi_tsc_hz() / 500000));
         p = text;
-    } else if (which == 6 || which == 7) {
+    } else if (which == 6 || which == 7 || which == 16) {
         /* What is mounted where, as the compat module answers statfs: the
-           disk at /, and Linux's own filesystems over the kernel's files. */
-        strcpy(p, "/dev/root / ext4 rw,relatime 0 0\n"
-                  "proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n"
-                  "sysfs /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0\n"
-                  "devtmpfs /dev devtmpfs rw,nosuid,relatime 0 0\n"
-                  "devpts /dev/pts devpts rw,nosuid,noexec,relatime 0 0\n"
-                  "tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0\n"
-                  "tmpfs /run tmpfs rw,nosuid,nodev 0 0\n");
+           disk at /, and Linux's own filesystems over the kernel's files.
+           mountinfo, which df reads, says the same in its own layout. */
+        static const char *const mounts[][4] = {
+            { "/dev/root", "/",        "ext4",     "rw,relatime" },
+            { "proc",      "/proc",    "proc",     "rw,nosuid,nodev,noexec,relatime" },
+            { "sysfs",     "/sys",     "sysfs",    "rw,nosuid,nodev,noexec,relatime" },
+            { "devtmpfs",  "/dev",     "devtmpfs", "rw,nosuid,relatime" },
+            { "devpts",    "/dev/pts", "devpts",   "rw,nosuid,noexec,relatime" },
+            { "tmpfs",     "/dev/shm", "tmpfs",    "rw,nosuid,nodev" },
+            { "tmpfs",     "/run",     "tmpfs",    "rw,nosuid,nodev" },
+        };
+
+        for (unsigned i = 0; i < sizeof mounts / sizeof mounts[0]; i++) {
+            if (which == 16) {
+                ksprintf(p, "%u %u 0:%u / %s %s - %s %s %s\n", i + 1, i == 0 ? 0 : 1, i + 1,
+                         mounts[i][1], mounts[i][3], mounts[i][2], mounts[i][0], mounts[i][3]);
+            } else {
+                ksprintf(p, "%s %s %s %s 0 0\n", mounts[i][0], mounts[i][1], mounts[i][2],
+                         mounts[i][3]);
+            }
+            p += strlen(p);
+        }
+        p = text;
     } else if (which == 10) {
         process_maps(p, sizeof text);
     } else if (which == 11) {
@@ -512,7 +543,7 @@ static const struct proc_cmd commands[] = {
     { "mode",   "[size]",            cmd_mode   },
     { "scale",  "[size|off]",        cmd_scale  },
     { "font",   "[size]",            cmd_font   },
-    { "mem",    "[all|top]",         cmd_mem    },
+    { "mem",    MEM_USAGE,           cmd_mem    },
     { "modman", "[enable|disable <module>|auto <category>|takeover]", module_command },
     { "clear",  "",                  cmd_clear },
     { "echo",   "[text]",            cmd_echo },

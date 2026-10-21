@@ -1,6 +1,8 @@
-#include "tef.h"
+#include "tcr.h"
 
 #include <stdarg.h>
+
+/* ---- start-up and syscalls ----------------------------------------------- */
 
 /* Where the kernel starts a TEF64 program: argc, the arguments and the
  * environment are on the stack the way they are for any Linux program. */
@@ -30,10 +32,10 @@ __asm__(
 
     /* The child runs first, on this same stack, so the return address is
        kept in a register rather than where the child's calls would write. */
-    ".section .text.tef_vfork,\"ax\"\n"
-    ".globl tef_vfork\n"
-    ".hidden tef_vfork\n"
-    "tef_vfork:\n"
+    ".section .text.vfork,\"ax\"\n"
+    ".globl vfork\n"
+    ".hidden vfork\n"
+    "vfork:\n"
     "    pop %rdx\n"
     "    mov $56, %eax\n"
     "    mov $0x4111, %edi\n"           /* CLONE_VM | CLONE_VFORK | SIGCHLD */
@@ -42,13 +44,15 @@ __asm__(
     "    push %rdx\n"
     "    ret\n"
 
-    ".section .text.tef_restorer,\"ax\"\n"
-    ".globl tef_restorer\n"
-    ".hidden tef_restorer\n"
-    "tef_restorer:\n"
+    ".section .text.tcr_restorer,\"ax\"\n"
+    ".globl tcr_restorer\n"
+    ".hidden tcr_restorer\n"
+    "tcr_restorer:\n"
     "    mov $15, %eax\n"
     "    syscall\n"
 );
+
+/* ---- strings --------------------------------------------------------------- */
 
 size_t strlen(const char *s) {
     size_t n = 0;
@@ -95,6 +99,70 @@ void *memset(void *to, int c, size_t n) {
     return to;
 }
 
+/* ---- memory ---------------------------------------------------------------- */
+
+/* Each block has its size in front of it; a free one keeps the next free one
+   where its bytes were. First fit, no merging: the core programs allocate
+   little and exit soon. */
+struct block {
+    size_t size;
+    struct block *next;             /* only while free */
+};
+
+static struct block *free_list;
+static char *heap_top;
+
+void *malloc(size_t n) {
+    struct block **at, *b;
+    char *top;
+
+    n = (n + 15) & ~(size_t)15;
+    for (at = &free_list; *at != NULL; at = &(*at)->next) {
+        if ((*at)->size >= n) {
+            b = *at;
+            *at = b->next;
+            return &b->next;
+        }
+    }
+    if (heap_top == NULL) {
+        heap_top = (char *)brk(0);
+    }
+    top = (char *)brk(heap_top + sizeof(size_t) + n);
+    if (top < heap_top + sizeof(size_t) + n) {
+        return NULL;
+    }
+    b = (struct block *)heap_top;
+    b->size = n;
+    heap_top = top;
+    return &b->next;
+}
+
+void free(void *p) {
+    struct block *b;
+
+    if (p != NULL) {
+        b = (struct block *)((char *)p - sizeof(size_t));
+        b->next = free_list;
+        free_list = b;
+    }
+}
+
+void *realloc(void *p, size_t n) {
+    size_t had = p != NULL ? ((size_t *)p)[-1] : 0;
+    void *q;
+
+    if (had >= n) {
+        return p;
+    }
+    if ((q = malloc(n)) != NULL && p != NULL) {
+        memcpy(q, p, had);
+        free(p);
+    }
+    return q;
+}
+
+/* ---- output and paths -------------------------------------------------------- */
+
 void out(int fd, ...) {
     va_list list;
     const char *s;
@@ -104,6 +172,22 @@ void out(int fd, ...) {
         write(fd, s, strlen(s));
     }
     va_end(list);
+}
+
+int puts(const char *s) {
+    out(1, s, "\n", NULL);
+    return 0;
+}
+
+char *utoa(unsigned long n, char *buf) {
+    char *p = buf + 20;
+
+    *p = '\0';
+    do {
+        *--p = (char)('0' + n % 10);
+        n /= 10;
+    } while (n != 0);
+    return memcpy(buf, p, (size_t)(buf + 21 - p));
 }
 
 const char *base_of(const char *path) {

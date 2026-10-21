@@ -4,6 +4,7 @@
 
 #include "mem.h"
 #include "string.h"
+#include "vga.h"
 
 #define MSR_FS_BASE   0xC0000100
 #define MSR_GS_BASE   0xC0000101    /* a program's too: the kernel never uses GS */
@@ -17,11 +18,14 @@ struct thread {
     void    *proc;                  /* its process (syscall.c's), NULL for the kernel */
     bool     leader;                /* the one whose end is the process's */
     int      tid;
+    unsigned slot;                  /* its place in all[] */
     bool     dead;                  /* ended; its stack goes at the next switch */
     bool     woken;
     bool     exiting;               /* the process is ending: the leader does it */
     int      exit_code;
     uint64_t futex;                 /* where it waits, 0 if nowhere */
+    uint64_t wake_us;               /* when that wait times out, 0 if never */
+    bool     kicked;                /* a signal came for its process meanwhile */
     uint64_t sigmask;               /* the signals it has blocked: each thread its own */
     uint64_t restore[3];            /* rt_sigreturn's RCX and R11 to put back, if [0] */
     uint64_t clear_tid;
@@ -77,18 +81,70 @@ static uint64_t *kernel_rsp(void) {
     return (uint64_t *)(tss + 4);
 }
 
+/* Threads ended whose stacks are not given back yet. reap runs at every
+   switch, and going through every thread to find none was most of a
+   switch: each one's record is on a page of its own. */
+static unsigned dead_count;
+
+static void mark_dead(struct thread *t) {
+    if (!t->dead) {
+        t->dead = true;
+        dead_count++;
+    }
+}
+
+/* The most of a thread's kernel stack ever in use: each starts zeroed, so
+   its lowest byte that is not still zero marks how deep it went. */
+static uint32_t deepest;
+
+static uint32_t depth(const struct thread *t) {
+    const uint8_t *at = (const uint8_t *)(t + 1) + 8, *top = (const uint8_t *)t + THREAD_STACK_BYTES;
+
+    while (at < top && *at == 0) {
+        at++;
+    }
+    return (uint32_t)(top - at);
+}
+
+uint32_t thread_stack_peak(void) {
+    uint32_t most = deepest;
+
+    for (unsigned i = 1; i < THREADS; i++) {
+        if (all[i] != NULL && depth(all[i]) > most) {
+            most = depth(all[i]);
+        }
+    }
+    return most;
+}
+
 /* Gives back the stacks of the threads that have ended, other than this. */
 static void reap(void) {
-    for (unsigned i = 1; i < THREADS; i++) {
+    for (unsigned i = 1; dead_count > 0 && i < THREADS; i++) {
         if (all[i] != NULL && all[i]->dead && all[i] != current) {
+            deepest = depth(all[i]) > deepest ? depth(all[i]) : deepest;
             mem_pages_free((uint64_t)all[i], STACK_PAGES);   /* it is at the base */
             all[i] = NULL;
+            dead_count--;
         }
     }
 }
 
+/* The word just above a thread's record, which its stack reaches only by
+   running out: checked at every switch, so that an overflow stops the
+   machine saying so rather than quietly wrecking the record. Two pages of
+   stack, where the deepest seen - a browser, an office suite, tar, modman -
+   is about four kilobytes. */
+#define CANARY 0x6b636174536b7854ull
+
 static void switch_to(struct thread *next) {
     struct thread *prev = current;
+
+    if (prev != &first && *(const uint64_t *)(prev + 1) != CANARY) {
+        kprintf("\nkernel stack overflow: thread %u\n", (unsigned)prev->tid);
+        for (;;) {
+            __asm__ volatile("cli; hlt");
+        }
+    }
 
     prev->fs_base = rdmsr(MSR_FS_BASE);
     prev->gs_base = rdmsr(MSR_GS_BASE);
@@ -113,16 +169,30 @@ static void switch_to(struct thread *next) {
 /* The next thread after this one, of any process - or, with mine, of this
    one only - or NULL. Every thread waiting calls thread_yield in its wait, so
    going round all of them is what lets every process get on. */
-static struct thread *next_one(bool mine) {
-    unsigned at = 0;
+uint64_t efi_uptime_us(void);
 
-    while (all[at] != current) {
-        at++;
-    }
+#define WAITING 1                   /* thread_wait's: no futex is at an odd address */
+
+/* Whether t waits at a futex that nothing has woken, with no time-out due
+   and no signal come: switching to it would only have it look and pass the
+   processor on, and a browser has a hundred of those. */
+static bool asleep(const struct thread *t, uint64_t now) {
+    return t->futex != 0 && !t->woken && !t->kicked && !t->exiting &&
+           (t->wake_us == 0 || now < t->wake_us);
+}
+
+/* The next thread to run after this one, round the table: of this process
+   only for `mine`, and asleep or not for `any` - which asks whether there is
+   another at all, one that could yet do what this one waits for. */
+static struct thread *next_one(bool mine, bool any) {
+    unsigned at = current->slot;
+    uint64_t now = any ? 0 : efi_uptime_us();
+
     for (unsigned n = 1; n < THREADS; n++) {
         struct thread *t = all[(at + n) % THREADS];
 
-        if (t != NULL && !t->dead && (!mine || t->proc == current->proc)) {
+        if (t != NULL && !t->dead && (!mine || t->proc == current->proc) &&
+            (any || !asleep(t, now))) {
             return t;
         }
     }
@@ -139,19 +209,29 @@ static struct thread *leader_of(void *proc) {
     return NULL;
 }
 
+/* Where a thread that has ended goes: one awake if there is one, else any -
+   there is always one, the kernel's own. */
+static struct thread *next_after_end(void) {
+    struct thread *t = next_one(false, false);
+
+    return t != NULL ? t : next_one(false, true);
+}
+
 void timers_tick(void);            /* syscall.c: the timers that are due, sent */
 void process_yielded(uint64_t us); /* syscall.c: time others had, not the caller's */
-uint64_t efi_uptime_us(void);
 
 void thread_yield(void) {
     timers_tick();
-    struct thread *next = next_one(false);
+    struct thread *next = next_one(false, false);
 
     if (next != NULL) {
         uint64_t began = efi_uptime_us();
 
         switch_to(next);
         process_yielded(efi_uptime_us() - began);
+    }
+    if (current->futex == WAITING) {
+        current->futex = 0;         /* thread_wait's sleep is one round long */
     }
     if (current->exiting) {
         current->exiting = false;
@@ -168,11 +248,11 @@ uint64_t *thread_sigmask(void) {
 }
 
 bool thread_alone(void) {
-    return next_one(true) == NULL;
+    return next_one(true, true) == NULL;
 }
 
 bool thread_only(void) {
-    return next_one(false) == NULL;
+    return next_one(false, true) == NULL;
 }
 
 int thread_id(void) {
@@ -181,10 +261,6 @@ int thread_id(void) {
 
 int thread_new_id(void) {
     return next_tid++;
-}
-
-uint64_t thread_stack_left(const void *here) {
-    return (uint64_t)here - (uint64_t)current->bottom;
 }
 
 /* Where a new thread's kernel stack first returns to. */
@@ -198,8 +274,8 @@ static void thread_start(void) {
         *(volatile int32_t *)t->clear_tid = 0;
         thread_wake(t->clear_tid, 1, 0, 0);
     }
-    t->dead = true;
-    switch_to(next_one(false));     /* there is always one: the kernel's own */
+    mark_dead(t);
+    switch_to(next_after_end());
     for (;;) {
     }
 }
@@ -212,8 +288,8 @@ static void process_entry(void) {
     fpu_load(t);
     reap();
     process_finished(user_resume(&t->regs, 0));
-    t->dead = true;
-    switch_to(next_one(false));
+    mark_dead(t);
+    switch_to(next_after_end());
     for (;;) {
     }
 }
@@ -231,11 +307,14 @@ static struct thread *thread_new(void *proc, bool leader, const struct user_regs
         return NULL;
     }
     struct thread *t = (struct thread *)base;
-    uint64_t *sp = (uint64_t *)(base + STACK_PAGES * 4096);
+    uint64_t *sp;
+
+    memset(t, 0, THREAD_STACK_BYTES);
+    *(uint64_t *)(t + 1) = CANARY;
 
     *t = (struct thread){
         .bottom = (uint8_t *)(t + 1), .proc = proc, .leader = leader, .tid = next_tid++,
-        .sigmask = sigmask, .fs_base = fs, .gs_base = rdmsr(MSR_GS_BASE),
+        .slot = slot, .sigmask = sigmask, .fs_base = fs, .gs_base = rdmsr(MSR_GS_BASE),
         /* Its syscalls land at the top of its own stack. */
         .kernel_rsp = base + STACK_PAGES * 4096 - 64,
         .regs = *regs,
@@ -271,7 +350,7 @@ bool thread_spawn(void *proc, const struct user_regs *regs, uint64_t fs, uint64_
 void thread_end_others(void) {
     for (unsigned i = 1; i < THREADS; i++) {
         if (all[i] != NULL && all[i] != current && all[i]->proc == current->proc) {
-            all[i]->dead = true;
+            mark_dead(all[i]);
         }
     }
     reap();
@@ -321,7 +400,7 @@ void process_exit(int code) {
            process from there, on its own stack. */
         leader->exiting = true;
         leader->exit_code = code;
-        current->dead = true;
+        mark_dead(current);
         switch_to(leader);
     }
     thread_end_others();
@@ -337,9 +416,41 @@ void thread_exit(int code) {
     user_exit(code);                /* a thread's ends in thread_start */
 }
 
-void thread_sleep_on(uint64_t addr) {
+/* A wait for anything at all - a pipe, a socket, a child, a key - sleeps
+   rather than has every waiter switched into round after round only to look
+   and pass the processor on, each one a change of address space: what a
+   browser's dozen processes cost while it had work to do. Whatever might
+   end a wait calls thread_stir, which wakes every one of them to look again;
+   one it missed looks anyway once WAIT_US is up. */
+#define WAIT_US 10000
+
+void thread_wait(uint64_t until_us) {
+    uint64_t latest = efi_uptime_us() + WAIT_US;
+
+    thread_sleep_on(WAITING, until_us != 0 && until_us < latest ? until_us : latest);
+    thread_yield();
+}
+
+void thread_stir(void) {
+    for (unsigned i = 0; i < THREADS; i++) {
+        if (all[i] != NULL && all[i]->futex == WAITING) {
+            all[i]->futex = 0;
+        }
+    }
+}
+
+void thread_sleep_on(uint64_t addr, uint64_t until_us) {
     current->futex = addr;
-    current->woken = false;
+    current->wake_us = until_us;
+    current->woken = current->kicked = false;
+}
+
+void thread_kick(void *proc) {
+    for (unsigned i = 0; i < THREADS; i++) {
+        if (all[i] != NULL && all[i]->proc == proc) {
+            all[i]->kicked = true;
+        }
+    }
 }
 
 bool thread_woken(void) {
