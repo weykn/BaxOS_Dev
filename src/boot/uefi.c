@@ -1,7 +1,9 @@
-/* The Tuxlet OS UEFI loader: BOOTX64.EFI.
+/* The Tuxlet OS UEFI loader: BOOTX64.EFI - or, built by a 32-bit compiler,
+ * BOOTIA32.EFI, which a 32-bit firmware starts in protected mode with
+ * paging off, for the 32-bit kernel.
  *
- * Firmware hands us a machine already in long mode with everything mapped,
- * so there is no mode switching to do - only finding the things the kernel
+ * Firmware hands us a machine already in long mode (or 32-bit protected
+ * mode) with everything mapped, so there is no mode switching to do - only finding the things the kernel
  * cannot find for itself once it is running, and putting the kernel where it
  * expects to be.
  *
@@ -20,7 +22,11 @@
 /* Put there by objcopy, from build/kernel.bin. */
 extern const unsigned char kernel_start[], kernel_end[];
 
+#ifdef __i386__
+typedef __attribute__((cdecl, noreturn)) void (*kernel_entry)(struct boot_info *);
+#else
 typedef __attribute__((sysv_abi, noreturn)) void (*kernel_entry)(struct boot_info *);
+#endif
 
 static struct efi_system_table *st;
 static struct efi_boot_services *bs;
@@ -165,11 +171,16 @@ static void measure_memory(void) {
     if (!EFI_ERROR(bs->get_memory_map(&size, map, &key, &stride, &version))) {
         for (efi_uintn off = 0; off < size; off += stride) {
             struct efi_memory_descriptor *d = (void *)((char *)map + off);
+            /* A 32-bit kernel reaches only the first 4 GiB. */
+            uint64_t n = sizeof(void *) == 4 && d->physical >= (1ull << 32) ? 0 :
+                         sizeof(void *) == 4 && d->physical + d->pages * 4096 > (1ull << 32) ?
+                         ((1ull << 32) - d->physical) / 4096 : d->pages;
+
             if (d->type == EFI_CONVENTIONAL_MEMORY) {
-                pages += d->pages;
+                pages += n;
             }
             if (efi_is_ram(d->type)) {
-                ram += d->pages;
+                ram += n;
             }
             if (efi_is_firmware_kept(d->type)) {
                 kept += d->pages;
@@ -185,10 +196,16 @@ static void measure_memory(void) {
 /* ---- taking memory for the kernel ---------------------------------------- */
 
 /* Anywhere below 4 GiB: the kernel runs wherever it is put. Returns where,
-   or 0 if there is no room at all. */
+   or 0 if there is no room at all. The 32-bit kernel goes below 128 MiB
+   if it can, out of the first gigabyte's programs' way (ia32.h). */
 static uint64_t take(uint64_t bytes) {
-    uint64_t at = 0xFFFFFFFF;
+    uint64_t at = 0x07FFFFFF;
 
+    if (sizeof(void *) == 4 &&
+        !EFI_ERROR(bs->allocate_pages(EFI_ALLOCATE_MAX, EFI_LOADER_DATA, bytes / 4096, &at))) {
+        return at;
+    }
+    at = 0xFFFFFFFF;
     return EFI_ERROR(bs->allocate_pages(EFI_ALLOCATE_MAX, EFI_LOADER_DATA,
                                         bytes / 4096, &at)) ? 0 : at;
 }
@@ -204,6 +221,16 @@ efi_status EFIAPI efi_main(efi_handle image, struct efi_system_table *table) {
        finishing. This one never finishes. */
     bs->set_watchdog_timer(0, 0, 0, 0);
 
+#ifdef __i386__
+    /* PAE for the kernel's page tables, FXSR for the registers it keeps
+       for each thread: what the BIOS loader checks too. */
+    uint32_t a = 1, b, c = 0, d;
+
+    __asm__ volatile("cpuid" : "+a"(a), "=b"(b), "+c"(c), "=d"(d));
+    if ((d & (1u << 6 | 1u << 24)) != (1u << 6 | 1u << 24)) {
+        fail(u"needs a processor with PAE and FXSR");
+    }
+#endif
     info.magic  = BOOT_MAGIC;
     info.system = st;
     info.image  = image;
@@ -228,8 +255,8 @@ efi_status EFIAPI efi_main(efi_handle image, struct efi_system_table *table) {
 
     /* The image, then zeroes for its .bss - which the flat binary does not
        carry - and the stack that lives in it. */
-    zero((void *)base, KERNEL_BYTES);
-    copy((void *)base, kernel_start, (uint64_t)(kernel_end - kernel_start));
+    zero((void *)(uintptr_t)base, KERNEL_BYTES);
+    copy((void *)(uintptr_t)base, kernel_start, (uint64_t)(kernel_end - kernel_start));
 
-    ((kernel_entry)base)(&info);
+    ((kernel_entry)(uintptr_t)base)(&info);
 }

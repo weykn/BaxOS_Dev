@@ -108,7 +108,7 @@ static void send(const uint8_t *frame, size_t len) {
 
     memset(buf, 0, HDR);
     memcpy(buf + HDR, frame, len);
-    txq.desc[0] = (struct desc){ (uint64_t)buf, (uint32_t)(HDR + len), 0, 0 };
+    txq.desc[0] = (struct desc){ (uint64_t)(uintptr_t)buf, (uint32_t)(HDR + len), 0, 0 };
     hand_over(&txq, 0);
     outw(io + NOTIFY, 1);
     while (txq.used->idx == txq.seen && efi_uptime_ms() < until) {

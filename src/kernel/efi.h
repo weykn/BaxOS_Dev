@@ -14,7 +14,26 @@
  * matter carry a static assertion on their offset: a mistake here would show
  * up as a machine that hangs with a blank screen and nothing to go on. */
 
+#ifdef __i386__
+/* A 32-bit firmware's convention is the C one, and its numbers are 32 bits
+   wide (EFI_ERROR is the top one of them). A call goes through efi_jump
+   (i386/efi_call.asm), which runs the function in efi_target on the
+   firmware's stack with whatever arguments it was given - so they are laid
+   out by the function's own type, a 64-bit one taking two words. */
+#define EFIAPI
+typedef uint32_t efi_status;
+typedef uint32_t efi_uintn;
+#define EFI_HIGH_BIT 0x80000000u
+
+extern const void *efi_target;
+extern char efi_jump[];             /* code, but called as any function's type */
+#define EFI_CALL(f, ...) \
+    (efi_target = (const void *)(f), ((__typeof__(f))(void *)efi_jump)(__VA_ARGS__))
+#else
 #define EFIAPI __attribute__((ms_abi))
+typedef uint64_t efi_status;
+typedef uint64_t efi_uintn;
+#define EFI_HIGH_BIT 0x8000000000000000ull
 
 /* A call into the firmware on a stack big enough for it (efi_call.asm):
    EFI_CALL(bs->stall, 10) for bs->stall(10). At most five arguments. */
@@ -30,16 +49,15 @@ uint64_t efi_call(const void *fn, uint64_t a, uint64_t b, uint64_t c, uint64_t d
     efi_call((const void *)(f), EFI_U_(a), EFI_U_(b), EFI_U_(c), EFI_U_(d), EFI_U_(e))
 #define EFI_CALL(f, ...) \
     EFI_N_(__VA_ARGS__, EFI_C5_, EFI_C4_, EFI_C3_, EFI_C2_, EFI_C1_)(f, __VA_ARGS__)
+#endif
 
-typedef uint64_t efi_status;
-typedef uint64_t efi_uintn;
 typedef void    *efi_handle;
 
 #define EFI_SUCCESS       0
-#define EFI_OUT_OF_RESOURCES (1ull << 63 | 9)
-#define EFI_ERROR(s)      (((int64_t)(s)) < 0)
-#define EFI_NOT_READY     0x8000000000000006ull
-#define EFI_BUFFER_SMALL  0x8000000000000005ull
+#define EFI_OUT_OF_RESOURCES (EFI_HIGH_BIT | 9)
+#define EFI_ERROR(s)      (((s) & EFI_HIGH_BIT) != 0)
+#define EFI_NOT_READY     (EFI_HIGH_BIT | 6)
+#define EFI_BUFFER_SMALL  (EFI_HIGH_BIT | 5)
 
 struct efi_guid {
     uint32_t a;
@@ -162,7 +180,6 @@ struct efi_block_io {
 
 struct efi_loaded_image {
     uint32_t    revision;
-    uint32_t    pad;
     efi_handle  parent;
     void       *system_table;
     efi_handle  device;         /* what we were loaded from */
@@ -280,7 +297,6 @@ struct efi_system_table {
     struct efi_table_header      hdr;
     uint16_t                    *vendor;
     uint32_t                     revision;
-    uint32_t                     pad;
     efi_handle                   console_in_handle;
     struct efi_text_input       *con_in;
     efi_handle                   console_out_handle;
@@ -293,26 +309,29 @@ struct efi_system_table {
     void                        *configuration;
 };
 
-/* The offsets firmware actually writes these at. */
+/* The offsets firmware actually writes these at: a pointer's width apart,
+   every one of them. */
+#define EFI_W (sizeof(void *))
 _Static_assert(sizeof(struct efi_table_header) == 24, "EFI_TABLE_HEADER");
-_Static_assert(__builtin_offsetof(struct efi_system_table, con_in) == 48, "ConIn");
-_Static_assert(__builtin_offsetof(struct efi_system_table, con_out) == 64, "ConOut");
-_Static_assert(__builtin_offsetof(struct efi_system_table, runtime) == 88, "RuntimeServices");
-_Static_assert(__builtin_offsetof(struct efi_system_table, boot) == 96, "BootServices");
-_Static_assert(__builtin_offsetof(struct efi_boot_services, allocate_pages) == 40, "AllocatePages");
-_Static_assert(__builtin_offsetof(struct efi_boot_services, get_memory_map) == 56, "GetMemoryMap");
-_Static_assert(__builtin_offsetof(struct efi_boot_services, handle_protocol) == 152, "HandleProtocol");
-_Static_assert(__builtin_offsetof(struct efi_boot_services, stall) == 248, "Stall");
-_Static_assert(__builtin_offsetof(struct efi_boot_services, set_watchdog_timer) == 256, "SetWatchdogTimer");
-_Static_assert(__builtin_offsetof(struct efi_boot_services, connect_controller) == 264, "ConnectController");
-_Static_assert(__builtin_offsetof(struct efi_boot_services, locate_handle_buffer) == 312, "LocateHandleBuffer");
-_Static_assert(__builtin_offsetof(struct efi_boot_services, locate_protocol) == 320, "LocateProtocol");
+_Static_assert(__builtin_offsetof(struct efi_system_table, con_in) == 24 + 3 * EFI_W, "ConIn");
+_Static_assert(__builtin_offsetof(struct efi_system_table, con_out) == 24 + 5 * EFI_W, "ConOut");
+_Static_assert(__builtin_offsetof(struct efi_system_table, runtime) == 24 + 8 * EFI_W, "RuntimeServices");
+_Static_assert(__builtin_offsetof(struct efi_system_table, boot) == 24 + 9 * EFI_W, "BootServices");
+_Static_assert(__builtin_offsetof(struct efi_boot_services, allocate_pages) == 24 + 2 * EFI_W, "AllocatePages");
+_Static_assert(__builtin_offsetof(struct efi_boot_services, get_memory_map) == 24 + 4 * EFI_W, "GetMemoryMap");
+_Static_assert(__builtin_offsetof(struct efi_boot_services, handle_protocol) == 24 + 16 * EFI_W, "HandleProtocol");
+_Static_assert(__builtin_offsetof(struct efi_boot_services, stall) == 24 + 28 * EFI_W, "Stall");
+_Static_assert(__builtin_offsetof(struct efi_boot_services, set_watchdog_timer) == 24 + 29 * EFI_W, "SetWatchdogTimer");
+_Static_assert(__builtin_offsetof(struct efi_boot_services, connect_controller) == 24 + 30 * EFI_W, "ConnectController");
+_Static_assert(__builtin_offsetof(struct efi_boot_services, locate_handle_buffer) == 24 + 36 * EFI_W, "LocateHandleBuffer");
+_Static_assert(__builtin_offsetof(struct efi_boot_services, locate_protocol) == 24 + 37 * EFI_W, "LocateProtocol");
 _Static_assert(__builtin_offsetof(struct efi_runtime_services, get_time) == 24, "GetTime");
-_Static_assert(__builtin_offsetof(struct efi_runtime_services, reset_system) == 104, "ResetSystem");
-_Static_assert(__builtin_offsetof(struct efi_gop, mode) == 24, "GOP Mode");
-_Static_assert(__builtin_offsetof(struct efi_gop_mode, framebuffer) == 24, "FrameBufferBase");
+_Static_assert(__builtin_offsetof(struct efi_runtime_services, reset_system) == 24 + 10 * EFI_W, "ResetSystem");
+_Static_assert(__builtin_offsetof(struct efi_gop, mode) == 3 * EFI_W, "GOP Mode");
+_Static_assert(__builtin_offsetof(struct efi_gop_mode, framebuffer) == (EFI_W == 8 ? 24 : 16), "FrameBufferBase");
 _Static_assert(__builtin_offsetof(struct efi_gop_info, pixels_per_scanline) == 32, "PixelsPerScanLine");
 _Static_assert(__builtin_offsetof(struct efi_block_media, last_block) == 24, "LastBlock");
-_Static_assert(__builtin_offsetof(struct efi_block_io, read_blocks) == 24, "ReadBlocks");
-_Static_assert(__builtin_offsetof(struct efi_loaded_image, device) == 24, "DeviceHandle");
-_Static_assert(__builtin_offsetof(struct efi_file, read) == 32, "File Read");
+_Static_assert(__builtin_offsetof(struct efi_block_io, read_blocks) == 8 + 2 * EFI_W, "ReadBlocks");
+_Static_assert(__builtin_offsetof(struct efi_loaded_image, device) == 3 * EFI_W, "DeviceHandle");
+_Static_assert(__builtin_offsetof(struct efi_file, read) == 8 + 3 * EFI_W, "File Read");
+_Static_assert(__builtin_offsetof(struct efi_memory_descriptor, pages) == 24, "NumberOfPages");

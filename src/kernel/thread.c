@@ -1,4 +1,5 @@
 #include "thread.h"
+#include "ia32.h"
 
 #include <stddef.h>
 
@@ -6,8 +7,6 @@
 #include "string.h"
 #include "vga.h"
 
-#define MSR_FS_BASE   0xC0000100
-#define MSR_GS_BASE   0xC0000101    /* a program's too: the kernel never uses GS */
 #define THREADS       512           /* at once, over every process: a browser has hundreds */
 #define STACK_PAGES   (THREAD_STACK_BYTES / 4096)  /* a thread's kernel stack, with the
                                        thread itself at the bottom of it */
@@ -38,12 +37,20 @@ struct thread {
     uint8_t  fpu[512] __attribute__((aligned(16)));
 };
 
+#ifdef __i386__
+#define FXSAVE  "fxsave %0"
+#define FXRSTOR "fxrstor %0"
+#else
+#define FXSAVE  "fxsave64 %0"
+#define FXRSTOR "fxrstor64 %0"
+#endif
+
 static void fpu_save(struct thread *t) {
-    __asm__ volatile("fxsave64 %0" : "=m"(t->fpu));
+    __asm__ volatile(FXSAVE : "=m"(t->fpu));
 }
 
 static void fpu_load(const struct thread *t) {
-    __asm__ volatile("fxrstor64 %0" : : "m"(t->fpu));
+    __asm__ volatile(FXRSTOR : : "m"(t->fpu));
 }
 
 extern uint8_t tss[];
@@ -60,25 +67,23 @@ void process_switch(void *from, void *to);
 void process_finished(int code);
 int  process_pid(void *proc);
 
+/* What thread_switch keeps on a stack: the registers C keeps across a
+   call - RBX, RBP and R12-R15, or on i386 EBX, ESI, EDI and EBP. */
+#ifdef __i386__
+#define SWITCH_SAVES 4
+#else
+#define SWITCH_SAVES 6
+#endif
+
 static struct thread first = { .bottom = (uint8_t *)stack_bottom, .tid = 1 };
 static struct thread *all[THREADS] = { &first };
 static struct thread *current = &first;
 static int next_tid = 2;            /* pids and tids alike: one counter, no clash */
 
-static uint64_t rdmsr(uint32_t msr) {
-    uint32_t low, high;
-
-    __asm__ volatile("rdmsr" : "=a"(low), "=d"(high) : "c"(msr));
-    return (uint64_t)high << 32 | low;
-}
-
-static void wrmsr(uint32_t msr, uint64_t value) {
-    __asm__ volatile("wrmsr" : : "c"(msr), "a"((uint32_t)value), "d"((uint32_t)(value >> 32)));
-}
-
-/* The TSS's RSP0: where a syscall or an exception from ring 3 lands. */
-static uint64_t *kernel_rsp(void) {
-    return (uint64_t *)(tss + 4);
+/* The TSS's stack pointer for ring 0 - RSP0, or ESP0 on i386, beside
+   which is SS0: a word of the processor's width. */
+static uintptr_t *kernel_rsp(void) {
+    return (uintptr_t *)(tss + 4);
 }
 
 /* Threads ended whose stacks are not given back yet. reap runs at every
@@ -122,7 +127,7 @@ static void reap(void) {
     for (unsigned i = 1; dead_count > 0 && i < THREADS; i++) {
         if (all[i] != NULL && all[i]->dead && all[i] != current) {
             deepest = depth(all[i]) > deepest ? depth(all[i]) : deepest;
-            mem_pages_free((uint64_t)all[i], STACK_PAGES);   /* it is at the base */
+            mem_pages_free((uint64_t)(uintptr_t)all[i], STACK_PAGES);   /* it is at the base */
             all[i] = NULL;
             dead_count--;
         }
@@ -146,8 +151,8 @@ static void switch_to(struct thread *next) {
         }
     }
 
-    prev->fs_base = rdmsr(MSR_FS_BASE);
-    prev->gs_base = rdmsr(MSR_GS_BASE);
+    prev->fs_base = tls_fs();
+    prev->gs_base = tls_gs();
     prev->kernel_rsp = *kernel_rsp();
     prev->frame = user_frame;
     memcpy(prev->args, syscall_args(), sizeof prev->args);
@@ -155,9 +160,9 @@ static void switch_to(struct thread *next) {
         process_switch(prev->proc, next->proc);
     }
     current = next;
-    wrmsr(MSR_FS_BASE, next->fs_base);
-    wrmsr(MSR_GS_BASE, next->gs_base);
-    *kernel_rsp() = next->kernel_rsp;
+    tls_fs_set(next->fs_base);
+    tls_gs_set(next->gs_base);      /* and what a 32-bit thread loading GS gets */
+    *kernel_rsp() = (uintptr_t)next->kernel_rsp;
     user_frame = next->frame;
     memcpy(syscall_args(), next->args, sizeof next->args);
     fpu_save(prev);
@@ -307,26 +312,26 @@ static struct thread *thread_new(void *proc, bool leader, const struct user_regs
         return NULL;
     }
     struct thread *t = (struct thread *)base;
-    uint64_t *sp;
+    uintptr_t *sp;
 
     memset(t, 0, THREAD_STACK_BYTES);
     *(uint64_t *)(t + 1) = CANARY;
 
     *t = (struct thread){
         .bottom = (uint8_t *)(t + 1), .proc = proc, .leader = leader, .tid = next_tid++,
-        .slot = slot, .sigmask = sigmask, .fs_base = fs, .gs_base = rdmsr(MSR_GS_BASE),
+        .slot = slot, .sigmask = sigmask, .fs_base = fs, .gs_base = tls_gs(),
         /* Its syscalls land at the top of its own stack. */
         .kernel_rsp = base + STACK_PAGES * 4096 - 64,
         .regs = *regs,
     };
     t->regs.rsp = rsp;
     fpu_save(t);                    /* it starts with its creator's, as on Linux */
-    sp = (uint64_t *)(base + STACK_PAGES * 4096 - 64);
+    sp = (uintptr_t *)(base + STACK_PAGES * 4096 - 64);
     *--sp = 0;                      /* the entry's return address: none */
-    *--sp = (uint64_t)entry;        /* where thread_switch's ret goes */
-    sp -= 6;                        /* the six registers it pops */
-    memset(sp, 0, 6 * 8);
-    t->ksp = (uint64_t)sp;
+    *--sp = (uintptr_t)entry;       /* where thread_switch's ret goes */
+    sp -= SWITCH_SAVES;             /* the registers it pops */
+    memset(sp, 0, SWITCH_SAVES * sizeof *sp);
+    t->ksp = (uint64_t)(uintptr_t)sp;
     all[slot] = t;
     return t;
 }

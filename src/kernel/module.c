@@ -17,6 +17,7 @@
 #include "syscall.h"
 #include "thread.h"
 #include "usb.h"
+#include "ia32.h"
 #include "vga.h"
 
 #define MODULES  12
@@ -131,13 +132,52 @@ static const struct {
     X(vga_pixel_height), X(vga_pixel_width), X(vga_width), X(write_name),
     X(input_report), X(input_ready), X(input_keys), X(input_clock), X(console_keys),
     X(graphics_take), X(thread_id), X(proc_fd_target), X(proc_fd_folder), X(process_creds), X(fd_truncate), X(proc_task_links), X(fs_cwd), X(fd_cloexec), X(files_register), X(file_ops), X(signal_pgrp), X(process_ids), X(ops_named), X(buffer_open), X(pipe_data), X(unix_register), X(pair_new), X(pair_send), X(pair_recv), X(handle_share), X(pair_flags), X(pair_sender), X(handle_close), X(fd_read), X(fd_write), X(sock_ready), X(tty_foreground), X(tty_set_foreground), X(vga_screen), X(vga_lend), X(vga_lent), X(tick_register), X(mem_map_io),
+    X(syscall_run), X(ia32_register), X(tls_descriptor), X(thread_sigmask), X(tls_gs), X(tls_gs_set),
 #ifdef DEBUG
     X(dbg),
 #endif
 };
 
-/* ---- ELF, as much of it as a shared object needs ----------------------- */
+/* ---- ELF, as much of it as a shared object needs -----------------------
+ *
+ * ELF64 and x86-64's relocations; on i386, ELF32 and i386's - REL rather
+ * than RELA, the addend in the word being relocated. */
 
+#ifdef __i386__
+struct elf_header {
+    uint8_t  ident[16];
+    uint16_t type, machine;
+    uint32_t version, entry, phoff, shoff, flags;
+    uint16_t ehsize, phentsize, phnum, shentsize, shnum, shstrndx;
+};
+
+struct elf_program {
+    uint32_t type, offset, vaddr, paddr, filesz, memsz, flags, align;
+};
+
+struct elf_sym {
+    uint32_t name, value, size;
+    uint8_t  info, other;
+    uint16_t shndx;
+};
+
+struct elf_section {
+    uint32_t name, type, flags, addr, offset, size, link, info, addralign, entsize;
+};
+
+struct elf_rela {
+    uint32_t offset, info;
+};
+
+typedef uint32_t elf_word;          /* a word of the dynamic section, and of a relocated place */
+#define ELF_MACHINE 3
+#define R_SYM(info)  ((info) >> 8)
+#define R_TYPE(info) ((info) & 0xFF)
+#define DT_RELA     17              /* DT_REL, DT_RELSZ */
+#define DT_RELASZ   18
+#define SHT_RELA    9               /* SHT_REL */
+#define R_64        1               /* R_386_32 */
+#else
 struct elf_header {
     uint8_t  ident[16];
     uint16_t type, machine;
@@ -171,6 +211,16 @@ struct elf_rela {
     int64_t  addend;
 };
 
+typedef uint64_t elf_word;
+#define ELF_MACHINE 0x3E
+#define R_SYM(info)  ((uint32_t)((info) >> 32))
+#define R_TYPE(info) ((uint32_t)(info))
+#define DT_RELA     7
+#define DT_RELASZ   8
+#define SHT_RELA    4
+#define R_64        1
+#endif
+
 #define PT_LOAD     1
 #define PT_DYNAMIC  2
 #define DT_NULL     0
@@ -178,17 +228,13 @@ struct elf_rela {
 #define DT_HASH     4
 #define DT_STRTAB   5
 #define DT_SYMTAB   6
-#define DT_RELA     7
-#define DT_RELASZ   8
 #define DT_JMPREL   23
 #define SHF_ALLOC   2
 #define SHT_STRTAB  3
-#define SHT_RELA    4
 #define SHT_HASH    5
 #define SHT_DYNSYM  11
 #define SHT_GNU_HASH 0x6FFFFFF6
 #define R_NONE      0
-#define R_64        1
 #define R_GLOB_DAT  6
 #define R_JUMP_SLOT 7
 #define R_RELATIVE  8
@@ -245,7 +291,7 @@ static uint64_t resolve(const struct link *l, const struct module *m, const stru
     }
     for (unsigned i = 0; i < sizeof exports / sizeof exports[0]; i++) {
         if (strcmp(exports[i].name, name) == 0) {
-            return (uint64_t)exports[i].at;
+            return (uint64_t)(uintptr_t)exports[i].at;
         }
     }
     if ((s->info >> 4) != 2) {      /* a weak one may be missing */
@@ -261,19 +307,24 @@ static bool relocate(const struct link *l, struct module *m, uint64_t vaddr, uin
         return false;
     }
     for (; bytes >= sizeof *r; r++, bytes -= sizeof *r) {
-        uint64_t *at = (uint64_t *)(m->base + r->offset);
-        uint32_t type = (uint32_t)r->info, sym = (uint32_t)(r->info >> 32);
+        elf_word *at = (elf_word *)(m->base + r->offset);
+        uint32_t type = R_TYPE(r->info), sym = R_SYM(r->info);
         uint64_t value;
+#ifdef __i386__
+        elf_word addend = *at;      /* REL: in the word itself */
+#else
+        elf_word addend = (elf_word)r->addend;
+#endif
 
-        if (r->offset + m->base < m->image || r->offset + m->base + 8 > m->image + m->span ||
-            sym >= l->nsyms) {
+        if (r->offset + m->base < m->image ||
+            r->offset + m->base + sizeof *at > m->image + m->span || sym >= l->nsyms) {
             return false;
         }
         switch (type) {
         case R_NONE:
             break;
         case R_RELATIVE:
-            *at = m->base + (uint64_t)r->addend;
+            *at = (elf_word)m->base + addend;
             break;
         case R_64:
         case R_GLOB_DAT:
@@ -282,7 +333,7 @@ static bool relocate(const struct link *l, struct module *m, uint64_t vaddr, uin
             if (value == 0 && why[0] != '\0') {
                 return false;
             }
-            *at = value + (type == R_64 ? (uint64_t)r->addend : 0);
+            *at = (elf_word)value + (type == R_64 ? addend : 0);
             break;
         default:
             ksprintf(why, "relocation type %u", type);
@@ -392,14 +443,14 @@ static bool place(struct module *m, const uint8_t *file, uint32_t size, uint64_t
     static uint64_t tag[24];
     const struct elf_header *h = (const struct elf_header *)file;
     const struct elf_section *sec;
-    const uint64_t *dyn = NULL;
+    const elf_word *dyn = NULL;
     uint64_t lo = ~0ull, hi = 0;
 
     l = (struct link){ file, size, h, NULL, NULL, NULL, 0 };
     memset(tag, 0, sizeof tag);
 
     if (size < sizeof *h || h->ident[0] != 0x7F || h->ident[1] != 'E' || h->type != 3 ||
-        h->machine != 0x3E || h->phoff + (uint64_t)h->phnum * sizeof *l.p > size ||
+        h->machine != ELF_MACHINE || h->phoff + (uint64_t)h->phnum * sizeof *l.p > size ||
         h->shoff + (uint64_t)h->shnum * sizeof *sec > size) {
         strcpy(why, "not a module");
         return false;
@@ -412,7 +463,7 @@ static bool place(struct module *m, const uint8_t *file, uint32_t size, uint64_t
             return false;
         }
         if (l.p[i].type == PT_DYNAMIC) {
-            dyn = (const uint64_t *)(file + l.p[i].offset);
+            dyn = (const elf_word *)(file + l.p[i].offset);
         }
     }
     for (unsigned i = 0; i < h->shnum; i++) {
@@ -485,10 +536,16 @@ static void release(struct module *m) {
 }
 
 /* Where module name is: <dir>/<name>.kmod for the first folder of MODPATH
-   that has it, as /etc/tuxlet/env exports it. */
+   that has it, as /etc/tuxlet/env exports it - or, before anything has,
+   the modules' own folder: the 32-bit OS needs compat/ia32 for its very
+   first program, tsh, which is what runs the scripts. */
 static bool module_file(const char *name, char *out, size_t max) {
     const char *dirs = shell_env("MODPATH");
     struct fs_file file;
+
+    if (dirs == NULL) {
+        dirs = "/usr/lib/modules";
+    }
 
     while (dirs != NULL && *dirs != '\0') {
         const char *end = strchr(dirs, ':');
@@ -569,7 +626,12 @@ static bool unload(int slot) {
 }
 
 bool module_need(const char *name) {
-    return load(name);
+    bool ok = load(name);
+
+    if (!ok) {
+        dbg("module: %s: %s\n", name, why);
+    }
+    return ok;
 }
 
 void module_drop(const char *name) {

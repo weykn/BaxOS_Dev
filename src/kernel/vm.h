@@ -82,6 +82,10 @@ void vm_firmware_view(bool on);
    What programs have hung off the firmware's is carried across. */
 void vm_move(uint64_t *top, uint64_t *pd);
 
+/* Whether any program has a page other than this one at its address in
+   low memory - where the kernel reaching it would reach that one instead. */
+bool vm_low_shadowed(uint64_t page);
+
 /* Whether a program linked to a fixed address has had the first gigabyte's
    directory: then vm_move needs a pd to carry it to. */
 bool vm_low_used(void);
@@ -98,6 +102,16 @@ bool vm_holds(uint64_t addr, uint64_t size);
    what the page fault handler calls. A page that was write-protected for
    vm_undo_begin is copied aside here and made writable again. */
 bool vm_fault(uint64_t addr);
+
+/* The same for a fault the kernel took itself (user false), reaching into
+   low memory: where the page is not the program's to have, the machine's
+   own page is mapped for the kernel alone instead - its data, or the
+   firmware's, that the program's tables would otherwise hide. */
+bool vm_fault_as(uint64_t addr, bool user);
+
+/* Whether addr is in the running program's low memory and not yet a page
+   of its own: what user_range fills before the kernel reaches it. */
+bool vm_low_unfilled(uint64_t addr);
 
 /* Linux's PROT_* for the pages under addr .. addr + size, as mmap and
    mprotect ask: kept in the page entries, mapped or not yet, so a page
@@ -116,6 +130,11 @@ void vm_settle(uint64_t addr, uint64_t size);
 
 /* Whether the program could write to all of addr .. addr + size. */
 bool vm_writable(uint64_t addr, uint64_t size);
+
+/* Whether addr .. addr + size is in the running program's low memory,
+   where an address need not be the machine's: what a disk moves data
+   to or from there goes through the kernel's own pages. */
+bool vm_low_moved(uint64_t addr, uint64_t size);
 
 /* Maps addr .. addr + size now, zeroed, rounded out to whole pages. */
 bool vm_reserve(uint64_t addr, uint64_t size);

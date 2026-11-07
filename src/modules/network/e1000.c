@@ -78,7 +78,7 @@ static void send(const uint8_t *frame, size_t len) {
     uint64_t until = efi_uptime_ms() + 50;
 
     memcpy(tx_buf, frame, len);
-    d->addr = (uint64_t)tx_buf;
+    d->addr = (uint64_t)(uintptr_t)tx_buf;
     d->len = (uint16_t)len;
     d->cmd = 1 | 2 | 8;             /* end of packet, add the CRC, report */
     d->status = 0;
@@ -140,19 +140,19 @@ static bool start(void) {
     rx_buf = (uint8_t *)pages + 4096;
     rx_next = tx_next = 0;
     for (unsigned i = 0; i < RING; i++) {
-        rx[i] = (struct rx_desc){ .addr = (uint64_t)rx_buf + i * RX_SIZE };
+        rx[i] = (struct rx_desc){ .addr = (uint64_t)(uintptr_t)rx_buf + i * RX_SIZE };
         tx[i] = (struct tx_desc){ 0 };
     }
-    reg_set(RDBAL, (uint32_t)(uint64_t)rx);
-    reg_set(RDBAH, (uint32_t)((uint64_t)rx >> 32));
+    reg_set(RDBAL, (uint32_t)(uint64_t)(uintptr_t)rx);
+    reg_set(RDBAH, (uint32_t)((uint64_t)(uintptr_t)rx >> 32));
     reg_set(RDLEN, RING * sizeof *rx);
     reg_set(RDH, 0);
     reg_set(RDT, RING - 1);
     /* On, broadcasts too, 2 KiB buffers, the CRC left off. */
     reg_set(RCTL, 1u << 1 | 1u << 15 | 1u << 26);
 
-    reg_set(TDBAL, (uint32_t)(uint64_t)tx);
-    reg_set(TDBAH, (uint32_t)((uint64_t)tx >> 32));
+    reg_set(TDBAL, (uint32_t)(uint64_t)(uintptr_t)tx);
+    reg_set(TDBAH, (uint32_t)((uint64_t)(uintptr_t)tx >> 32));
     reg_set(TDLEN, RING * sizeof *tx);
     reg_set(TDH, 0);
     reg_set(TDT, 0);

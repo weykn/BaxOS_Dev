@@ -112,7 +112,7 @@ static size_t cap(size_t most) {
         if (st->lines[i].first != NONE) {
             unhook((unsigned)i);
         }
-        mem_pages_free((uint64_t)st->lines[i].data, LINE_PAGES);
+        mem_pages_free((uint64_t)(uintptr_t)st->lines[i].data, LINE_PAGES);
         st->lines[i].data = NULL;
         count--;
         given += LINE_BYTES;

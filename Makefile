@@ -1,4 +1,5 @@
-# Tuxlet OS - an x86-64 kernel, started by UEFI or by a PC BIOS.
+# Tuxlet OS - an x86-64 kernel, started by UEFI or by a PC BIOS. ARCH=i386
+# builds the same OS for a 32-bit PC instead: build/i386/TuxletOS-i386.img.
 #
 # The disk image is a GPT disk with three partitions: an EFI system
 # partition holding the UEFI loader, which carries the kernel inside it; a
@@ -14,7 +15,18 @@ NASM    := nasm
 OBJCOPY := objcopy
 EFIOBJCOPY := x86_64-w64-mingw32-objcopy
 
-BUILD := build
+# ARCH=i386: the same sources for a 32-bit processor - i686, with PAE - into
+# build/i386. -malign-double puts a 64-bit field where x86-64 has it, which
+# is what keeps the structures the kernel shares with its modules, its
+# loaders and UEFI the same; a pointer is a 64-bit number cut short there.
+ARCH ?= x86_64
+I386 := $(filter i386,$(ARCH))
+comma := ,
+BUILD := $(if $(I386),build/i386,build)
+# A program, which shares no structure with the kernel but through its
+# calls, is built with i386's own layout instead (M32U).
+M32   := $(if $(I386),-m32 -march=i686 -malign-double)
+M32U  := $(if $(I386),-m32 -march=i686)
 
 # -mgeneral-regs-only keeps GCC away from SSE, which would fault because
 # nothing has enabled it; -mno-red-zone is required for any kernel code.
@@ -30,8 +42,9 @@ BUILD := build
 # what it loaded spends longer on those traps than on the loading.
 
 CFLAGS := -Isrc/kernel $(if $(filter 1,$(DEBUG)),-DDEBUG) -std=gnu11 -Oz -flto -Wall -Wextra \
-          -ffreestanding -fno-builtin -nostdlib \
-          -fpie -mno-red-zone -mgeneral-regs-only \
+          -ffreestanding -fno-builtin -nostdlib $(M32) \
+          $(if $(I386),-Wno-int-to-pointer-cast -Wno-pointer-to-int-cast,-mno-red-zone) \
+          -fpie -mgeneral-regs-only \
           -fno-stack-protector -fno-asynchronous-unwind-tables \
           -fno-tree-loop-distribute-patterns \
           -ffunction-sections -fdata-sections
@@ -42,19 +55,27 @@ CFLAGS := -Isrc/kernel $(if $(filter 1,$(DEBUG)),-DDEBUG) -std=gnu11 -Oz -flto -
 # -z pack-relative-relocs: the relocations as RELR, a bitmap of where they
 # are, rather than 24 bytes apiece - a fortieth of the size, in an image
 # that has to hold them for good.
+# On i386, 64-bit division is libgcc's, and the assembly names addresses
+# outright: relocations in the code, which the kernel applies like the rest.
 LDFLAGS := -static-pie \
            -Wl,-n,--no-warn-rwx-segments,--gc-sections,--build-id=none,-T,src/kernel/kernel.ld \
-           -Wl,-z,pack-relative-relocs
+           -Wl,-z,pack-relative-relocs $(if $(I386),-Wl$(comma)-z$(comma)notext)
+KLIBS   := $(if $(I386),-lgcc)
 
 # The loader is built by a compiler that emits PE and speaks the calling
 # convention UEFI uses; subsystem 10 is what makes firmware accept the file.
+# For a 32-bit firmware, BOOTIA32.EFI: the same loader, by a 32-bit compiler.
+ifneq ($(I386),)
+EFICC      := i686-w64-mingw32-gcc
+EFIOBJCOPY := i686-w64-mingw32-objcopy
+endif
 EFIFLAGS := -std=gnu11 -Oz -Wall -Wextra -ffreestanding -fno-builtin -nostdlib \
-            -fno-stack-protector -mno-red-zone -fshort-wchar \
-            -e efi_main -Wl,--subsystem,10
+            -fno-stack-protector -fshort-wchar \
+            $(if $(I386),-march=i686 -e _efi_main,-mno-red-zone -e efi_main) -Wl,--subsystem,10
 
 # legacy/ holds the drivers the BIOS path used, and is not built; see the
 # README there.
-KSRCS := $(shell find src/kernel -name '*.c')
+KSRCS := $(shell find src/kernel -maxdepth 1 -name '*.c')
 
 # Kernel modules, Tuxlet's own format rather than Linux's: src/modules/
 # <category>/<name>.c - or every .c in the folder <category>/<name>/ -
@@ -72,41 +93,48 @@ MCFLAGS  := $(filter-out -flto -fpie,$(CFLAGS)) -fPIC -fvisibility=hidden -fno-p
             -fcf-protection=none
 # Its segments are packed rather than page-aligned: nothing maps a module,
 # it is copied into RAM whole, and the alignment was most of what one cost.
-MLDFLAGS := -shared -nostdlib -s \
+MLDFLAGS := -shared -nostdlib -s $(M32) \
             -Wl,--hash-style=sysv,-z,noseparate-code,--gc-sections,--build-id=none \
             -Wl,-z,max-page-size=16,-z,common-page-size=16,-z,norelro
+MLIBS    := $(if $(I386),-lgcc)
 # The package manager, src/tuxpac, is /usr/bin/tuxpac on the disk: a
 # program like any other, but built here with the kernel - a static PIE,
 # freestanding and alone, there being no libc on the disk to link against.
 TUXPAC   := $(BUILD)/tuxpac
-PCFLAGS  := -std=gnu11 -Oz -Wall -Wextra -ffreestanding -fno-builtin -nostdlib -static-pie \
+PCFLAGS  := -std=gnu11 -Oz -Wall -Wextra -ffreestanding -fno-builtin -nostdlib -static-pie $(M32U) \
             -fpie -fno-stack-protector -fno-asynchronous-unwind-tables \
             -ffunction-sections -fdata-sections -fcf-protection=none -Wa,-mx86-used-note=no \
             -Wl,--gc-sections,--build-id=none,-z,noexecstack,-z,noseparate-code,-z,norelro -s
 
 # tsh and tuxlet-coreutils (ls, cat, cp, ...) are /usr/bin on the disk,
-# built here too, as TEF64: a header saying how much memory the program
+# built here too, as TEF: a header saying how much memory the program
 # needs, then its bytes, loaded where position-independent programs go and never
-# relocated - src/tcr/tef64.ld writes the header and refuses to link a program
+# relocated - src/tcr/tef.ld writes the header and refuses to link a program
 # that would need relocating. src/tcr/tcr.c, TCR, is their C runtime.
+# TEF_BITS=32 builds them as 32-bit programs instead, as ARCH=i386 does.
+TEF_BITS ?= $(if $(I386),32,64)
 TEFFLAGS := -std=gnu11 -Oz -Wall -Wextra -Isrc/tcr -ffreestanding -fno-builtin -nostdlib \
-            -fpie -fvisibility=hidden -mno-red-zone -fno-stack-protector \
+            -fpie -fvisibility=hidden -fno-stack-protector \
             -fno-asynchronous-unwind-tables -ffunction-sections -fdata-sections \
             -fcf-protection=none -Wa,-mx86-used-note=no -static-pie \
             -Wl,--no-dynamic-linker,--no-warn-rwx-segments,--gc-sections,--build-id=none,-z,norelro,-z,noexecstack \
-            -Wl,-T,src/tcr/tef64.ld
+            $(if $(filter 32,$(TEF_BITS)),-m32 -march=i686 -Wl$(comma)--defsym=TEF_CLASS=1,-mno-red-zone -Wl$(comma)--defsym=TEF_CLASS=2) \
+            -Wl,-T,src/tcr/tef.ld
 TSH       := $(BUILD)/tsh
 COREUTILS := $(patsubst src/coreutils/%.c,$(BUILD)/coreutils/%,$(wildcard src/coreutils/*.c))
-TEF_DEPS  := src/tcr/tcr.c src/tcr/tcr.h src/tcr/tef64.ld Makefile
+TEF_DEPS  := src/tcr/tcr.c src/tcr/tcr.h src/tcr/tef.ld Makefile $(BUILD)/tef_bits
 tef_link   = @mkdir -p $(@D) && $(CC) $(TEFFLAGS) $< src/tcr/tcr.c -o $@.elf && \
-             $(OBJCOPY) -O binary $@.elf $@ && rm -f $@.elf && echo "TEF64 $@: $$(stat -c %s $@) bytes"
+             $(OBJCOPY) -O binary $@.elf $@ && rm -f $@.elf && echo "TEF $@: $$(stat -c %s $@) bytes"
 
-KASMS := $(shell find src/kernel -name '*.asm' ! -name start.asm)
+# The assembly is each processor's own: src/kernel/i386 holds the 32-bit
+# counterparts of the files beside it.
+KASM_DIR := src/kernel$(if $(I386),/i386)
+KASMS := $(shell find $(KASM_DIR) -maxdepth 1 -name '*.asm' ! -name start.asm)
 KOBJS := $(KSRCS:src/%.c=$(BUILD)/%.o) $(KASMS:src/%.asm=$(BUILD)/%.o)
 
 # start.o must link first: its _start has to sit at the front of the binary,
 # because that is the address the loader jumps to.
-START_OBJ := $(BUILD)/kernel/start.o
+START_OBJ := $(BUILD)/$(KASM_DIR:src/%=%)/start.o
 
 # Everything under src/disk goes onto the disk exactly as it is, keeping the
 # folders it sits in - the folders themselves included, so that one with
@@ -118,11 +146,11 @@ DISK_FILES := $(shell find $(DISK_ROOT) -mindepth 1 \( -type f -o -type d -o -ty
 KERNEL_ELF := $(BUILD)/kernel.elf
 KERNEL_BIN := $(BUILD)/kernel.bin
 KERNEL_OBJ := $(BUILD)/kernel_blob.o
-LOADER     := $(BUILD)/BOOTX64.EFI
+LOADER     := $(BUILD)/$(if $(I386),BOOTIA32,BOOTX64).EFI
 BIOS_LOADER := $(BUILD)/boot/bios.bin
 MKFS       := $(BUILD)/mkfs
 FS_IMG     := $(BUILD)/fs.img
-IMAGE      := $(BUILD)/TuxletOS.img
+IMAGE      := $(BUILD)/TuxletOS$(if $(I386),-i386).img
 
 # The disk is as big as what is on it: the filesystem holds the kernel, the
 # modules and src/disk, plus FREE for files saved from inside Tuxlet (any
@@ -144,6 +172,10 @@ $(shell mkdir -p $(BUILD); \
         [ "$$(cat $(FLAGS_FILE) 2>/dev/null)" = "$(CFLAGS)" ] || \
         printf '%s' "$(CFLAGS)" > $(FLAGS_FILE))
 
+# And what TEF programs were built as.
+$(shell [ "$$(cat $(BUILD)/tef_bits 2>/dev/null)" = "$(TEF_BITS)" ] || \
+        printf '%s' "$(TEF_BITS)" > $(BUILD)/tef_bits)
+
 # And what the disk was sized with: a different FREE or src/disk resizes it.
 SIZE_FILE := $(BUILD)/size
 $(shell [ "$$(cat $(SIZE_FILE) 2>/dev/null)" = "$(FREE) $(DISK_ROOT)" ] || \
@@ -155,7 +187,7 @@ $(BUILD)/%.o: src/%.c $(FLAGS_FILE)
 
 $(BUILD)/%.o: src/%.asm $(FLAGS_FILE)
 	@mkdir -p $(@D)
-	$(NASM) -f elf64 $< -o $@
+	$(NASM) -f $(if $(I386),elf32,elf64) $< -o $@
 
 $(BUILD)/modules/%.o: src/modules/%.c $(FLAGS_FILE)
 	@mkdir -p $(@D)
@@ -166,11 +198,11 @@ mod_objs = $(patsubst src/%.c,$(BUILD)/%.o,$(wildcard src/modules/$(1).c src/mod
 
 .SECONDEXPANSION:
 $(BUILD)/modules/%.kmod: $$(call mod_objs,$$*)
-	$(CC) $(MLDFLAGS) $^ -o $@
+	$(CC) $(MLDFLAGS) $^ $(MLIBS) -o $@
 
 $(TUXPAC): $(wildcard src/tuxpac/*.c src/tuxpac/*.h) Makefile
 	@mkdir -p $(@D)
-	$(CC) $(PCFLAGS) $(filter %.c,$^) -o $@
+	$(CC) $(PCFLAGS) $(filter %.c,$^) $(if $(I386),-lgcc) -o $@
 
 $(TSH): src/tsh/tsh.c $(TEF_DEPS)
 	$(tef_link)
@@ -179,7 +211,7 @@ $(BUILD)/coreutils/%: src/coreutils/%.c $(TEF_DEPS)
 	$(tef_link)
 
 $(KERNEL_ELF): $(START_OBJ) $(KOBJS) src/kernel/kernel.ld
-	$(CC) $(CFLAGS) $(LDFLAGS) $(START_OBJ) $(KOBJS) -o $@
+	$(CC) $(CFLAGS) $(LDFLAGS) $(START_OBJ) $(KOBJS) $(KLIBS) -o $@
 
 $(KERNEL_BIN): $(KERNEL_ELF)
 	$(OBJCOPY) -O binary $< $@
@@ -187,9 +219,9 @@ $(KERNEL_BIN): $(KERNEL_ELF)
 # The kernel goes inside the loader, so the boot partition holds one file and
 # the loader needs no filesystem code to find it.
 $(KERNEL_OBJ): $(KERNEL_BIN)
-	cd $(BUILD) && $(EFIOBJCOPY) -I binary -O pe-x86-64 -B i386:x86-64 \
-	    --redefine-sym _binary_kernel_bin_start=kernel_start \
-	    --redefine-sym _binary_kernel_bin_end=kernel_end \
+	cd $(BUILD) && $(EFIOBJCOPY) -I binary $(if $(I386),-O pe-i386 -B i386,-O pe-x86-64 -B i386:x86-64) \
+	    --redefine-sym _binary_kernel_bin_start=$(if $(I386),_)kernel_start \
+	    --redefine-sym _binary_kernel_bin_end=$(if $(I386),_)kernel_end \
 	    kernel.bin kernel_blob.o
 
 $(LOADER): src/boot/uefi.c $(KERNEL_OBJ) src/kernel/boot.h src/kernel/efi.h
@@ -198,7 +230,7 @@ $(LOADER): src/boot/uefi.c $(KERNEL_OBJ) src/kernel/boot.h src/kernel/efi.h
 # The BIOS loader, with the kernel at its end (bios.asm's incbin).
 $(BIOS_LOADER): src/boot/bios.asm $(KERNEL_BIN)
 	@mkdir -p $(@D)
-	$(NASM) -f bin -DKERNEL_BIN='"$(KERNEL_BIN)"' $< -o $@
+	$(NASM) -f bin $(if $(I386),-DI386) -DKERNEL_BIN='"$(KERNEL_BIN)"' $< -o $@
 
 # mkfs runs on the host but is built from the kernel's own fs.c. -iquote keeps
 # the kernel's string.h from shadowing libc's.
@@ -236,7 +268,7 @@ $(IMAGE): $(LOADER) $(BIOS_LOADER) src/boot/mbr.asm $(FS_IMG)
 	        -n 2:$$at:+$$fs -t 2:8300 -c 2:"Tuxlet OS" $@ > /dev/null && \
 	 mformat -i $@@@34s -T $$esp -v TUXLET :: && \
 	 mmd -i $@@@34s ::/EFI ::/EFI/BOOT && \
-	 mcopy -i $@@@34s $(LOADER) ::/EFI/BOOT/BOOTX64.EFI && \
+	 mcopy -i $@@@34s $(LOADER) ::/EFI/BOOT/$(notdir $(LOADER)) && \
 	 dd if=$(BIOS_LOADER) of=$@ bs=512 seek=$$bat conv=notrunc status=none && \
 	 $(NASM) -f bin -DBLOB_LBA=$$bat -DBLOB_SECTORS=$$bios src/boot/mbr.asm \
 	         -o $(BUILD)/boot/mbr.bin && \
@@ -248,13 +280,14 @@ $(IMAGE): $(LOADER) $(BIOS_LOADER) src/boot/mbr.asm $(FS_IMG)
 
 # OVMF stands in for a real machine's firmware. The variables file is copied
 # so that boot entries written by the firmware do not dirty the system's.
-OVMF_CODE := /usr/share/edk2/x64/OVMF_CODE.4m.fd
-OVMF_VARS := /usr/share/edk2/x64/OVMF_VARS.4m.fd
+OVMF_CODE := /usr/share/edk2/$(if $(I386),ia32/OVMF_CODE.fd,x64/OVMF_CODE.4m.fd)
+OVMF_VARS := /usr/share/edk2/$(if $(I386),ia32/OVMF_VARS.fd,x64/OVMF_VARS.4m.fd)
 
 # Hardware virtualisation where the machine has it. Without it QEMU interprets
 # every instruction, and a program built for Linux spends most of its startup
 # being interpreted rather than run: the same command takes five times as long.
-ACCEL := $(shell test -w /dev/kvm && echo "-enable-kvm -cpu host")
+# A 32-bit build runs on a 32-bit processor, without long mode to fall back on.
+ACCEL := $(shell test -w /dev/kvm && echo "-enable-kvm") $(if $(I386),-cpu pentium3,$(shell test -w /dev/kvm && echo "-cpu host"))
 
 # make run MEM=<size> NET=<card>: the machine's RAM, as QEMU takes it (39M,
 # 1G), and its network card - e1000, rtl8139, virtio, the ones there are
@@ -268,7 +301,6 @@ NET ?= none
 NET_DEVICE = $(if $(filter virtio,$(NET)),virtio-net-pci,$(NET))
 NIC = $(if $(filter none,$(NET)),-nic none,-netdev user$(comma)id=n0 \
       -device $(NET_DEVICE)$(comma)netdev=n0$(comma)romfile=)
-comma := ,
 
 # make run BOOT=bios: started by SeaBIOS instead of OVMF - the same image.
 BOOT ?= uefi
@@ -277,7 +309,7 @@ FIRMWARE = $(if $(filter bios,$(BOOT)),,-drive if=pflash$(comma)format=raw$(comm
 
 run: $(IMAGE)
 	@cp -n $(OVMF_VARS) $(BUILD)/ovmf_vars.fd 2>/dev/null || true
-	qemu-system-x86_64 $(ACCEL) $(FIRMWARE) \
+	qemu-system-$(if $(I386),i386,x86_64) $(ACCEL) $(FIRMWARE) \
 	    -drive format=raw,file=$(IMAGE) $(NIC) -m $(MEM) -device qemu-xhci -device usb-tablet
 
 clean:

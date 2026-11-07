@@ -430,6 +430,13 @@ static void cpu_flags(char *p) {
     strcpy(p, "\n");
 }
 
+/* What /proc/cpuinfo says the addresses are: PAE's on i386. */
+#ifdef __i386__
+#define ADDRESS_SIZES "36 bits physical, 32 bits virtual"
+#else
+#define ADDRESS_SIZES "39 bits physical, 48 bits virtual"
+#endif
+
 size_t proc_linux(const char *path, char *out, size_t max) {
     static const char *const names[] = {
         "/proc/uptime", "/proc/meminfo", "/proc/cpuinfo",
@@ -486,7 +493,7 @@ size_t proc_linux(const char *path, char *out, size_t max) {
         p += strlen(p);
         cpu_flags(p);
         p += strlen(p);
-        ksprintf(p, "bogomips\t: %u.00\naddress sizes\t: 39 bits physical, 48 bits virtual\n\n",
+        ksprintf(p, "bogomips\t: %u.00\naddress sizes\t: " ADDRESS_SIZES "\n\n",
                  (unsigned)(efi_tsc_hz() / 500000));
         p = text;
     } else if (which == 6 || which == 7 || which == 16) {

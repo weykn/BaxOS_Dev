@@ -881,7 +881,7 @@ void fs_cache(bool slow) {
         return;
     }
     if (recent != small) {
-        mem_pages_free((uint64_t)recent, 1);
+        mem_pages_free((uint64_t)(uintptr_t)recent, 1);
     }
     recent = slow ? page : small;
     slots = slow ? RECENT_MAX : RECENT;

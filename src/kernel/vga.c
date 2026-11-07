@@ -306,13 +306,13 @@ static bool parse_size(const char *s, unsigned *w, unsigned *h) {
 }
 
 uint64_t vga_framebuffer_end(void) {
-    return (uint64_t)fb + (uint64_t)fb_pitch * real_h * 4;
+    return (uint64_t)(uintptr_t)fb + (uint64_t)fb_pitch * real_h * 4;
 }
 
 static void repaint(void);
 
 void vga_screen(struct vga_screen *out) {
-    *out = (struct vga_screen){ (uint64_t)fb, real_w, real_h, fb_pitch, red_first };
+    *out = (struct vga_screen){ (uint64_t)(uintptr_t)fb, real_w, real_h, fb_pitch, red_first };
 }
 
 bool vga_lent(void) {
@@ -1333,7 +1333,7 @@ static void format(const char *fmt, va_list args) {
         if (*fmt != '%') {
             out(*fmt);
         } else if (*++fmt == 's') {
-            for (const char *s = va_arg(args, const char *); *s != '\0'; s++) {
+            for (const char *s = (const char *)(uintptr_t)va_arg(args, uint64_t); *s != '\0'; s++) {
                 out(*s);
             }
         } else if (*fmt == 'x') {
@@ -1344,12 +1344,12 @@ static void format(const char *fmt, va_list args) {
                 pad = (size_t)(fmt[1] - '0');
                 fmt += 2;
             }
-            put_uint(va_arg(args, unsigned), pad);
+            put_uint((unsigned)va_arg(args, uint64_t), pad);
         }
     }
 }
 
-void kprintf(const char *fmt, ...) {
+void (kprintf)(const char *fmt, ...) {
     va_list args;
 
     va_start(args, fmt);
@@ -1357,7 +1357,7 @@ void kprintf(const char *fmt, ...) {
     va_end(args);
 }
 
-void ksprintf(char *buf, const char *fmt, ...) {
+void (ksprintf)(char *buf, const char *fmt, ...) {
     va_list args;
 
     out_buf = buf;

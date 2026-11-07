@@ -6,8 +6,20 @@
 
 #include "sys.h"
 
-/* /usr/bin/tuxpac: Debian packages, from the mirrors in /etc/tuxlet/mirror.
+/* /usr/bin/tuxpac: Debian and Alpine packages, from the mirrors in
+ * /etc/tuxlet/<prio>.<backend>.mirror.
  * A program like any other, built with the kernel and put on the disk. */
+
+/* The packages that suit the machine: built for the 32-bit OS, i386's. */
+#ifdef __i386__
+#define DEB_ARCH   "i386"
+#define APK_ARCH   "x86"
+#define LIB_TRIPLE "i386-linux-gnu"
+#else
+#define DEB_ARCH   "amd64"
+#define APK_ARCH   "x86_64"
+#define LIB_TRIPLE "x86_64-linux-gnu"
+#endif
 
 /* Where a decoder's input comes from: a buffer that fill refills - from a
    stretch of a file, or a socket. A read past the end gives zeroes

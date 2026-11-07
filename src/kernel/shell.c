@@ -10,7 +10,7 @@
 
 /* Bringing the machine up: the shell, which brings up the rest.
  *
- * The shell is tsh, /usr/bin/tsh - a TEF64 program of under three
+ * The shell is tsh, /usr/bin/tsh - a TEF program of under three
  * kilobytes, src/tsh. The kernel starts it as -tsh, the login shell, handing
  * it /etc/tuxlet/boot the first time: the machine itself - the modules, the
  * size of the screen, the environment - as a script. Then it runs

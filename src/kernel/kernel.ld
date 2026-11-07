@@ -24,12 +24,15 @@ SECTIONS
        image because the kernel is its own loader. Only the relocations are
        read; the rest is the linker's paperwork. */
     .dynamic : { *(.dynamic) }
-    .rela   : {
+    /* Named for neither RELA nor REL - i386's are REL - so that each keeps
+       the type of what is in it. */
+    .relocs : {
         __rela_start = .;
         *(.rela*)
+        *(.rel.*)               /* a 32-bit kernel's, without addends */
         __rela_end = .;
     }
-    .relr   : {
+    .packed : {
         __relr_start = .;
         *(.relr*)
         __relr_end = .;
@@ -52,7 +55,7 @@ SECTIONS
     __bss_end = .;
 
     /* KERNEL_BYTES in boot.h: all of it has to fit what the loader takes. */
-    ASSERT(__bss_end <= 0x28000, "the kernel outgrew KERNEL_BYTES")
+    ASSERT(__bss_end <= 0x30000, "the kernel outgrew KERNEL_BYTES")
 
     /DISCARD/ : {
         *(.comment)

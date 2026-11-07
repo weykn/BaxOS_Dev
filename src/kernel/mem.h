@@ -31,6 +31,10 @@ void  mem_free(void *memory);
    give memory for them; top is the highest address there is to map. */
 bool mem_own_tables(uint64_t top);
 
+/* i386 under UEFI: those tables built and paging turned on with them at
+   once, the firmware still running. False if there was no memory. */
+bool mem_paging_on(void);
+
 /* Takes the free memory in the firmware's final memory map for the kernel's
    own - the map got just before ExitBootServices succeeded - except the
    interrupt table, after moving onto the tables mem_own_tables built. */
@@ -62,6 +66,15 @@ bool mem_take_page(uint64_t page);
 /* Whether the page is low memory the firmware keeps for good - its runtime
    services', ACPI's, or reserved - rather than anyone's in use. */
 bool mem_firmware_kept(uint64_t page);
+
+/* Whether page is past every bit of memory the machine has: nothing's. */
+bool mem_beyond_ram(uint64_t page);
+
+/* Whether a page in low memory that cannot be taken is the running
+   firmware's, which only runs in calls that put its own view back: on
+   i386, where the kernel takes none of its own there until the firmware
+   is gone. */
+bool mem_firmware_has(uint64_t page);
 void mem_give_page(uint64_t page);
 
 /* RAM free right now, in KiB. */

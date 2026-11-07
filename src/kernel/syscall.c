@@ -19,6 +19,7 @@
 #include "input.h"
 #include "module.h"
 #include "shell.h"
+#include "ia32.h"
 
 #define MSR_EFER  0xC0000080
 #define MSR_STAR  0xC0000081
@@ -31,7 +32,7 @@
 #define SECTOR_SIZE 512
 #define PAGE_SIZE   4096
 
-static uint64_t write_protect(bool on);
+static uintptr_t write_protect(bool on);
 
 
 /* The arguments of the call being handled, all six of them. Handlers take
@@ -91,7 +92,12 @@ static uint64_t started_phent, started_phnum;
 void syscall_entry(void);
 extern const char trap_stubs[];     /* one 32-byte stub per exception vector */
 extern uint64_t user_cs, user_ss;   /* ring 3's selectors, for the iretq frame */
+#ifdef __i386__
+extern uint64_t kernel_ds;          /* and the kernel's data segment, which i386's ways in load */
+#endif
+static uint64_t user_cs64, user_cs32;   /* what user_cs is for each kind of program */
 void page_fault_entry(void);
+void int80_entry(void);
 int  user_enter(uint64_t entry, uint64_t stack);
 __attribute__((noreturn)) void user_exit(int code);
 
@@ -106,13 +112,13 @@ __attribute__((noreturn)) void user_exit(int code);
 #define LOW_NUMBERS 256
 static uint8_t low[LOW_NUMBERS];    /* the slot, one-based; 0 means none */
 
-static uint64_t rdmsr(uint32_t msr) {
+__attribute__((unused)) static uint64_t rdmsr(uint32_t msr) {
     uint32_t low, high;
     __asm__ volatile("rdmsr" : "=a"(low), "=d"(high) : "c"(msr));
     return (uint64_t)high << 32 | low;
 }
 
-static void wrmsr(uint32_t msr, uint64_t value) {
+__attribute__((unused)) static void wrmsr(uint32_t msr, uint64_t value) {
     __asm__ volatile("wrmsr" : : "c"(msr), "a"((uint32_t)value), "d"((uint32_t)(value >> 32)));
 }
 
@@ -124,8 +130,28 @@ static void wrmsr(uint32_t msr, uint64_t value) {
  * would - so a bad pointer inside the window is simply zeroes, and one
  * outside it never gets that far. */
 
+static bool map_fill(uint64_t addr);
+
 bool user_range(uint64_t addr, uint64_t size) {
-    return fits(addr, size);
+    if (!fits(addr, size)) {
+        return false;
+    }
+    /* In low memory, where the kernel's own view is the machine's memory,
+       every page of it has to be the program's before the kernel reaches
+       it: a fault of the kernel's own there is taken for its own data
+       (vm_fault_as), which a program's buffer is not. So any page not the
+       program's yet becomes it now, as the program's own touch would. */
+    uint64_t last = size != 0 ? addr + size - 1 : addr;
+
+    for (uint64_t page = addr & ~(uint64_t)(PAGE_SIZE - 1); page <= last; page += PAGE_SIZE) {
+        if (vm_low_unfilled(page)) {
+            if (!map_fill(page) && !vm_fault(page)) {
+                return false;
+            }
+            vm_settle(page, PAGE_SIZE);
+        }
+    }
+    return true;
 }
 
 /* The program's NUL-terminated string at addr, or NULL if it runs to the end
@@ -190,6 +216,7 @@ struct process {
     bool     zombie;                /* ended, its status not yet collected */
     bool     borrowed;              /* a vfork's child, in its parent's memory */
     bool     compat;                /* it has made a call of compat/linux's */
+    bool     ia32;                  /* it runs a 32-bit program */
     int      status;                /* as wait4 reports it, once ended */
     struct space own, *space;
     struct handle *files;           /* its descriptors, mem_alloc'd: a page's */
@@ -223,6 +250,15 @@ struct process {
 _Static_assert(sizeof(struct process) <= 4096 - 16, "a process is one page");
 
 static struct process *procs[PROCESSES];
+
+/* Where USER_<x> of the running program's memory is: in its region, or
+   for a 32-bit program, IA32_<x> in low memory. */
+#define AT(x) (proc != NULL && proc->ia32 ? (uint64_t)IA32_##x : vm_base() + USER_##x)
+
+struct sig_action;
+struct ia32_signal;
+static bool ia32_deliver(struct sig_action *a, uint64_t sig, uint64_t mask,
+                         struct ia32_signal *s);
 static struct process *proc;        /* the running thread's, NULL for the kernel */
 static struct times kernel_times;
 static char kernel_cwd[FS_NAME_LEN];
@@ -272,6 +308,7 @@ void process_switch(void *from, void *to) {
     strcpy(f != NULL ? f->cwd : kernel_cwd, fs_cwd());
     fs_cwd_set(t != NULL ? t->cwd : kernel_cwd);
     proc = t;
+    user_cs = t != NULL && t->ia32 ? user_cs32 : user_cs64;
     vm_space_use(t != NULL ? t->space : NULL);
     if (tracer != NULL) {
         tracer->program(t != NULL && t->name[0] != '\0' ? t->name : NULL);
@@ -464,7 +501,7 @@ static void peak_end(struct process *p, bool print) {
                 h = &parent->files[2];
             }
             if (print) {
-                write_to(h, (uint64_t)line, strlen(line));
+                write_to(h, (uint64_t)(uintptr_t)line, strlen(line));
             }
             peaks[w].pid = 0;
             peak_count--;
@@ -625,10 +662,19 @@ static bool any_linux(void) {
 
 static bool linux_ours;             /* the kernel loaded compat/linux, or tried to */
 
+static bool any_ia32(void);
+static bool ia32_ours;
+
 static void linux_unneeded(void) {
     if (linux_ours && !any_linux()) {
         module_drop(LINUX_MODULE);
         linux_ours = false;
+    }
+    /* On i386 every program is a 32-bit one: the module is the kernel's
+       way of answering any of them, and it stays. */
+    if (ia32_ours && !any_ia32() && sizeof(void *) == 8) {
+        module_drop(IA32_MODULE);
+        ia32_ours = false;
     }
 }
 
@@ -1991,6 +2037,27 @@ static uint64_t signal_deliver(uint64_t result, uint64_t restore) {
     struct sig_frame *frame = (struct sig_frame *)at;
 
     pending &= ~(1ull << sig);
+    if (proc->ia32) {
+        struct ia32_signal s = {
+            .code = 0x80, .eax = (uint32_t)result, .ebx = (uint32_t)f->rbx,
+            .ecx = (uint32_t)f->pad, .edx = (uint32_t)f->rdx, .esi = (uint32_t)f->rsi,
+            .edi = (uint32_t)f->rdi, .ebp = (uint32_t)f->rbp, .esp = (uint32_t)f->rsp,
+            .eip = (uint32_t)f->rip, .eflags = (uint32_t)f->rflags,
+        };
+
+        if (!ia32_deliver(a, sig, restore, &s)) {
+            process_exit(SIGNALLED | SIGSEGV);
+        }
+        blocked |= a->mask | ((a->flags & SA_NODEFER) != 0 ? 0 : 1ull << (sig - 1));
+        f->rsp = s.esp;
+        f->rip = s.eip;
+        f->rdx = s.edx;
+        f->pad = s.ecx;
+        if ((a->flags & SA_RESETHAND) != 0) {
+            *a = (struct sig_action){ 0 };
+        }
+        return s.eax;
+    }
     if (!user_range(at, sizeof *frame)) {
         process_exit(SIGNALLED | SIGSEGV);  /* nowhere to put it, as Linux */
     }
@@ -2030,8 +2097,8 @@ static uint64_t signal_deliver(uint64_t result, uint64_t restore) {
     }
 
     f->rdi = sig;
-    f->rsi = (uint64_t)&frame->info;
-    f->rdx = (uint64_t)&frame->uc;
+    f->rsi = (uint64_t)(uintptr_t)&frame->info;
+    f->rdx = (uint64_t)(uintptr_t)&frame->uc;
     f->rsp = at;
     f->rip = a->handler;
     if ((a->flags & SA_RESETHAND) != 0) {
@@ -2079,7 +2146,7 @@ static uint64_t sys_rt_sigreturn(uint64_t a, uint64_t b, uint64_t c) {
     (void)a;
     (void)b;
     (void)c;
-    if (!user_range((uint64_t)frame, sizeof *frame)) {
+    if (!user_range((uint64_t)(uintptr_t)frame, sizeof *frame)) {
         process_exit(SIGNALLED | SIGSEGV);  /* as Linux would */
     }
     f->r8 = g[G_R8];
@@ -3013,14 +3080,14 @@ static uint64_t sys_ftruncate(uint64_t fd, uint64_t length, uint64_t c) {
    pthread_getattr_np, and Firefox will not start without that. */
 void process_maps(char *out, size_t max) {
     out[0] = '\0';
-    if (proc == NULL || vm_base() == 0 || max < 200) {
+    if (proc == NULL || !vm_start() || max < 200) {
         return;
     }
-    uint64_t top = vm_base() + USER_STACK;
+    uint64_t top = AT(STACK);
 
     ksprintf(out, "%x-%x rw-p 00000000 00:00 0                          [heap]\n"
                   "%x-%x rw-p 00000000 00:00 0                          [stack]\n",
-             vm_base() + USER_BRK, program_break > vm_base() + USER_BRK ? program_break : vm_base() + USER_BRK + PAGE_SIZE,
+             AT(BRK), program_break > AT(BRK) ? program_break : AT(BRK) + PAGE_SIZE,
              top - USER_STACK_BYTES, top);
 }
 
@@ -3140,9 +3207,9 @@ static uint64_t sys_fchdir(uint64_t fd, uint64_t b, uint64_t c) {
    window with the program, the heap from the top of it and mmap from the
    far end growing down. */
 static void program_memory_start(void) {
-    program_break = vm_base() + USER_BRK;
-    program_map = vm_base() + USER_MMAP;
-    program_map_high = vm_base() + USER_HIGH;
+    program_break = AT(BRK);
+    program_map = AT(MMAP);
+    program_map_high = AT(HIGH);
 }
 
 static uint64_t sys_brk(uint64_t addr, uint64_t b, uint64_t c) {
@@ -3150,7 +3217,7 @@ static uint64_t sys_brk(uint64_t addr, uint64_t b, uint64_t c) {
     (void)c;
     /* Linux answers a request it cannot meet with the break unchanged. */
     if (addr >= program_break && fits(addr, 0) &&
-        addr < program_break + 0x10000000 && (vm_base() == 0 || addr <= vm_base() + USER_HIGH)) {
+        addr < program_break + 0x10000000 && (!vm_start() || addr <= AT(HIGH))) {
         program_break = addr;
     }
     return program_break;
@@ -3477,14 +3544,14 @@ static uint64_t map_at(uint64_t addr, uint64_t length) {
     }
     if ((flags & MAP_FIXED) != 0) {
         at = addr & ~(uint64_t)(PAGE_SIZE - 1);
-    } else if (vm_base() != 0) {
+    } else if (vm_start()) {
         /* Up to the heap, and no further: a reservation too big for what is
            left fails, as V8's first try at a terabyte does, and leaves room
            for the smaller one it tries next. */
-        if (size + PAGE_SIZE <= vm_base() + USER_BRK - program_map) {
+        if (size + PAGE_SIZE <= AT(BRK) - program_map) {
             at = program_map;
             program_map += size + PAGE_SIZE;     /* a gap, so a fixed map nearby is safe */
-        } else if (size + PAGE_SIZE <= vm_end() - program_map_high) {
+        } else if (!proc->ia32 && size + PAGE_SIZE <= vm_end() - program_map_high) {
             at = program_map_high;
             program_map_high += size + PAGE_SIZE;
         } else {
@@ -3816,14 +3883,14 @@ static uint64_t sys_arch_prctl(uint64_t code, uint64_t addr, uint64_t c) {
         if (!user_range(addr, 0)) {
             return ERR(EPERM);
         }
-        wrmsr(code == ARCH_SET_FS ? MSR_FS_BASE : MSR_GS_BASE, addr);
+        (code == ARCH_SET_FS ? tls_fs_set : tls_gs_set)(addr);
         return 0;
     case ARCH_GET_FS:
     case ARCH_GET_GS:
         if (!user_range(addr, 8)) {
             return ERR(EFAULT);
         }
-        *(uint64_t *)addr = rdmsr(code == ARCH_GET_FS ? MSR_FS_BASE : MSR_GS_BASE);
+        *(uint64_t *)addr = code == ARCH_GET_FS ? tls_fs() : tls_gs();
         return 0;
     }
     return ERR(EINVAL);
@@ -4305,25 +4372,40 @@ uint32_t file_ino(const char *name, bool follow) {
 #define TSS_IOMAP      102      /* holds the I/O permission bitmap's offset */
 #define EXCEPTIONS     32
 #define VEC_PAGE_FAULT 14
+#define INT80          0x80
 #define GDT_BYTES      256      /* room for the firmware's table and ours:
                                    a firmware's own runs to a few dozen
                                    bytes, and one that does not fit is done
                                    without rather than made room for */
 
+/* A gate: sixteen bytes on x86-64, eight on i386, which has no upper half
+   of the address to keep - gate() fills either. */
 struct idt_gate {
     uint16_t offset_low;
     uint16_t selector;
     uint8_t  ist;
     uint8_t  type;
     uint16_t offset_mid;
+#ifndef __i386__
     uint32_t offset_high;
     uint32_t reserved;
+#endif
 } __attribute__((packed));
 
 struct desc_ptr {
-    uint16_t limit;
-    uint64_t base;
+    uint16_t  limit;
+    uintptr_t base;
 } __attribute__((packed));
+
+static struct idt_gate gate(uintptr_t handler, uint16_t selector, uint8_t type) {
+    return (struct idt_gate){
+        .offset_low = (uint16_t)handler, .selector = selector, .type = type,
+        .offset_mid = (uint16_t)(handler >> 16),
+#ifndef __i386__
+        .offset_high = (uint32_t)((uint64_t)handler >> 32),
+#endif
+    };
+}
 
 static uint8_t        gdt[GDT_BYTES] __attribute__((aligned(16)));
 
@@ -4332,13 +4414,79 @@ static uint8_t        gdt[GDT_BYTES] __attribute__((aligned(16)));
 uint8_t tss[TSS_SIZE] __attribute__((aligned(16), used));
 static uint16_t       kernel_cs;        /* where our own code segment landed */
 
-/* Four in this order, because that is the order sysret expects them. */
+/* Four in this order, because that is the order sysret expects them. On
+   i386 the code segments are 32-bit ones, and there is no sysret. */
+#ifdef __i386__
+static const uint64_t descriptors[4] = {
+    0x00CF9A000000FFFF,     /* kernel code */
+    0x00CF92000000FFFF,     /* kernel data */
+    0x00CFF2000000FFFF,     /* user data, ring 3 */
+    0x00CFFA000000FFFF,     /* user code */
+};
+#else
 static const uint64_t descriptors[4] = {
     0x00AF9A000000FFFF,     /* kernel code, 64-bit: what syscall switches to */
     0x00CF92000000FFFF,     /* kernel data */
     0x00CFF2000000FFFF,     /* user data, ring 3 */
     0x00AFFA000000FFFF,     /* user code, 64-bit */
 };
+#endif
+
+/* After the TSS: a 32-bit program's code segment, and the one its thread
+   pointer is in (tls_descriptor) - data, ring 3, the base filled in. */
+#define CODE32 0x00CFFA000000FFFFull
+#define TLS32  0x00CFF2000000FFFFull
+
+static uint64_t *tls_slot;          /* where in the GDT the second is */
+
+unsigned tls_descriptor(uint64_t base) {
+    if (tls_slot == NULL) {
+        return 0;
+    }
+    *tls_slot = TLS32 | (base & 0xFFFFFF) << 16 | (base >> 24 & 0xFF) << 56;
+    return (unsigned)(((uint8_t *)tls_slot - gdt) / 8);
+}
+
+#ifdef __i386__
+/* No FS_BASE or GS_BASE to keep them in: GS's is the GDT entry's, and
+   loading GS is what takes it up - which every way back to ring 3 does
+   (i386/syscall_entry.asm). */
+static uint64_t gs_now;
+
+uint64_t tls_fs(void) {
+    return 0;
+}
+
+uint64_t tls_gs(void) {
+    return gs_now;
+}
+
+void tls_fs_set(uint64_t base) {
+    (void)base;
+}
+
+void tls_gs_set(uint64_t base) {
+    gs_now = base;
+    tls_descriptor(base);
+}
+#else
+uint64_t tls_fs(void) {
+    return rdmsr(MSR_FS_BASE);
+}
+
+uint64_t tls_gs(void) {
+    return rdmsr(MSR_GS_BASE);
+}
+
+void tls_fs_set(uint64_t base) {
+    wrmsr(MSR_FS_BASE, base);
+}
+
+void tls_gs_set(uint64_t base) {
+    wrmsr(MSR_GS_BASE, base);
+    tls_descriptor(base);           /* what a 32-bit thread loading GS gets */
+}
+#endif
 
 static void gdt_init(void) {
     struct desc_ptr had, ours;
@@ -4346,7 +4494,7 @@ static void gdt_init(void) {
 
     __asm__ volatile("sgdt %0" : "=m"(had));
     used = (unsigned)had.limit + 1;
-    if (used > GDT_BYTES - sizeof descriptors - 16) {
+    if (used > GDT_BYTES - sizeof descriptors - 32) {
         used = 0;                       /* implausibly large; do without it */
     } else {
         memcpy(gdt, (const void *)had.base, used);
@@ -4357,15 +4505,25 @@ static void gdt_init(void) {
     memcpy(gdt + used, descriptors, sizeof descriptors);
 
     /* The TSS descriptor is twice the width of the others, and carries the
-       address of the TSS split across it. */
-    uint64_t base = (uint64_t)tss;
+       address of the TSS split across it - once on i386, where it is as
+       wide as the rest, the 64-bit programs' code segment is the 32-bit
+       ones' too, and CODE32 is left empty. */
+    uint64_t base = (uintptr_t)tss;
     uint64_t *slot = (uint64_t *)(gdt + used + sizeof descriptors);
     slot[0] = (TSS_SIZE - 1) | (base & 0xFFFFFF) << 16 |
               (uint64_t)0x89 << 40 | (base >> 24 & 0xFF) << 56;
+#ifdef __i386__
+    slot[1] = 0;
+    slot[2] = 0;
+#else
     slot[1] = base >> 32;
+    slot[2] = CODE32;
+#endif
+    tls_slot = &slot[3];
+    *tls_slot = TLS32;
 
-    ours.limit = (uint16_t)(used + sizeof descriptors + 16 - 1);
-    ours.base = (uint64_t)gdt;
+    ours.limit = (uint16_t)(used + sizeof descriptors + 32 - 1);
+    ours.base = (uintptr_t)gdt;
     __asm__ volatile("lgdt %0" : : "m"(ours));
     /* Every selector the firmware was using still means what it did, because
        its descriptors were copied in at the very same offsets - so there is
@@ -4375,7 +4533,16 @@ static void gdt_init(void) {
     /* Ring 3's two selectors, with the bits that say ring 3 already on: what
        the frame an IRETQ returns through has to carry. */
     user_ss = (uint64_t)(kernel_cs + 16) | 3;
-    user_cs = (uint64_t)(kernel_cs + 24) | 3;
+    user_cs = user_cs64 = (uint64_t)(kernel_cs + 24) | 3;
+#ifdef __i386__
+    user_cs32 = user_cs64;
+    kernel_ds = (uint64_t)(kernel_cs + 8);
+#else
+    user_cs32 = (uint64_t)(used + sizeof descriptors + 16) | 3;
+#endif
+    /* DS and ES, which a 32-bit program addresses through, and which
+       nothing in 64-bit code reads: the user data segment from here on. */
+    __asm__ volatile("mov %0, %%ds\n\tmov %0, %%es" : : "r"((uint32_t)user_ss));
 }
 
 /* The firmware's interrupt table is kept and only the first thirty-two
@@ -4392,27 +4559,41 @@ static void traps_init(void) {
 
     memset(tss, 0, TSS_SIZE);
     *(uint16_t *)(tss + TSS_IOMAP) = TSS_SIZE;  /* no bitmap: no ports for ring 3 */
+#ifdef __i386__
+    *(uint16_t *)(tss + 8) = (uint16_t)kernel_ds;   /* SS0: the stack ring 3's ways in land on */
+#endif
 
     __asm__ volatile("sidt %0" : "=m"(idtr));
     if (idtr.limit < EXCEPTIONS * sizeof(struct idt_gate) - 1) {
         return;
     }
+#ifdef __i386__
+    /* A 32-bit firmware's table is somewhere in the first gigabyte, where a
+       program's pages may hide it from the processor itself: a copy of it
+       in the kernel's own memory, every gate of the firmware's in it. */
+    static struct idt_gate own_idt[256] __attribute__((aligned(8)));
+    size_t bytes = idtr.limit + 1u < sizeof own_idt ? idtr.limit + 1u : sizeof own_idt;
+
+    memcpy(own_idt, (const void *)idtr.base, bytes);
+    idtr.base = (uintptr_t)own_idt;
+    idtr.limit = (uint16_t)(bytes - 1);
+    __asm__ volatile("lidt %0" : : "m"(idtr));
+#endif
     idt = (struct idt_gate *)idtr.base;
 
-    uint64_t cr0 = write_protect(false);
+    uintptr_t cr0 = write_protect(false);
     for (unsigned i = 0; i < EXCEPTIONS; i++) {
-        uint64_t handler = i == VEC_PAGE_FAULT ? (uint64_t)page_fault_entry
-                                               : (uint64_t)trap_stubs + i * 32;
-        idt[i] = (struct idt_gate){
-            .offset_low  = (uint16_t)handler,
-            .selector    = kernel_cs,
-            /* present 64-bit interrupt gates - int3 and into ones a program
-               may use itself, as a debugger's breakpoint and as Chromium's
-               way of ending on purpose */
-            .type        = i == 3 || i == 4 ? 0xEE : 0x8E,
-            .offset_mid  = (uint16_t)(handler >> 16),
-            .offset_high = (uint32_t)(handler >> 32),
-        };
+        uintptr_t handler = i == VEC_PAGE_FAULT ? (uintptr_t)page_fault_entry
+                                                : (uintptr_t)trap_stubs + i * 32;
+
+        /* present interrupt gates - int3 and into ones a program may use
+           itself, as a debugger's breakpoint and as Chromium's way of
+           ending on purpose */
+        idt[i] = gate(handler, kernel_cs, i == 3 || i == 4 ? 0xEE : 0x8E);
+    }
+    /* int 0x80, a 32-bit program's way in: a gate ring 3 may use. */
+    if (idtr.limit >= (INT80 + 1) * sizeof(struct idt_gate) - 1) {
+        idt[INT80] = gate((uintptr_t)int80_entry, kernel_cs, 0xEE);
     }
     __asm__ volatile("mov %0, %%cr0" : : "r"(cr0) : "memory");
 }
@@ -4422,17 +4603,17 @@ static void traps_init(void) {
    each thread's with FXSAVE as it switches - which covers SSE and no more, so
    the larger AVX state stays off: a libc only uses it when told it may. */
 static void sse_init(void) {
-    uint64_t cr0, cr4;
+    uintptr_t cr0, cr4;
 
     __asm__ volatile("mov %%cr0, %0" : "=r"(cr0));
-    cr0 = (cr0 & ~(uint64_t)(1 << 2)) | (1 << 1);   /* not emulated, monitored */
+    cr0 = (cr0 & ~(uintptr_t)(1 << 2)) | (1 << 1);  /* not emulated, monitored */
     cr0 |= 1 << 16;     /* WP: the kernel too faults on a read-only page, so a
                            write into a page processes share copies it first */
     __asm__ volatile("mov %0, %%cr0" : : "r"(cr0));
 
     __asm__ volatile("mov %%cr4, %0" : "=r"(cr4));
     cr4 |= (1 << 9) | (1 << 10);        /* OSFXSR, OSXMMEXCPT */
-    cr4 &= ~(uint64_t)(1 << 18);        /* not OSXSAVE, whatever the firmware left */
+    cr4 &= ~(uintptr_t)(1 << 18);       /* not OSXSAVE, whatever the firmware left */
     __asm__ volatile("mov %0, %%cr4" : : "r"(cr4));
     __asm__ volatile("fninit");
 }
@@ -4654,12 +4835,14 @@ void syscall_init(void) {
     gdt_init();
     sse_init();
     traps_init();
+#ifndef __i386__
     wrmsr(MSR_EFER, rdmsr(MSR_EFER) | EFER_SCE);
     /* syscall takes its code segment from one half and sysret counts on from
        the other: the four descriptors gdt_init laid down, in their order. */
     wrmsr(MSR_STAR, (uint64_t)(kernel_cs + 8) << 48 | (uint64_t)kernel_cs << 32);
     wrmsr(MSR_LSTAR, (uint64_t)syscall_entry);
     wrmsr(MSR_FMASK, RFLAGS_MASK);
+#endif
 
     for (unsigned i = 0; i < SYSCALLS; i++) {
         if (numbers[i] < LOW_NUMBERS) {
@@ -4715,25 +4898,8 @@ static bool stirs(uint64_t number, uint64_t fd) {
     return false;
 }
 
-uint64_t syscall_dispatch(uint64_t a, uint64_t b, uint64_t c,
-                          uint64_t d, uint64_t e, uint64_t f, uint64_t number) {
-    void *entry = tracer != NULL ? tracer->begin((uint32_t)number, a, b, c) : NULL;
-    uint64_t result = ERR(ENOSYS);
-
-    if (peak_count > 0) {
-        peak_sample();
-    }
-
-    if (proc != NULL && now_running.left != 0) {
-        now_running.user += efi_uptime_us() - now_running.left;
-    }
-    arg[0] = a;
-    arg[1] = b;
-    arg[2] = c;
-    arg[3] = d;
-    arg[4] = e;
-    arg[5] = f;
-
+/* The handler for number, from the kernel's table or a module's. */
+static syscall_fn handler_any(uint64_t number, uint64_t a) {
     syscall_fn handler = handler_for(number);
     struct handle *h = number == SYS_SENDTO || number == SYS_RECVFROM ? handle_of(a) : NULL;
 
@@ -4757,6 +4923,21 @@ uint64_t syscall_dispatch(uint64_t a, uint64_t b, uint64_t c,
             proc->compat = true;
         }
     }
+    return handler;
+}
+
+uint64_t syscall_run(uint64_t number, uint64_t a, uint64_t b, uint64_t c,
+                     uint64_t d, uint64_t e, uint64_t f) {
+    uint64_t result = ERR(ENOSYS);
+
+    arg[0] = a;
+    arg[1] = b;
+    arg[2] = c;
+    arg[3] = d;
+    arg[4] = e;
+    arg[5] = f;
+
+    syscall_fn handler = handler_any(number, a);
 
     if (handler != NULL) {
         struct kernel_mark mark = kernel_began();
@@ -4771,7 +4952,11 @@ uint64_t syscall_dispatch(uint64_t a, uint64_t b, uint64_t c,
             thread_stir();
         }
     }
+    return result;
+}
 
+/* What every call ends with, 64-bit or 32-bit. */
+static uint64_t syscall_end(uint64_t number, uint64_t result) {
     /* A program that never waits is asked every so often whether Ctrl-C
        was typed - nothing else would ask - and a SIGINT it handles goes to
        its handler here, on the way out. */
@@ -4790,6 +4975,21 @@ uint64_t syscall_dispatch(uint64_t a, uint64_t b, uint64_t c,
     if (deliverable() != 0 && number != SYS_RT_SIGRETURN && program_running()) {
         result = signal_deliver(result, blocked);
     }
+    return result;
+}
+
+uint64_t syscall_dispatch(uint64_t a, uint64_t b, uint64_t c,
+                          uint64_t d, uint64_t e, uint64_t f, uint64_t number) {
+    void *entry = tracer != NULL ? tracer->begin((uint32_t)number, a, b, c) : NULL;
+
+    if (peak_count > 0) {
+        peak_sample();
+    }
+
+    if (proc != NULL && now_running.left != 0) {
+        now_running.user += efi_uptime_us() - now_running.left;
+    }
+    uint64_t result = syscall_end(number, syscall_run(number, a, b, c, d, e, f));
 
     /* SYS_EXIT does not come back, and neither does a program killed
        mid-call, so those entries stay unfinished - which is worth seeing. */
@@ -4810,6 +5010,61 @@ uint64_t syscall_dispatch(uint64_t a, uint64_t b, uint64_t c,
     return result;
 }
 
+/* ---- 32-bit programs (ia32.h) -------------------------------------------- */
+
+static const struct ia32_ops *ia32;    /* ia32_ours: the kernel loaded it */
+
+void ia32_register(const struct ia32_ops *ops) {
+    ia32 = ops;
+}
+
+/* Called by int80_entry, user_frame holding the program's registers. */
+uint64_t ia32_dispatch(void) {
+    struct user_regs *f = user_frame;
+
+    if (peak_count > 0) {
+        peak_sample();
+    }
+    if (proc != NULL && now_running.left != 0) {
+        now_running.user += efi_uptime_us() - now_running.left;
+    }
+    uint64_t result = ia32 != NULL && proc != NULL && proc->ia32 ? ia32->syscall(f) : ERR(ENOSYS);
+
+    user_frame = f;
+    result = syscall_end(0, result);
+    if (proc != NULL) {
+        now_running.left = efi_uptime_us();
+    }
+    return (uint32_t)result;
+}
+
+/* Whether a process still running runs a 32-bit program. */
+static bool any_ia32(void) {
+    for (unsigned i = 0; i < PROCESSES; i++) {
+        if (procs[i] != NULL && !procs[i]->zombie && procs[i]->ia32) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Hands the handler for sig, a, the registers in s, i386's way; false if
+   the frame does not fit. */
+static bool ia32_deliver(struct sig_action *a, uint64_t sig, uint64_t mask,
+                         struct ia32_signal *s) {
+    s->sig = (uint32_t)sig;
+    s->handler = (uint32_t)a->handler;
+    s->restorer = (uint32_t)a->restorer;
+    s->flags = (uint32_t)a->flags;
+    s->mask = mask;
+    if (sig == SIGCHLD) {
+        s->code = 1;                /* CLD_EXITED */
+        s->pid = (uint32_t)child_pid;
+        s->status = (uint32_t)child_code;
+    }
+    return ia32 != NULL && ia32->signal(s);
+}
+
 /* ---- program memory ------------------------------------------------------
  *
  * Every page a program has comes from vm.c: its own region, hung off a slot
@@ -4824,11 +5079,11 @@ uint64_t syscall_dispatch(uint64_t a, uint64_t b, uint64_t c,
 /* The firmware write-protects its own page tables and its own descriptors -
    CR0.WP, which makes even ring 0 respect a read-only page - so editing one
    means turning that off for as long as the edit takes. */
-static uint64_t write_protect(bool on) {
-    uint64_t cr0;
+static uintptr_t write_protect(bool on) {
+    uintptr_t cr0;
 
     __asm__ volatile("mov %%cr0, %0" : "=r"(cr0));
-    __asm__ volatile("mov %0, %%cr0" : : "r"(on ? cr0 | 0x10000 : cr0 & ~0x10000ull) : "memory");
+    __asm__ volatile("mov %0, %%cr0" : : "r"(on ? cr0 | 0x10000 : cr0 & ~(uintptr_t)0x10000) : "memory");
     return cr0;
 }
 
@@ -4874,6 +5129,29 @@ static bool fault_deliver(uint64_t sig, int code, uint64_t addr, unsigned vector
     uint64_t at = ((r->rsp - 128 - sizeof(struct sig_frame)) & ~15ull) - 8;
     struct sig_frame *frame = (struct sig_frame *)at;
 
+    if (proc->ia32) {
+        struct ia32_signal s = {
+            .code = (uint32_t)code, .addr = (uint32_t)addr, .trapno = vector,
+            .err = (uint32_t)r->err, .eax = (uint32_t)r->rax, .ebx = (uint32_t)r->rbx,
+            .ecx = (uint32_t)r->rcx, .edx = (uint32_t)r->rdx, .esi = (uint32_t)r->rsi,
+            .edi = (uint32_t)r->rdi, .ebp = (uint32_t)r->rbp, .esp = (uint32_t)r->rsp,
+            .eip = (uint32_t)r->rip, .eflags = (uint32_t)r->rflags,
+        };
+
+        if (!ia32_deliver(a, sig, blocked, &s)) {
+            return false;
+        }
+        blocked |= a->mask | ((a->flags & SA_NODEFER) != 0 ? 0 : 1ull << (sig - 1));
+        r->rsp = s.esp;
+        r->rip = s.eip;
+        r->rax = s.eax;
+        r->rdx = s.edx;
+        r->rcx = s.ecx;
+        if ((a->flags & SA_RESETHAND) != 0) {
+            *a = (struct sig_action){ 0 };
+        }
+        return true;
+    }
     if (!user_range(at, sizeof *frame)) {
         return false;
     }
@@ -4917,8 +5195,8 @@ static bool fault_deliver(uint64_t sig, int code, uint64_t addr, unsigned vector
     }
 
     r->rdi = sig;
-    r->rsi = (uint64_t)&frame->info;
-    r->rdx = (uint64_t)&frame->uc;
+    r->rsi = (uint64_t)(uintptr_t)&frame->info;
+    r->rdx = (uint64_t)(uintptr_t)&frame->uc;
     r->rax = 0;
     r->rsp = at;
     r->rip = a->handler;
@@ -4958,17 +5236,14 @@ bool tick_register(unsigned vector, void (*ack)(void)) {
         return false;               /* the firmware's interrupts are still its own */
     }
     struct idt_gate *idt = (struct idt_gate *)idtr.base;
-    uint64_t cr0 = write_protect(false);
+    uintptr_t cr0 = write_protect(false);
 
     /* Every vector past the CPU's own: whatever the firmware left wired to
        one of its handlers - gone with its memory - is let go instead. */
     for (unsigned i = EXCEPTIONS; i < gates; i++) {
-        uint64_t handler = (uint64_t)(i == vector ? tick_entry : stray_entry);
-
-        idt[i] = (struct idt_gate){
-            .offset_low = (uint16_t)handler, .selector = kernel_cs, .type = 0x8E,
-            .offset_mid = (uint16_t)(handler >> 16), .offset_high = (uint32_t)(handler >> 32),
-        };
+        if (i != INT80) {
+            idt[i] = gate((uintptr_t)(i == vector ? tick_entry : stray_entry), kernel_cs, 0x8E);
+        }
     }
     __asm__ volatile("mov %0, %%cr0" : : "r"(cr0) : "memory");
     tick_ack = ack;
@@ -5035,7 +5310,7 @@ void page_fault(uint64_t addr, struct trap_regs *r) {
     /* Something promised to a mapping comes first: the page is not merely
        empty, it has a stretch of a file that belongs in it. What the program
        asked of the pages filled is applied once they are. */
-    if (!denied && (map_fill(addr) || vm_fault(addr))) {
+    if (!denied && (map_fill(addr) || vm_fault_as(addr, (r->err & 4) != 0))) {
         vm_settle(addr - FILL_PAGES * PAGE_SIZE, 2 * FILL_PAGES * PAGE_SIZE);
         kernel_ended(mark);
         return;
@@ -5060,11 +5335,13 @@ void page_fault(uint64_t addr, struct trap_regs *r) {
  * linkers and debuggers, and a linked executable needs none of it here: the
  * memory these programs live in is already read-write-execute. */
 
-#define ELF_CLASS64 2       /* ident[4] */
+#define ELF_CLASS32 1       /* ident[4] */
+#define ELF_CLASS64 2
 #define ELF_LITTLE  1       /* ident[5] */
 #define ET_EXEC     2
 #define ET_DYN      3       /* position-independent: it runs wherever it is put */
 #define EM_X86_64   0x3E
+#define EM_386      3
 #define PT_LOAD     1
 #define PT_INTERP   3       /* the path of the loader it wants */
 
@@ -5091,6 +5368,55 @@ struct elf_program {
     uint64_t filesz;
     uint64_t memsz;         /* anything past filesz reads as zero (.bss) */
 } __attribute__((packed));  /* p_align follows, and we do not need it */
+
+/* The same two for a 32-bit ELF, which elf_read and elf_program widen into
+   the 64-bit ones: the rest of the loader reads only those. */
+struct elf32_header {
+    uint8_t  ident[16];
+    uint16_t type, machine;
+    uint32_t version, entry, phoff, shoff, flags;
+    uint16_t ehsize, phentsize, phnum;
+} __attribute__((packed));
+
+struct elf32_program {
+    uint32_t type, offset, vaddr, paddr, filesz, memsz, flags;
+} __attribute__((packed));
+
+static int read_at(const struct fs_file *file, uint64_t offset, void *dest, uint64_t size);
+
+/* The file's header, a 32-bit one widened. */
+static int elf_read(const struct fs_file *file, struct elf_header *h) {
+    int err = read_at(file, 0, h, sizeof *h);
+    struct elf32_header n;
+
+    if (err == 0 && h->ident[4] == ELF_CLASS32) {
+        memcpy(&n, h, sizeof n);
+        *h = (struct elf_header){ .type = n.type, .machine = n.machine, .version = n.version,
+                                  .entry = n.entry, .phoff = n.phoff, .shoff = n.shoff,
+                                  .flags = n.flags, .ehsize = n.ehsize,
+                                  .phentsize = n.phentsize, .phnum = n.phnum };
+        memcpy(h->ident, n.ident, sizeof h->ident);
+    }
+    return err;
+}
+
+/* Program header i, a 32-bit one widened. */
+static int elf_program(const struct fs_file *file, const struct elf_header *h, unsigned i,
+                       struct elf_program *p) {
+    uint64_t at = h->phoff + (uint64_t)i * h->phentsize;
+    struct elf32_program n;
+    int err;
+
+    if (h->ident[4] != ELF_CLASS32) {
+        return read_at(file, at, p, sizeof *p);
+    }
+    if ((err = read_at(file, at, &n, sizeof n)) == 0) {
+        *p = (struct elf_program){ .type = n.type, .flags = n.flags, .offset = n.offset,
+                                   .vaddr = n.vaddr, .paddr = n.paddr, .filesz = n.filesz,
+                                   .memsz = n.memsz };
+    }
+    return err;
+}
 
 /* Copies size bytes from offset in the file to dest, going through the
    filesystem's one sector buffer. Returns 0, FS_EIO, or PROGRAM_EINVAL if
@@ -5174,8 +5500,7 @@ static bool elf_span(const struct fs_file *file, const struct elf_header *header
     *low = (uint64_t)-1;
     *high = 0;
     for (unsigned i = 0; i < header->phnum; i++) {
-        if (read_at(file, header->phoff + (uint64_t)i * header->phentsize,
-                    &program, sizeof program) != 0) {
+        if (elf_program(file, header, i, &program) != 0) {
             return false;
         }
         if (program.type == PT_LOAD && program.memsz != 0) {
@@ -5196,10 +5521,12 @@ static bool elf_span(const struct fs_file *file, const struct elf_header *header
 static int load_elf_at(const struct fs_file *file, const struct elf_header *header,
                        uint64_t bias, uint64_t *entry, uint64_t *phdr,
                        char *interp, size_t interp_max) {
-    if (header->ident[4] != ELF_CLASS64 || header->ident[5] != ELF_LITTLE ||
+    bool narrow = proc->ia32;
+
+    if (header->ident[4] != (narrow ? ELF_CLASS32 : ELF_CLASS64) || header->ident[5] != ELF_LITTLE ||
         (header->type != ET_EXEC && header->type != ET_DYN) ||
-        header->machine != EM_X86_64 ||
-        header->phentsize < sizeof(struct elf_program) ||
+        header->machine != (narrow ? EM_386 : EM_X86_64) ||
+        header->phentsize < (narrow ? sizeof(struct elf32_program) : sizeof(struct elf_program)) ||
         !fits(bias + header->entry, 0)) {
         return PROGRAM_EINVAL;
     }
@@ -5209,8 +5536,7 @@ static int load_elf_at(const struct fs_file *file, const struct elf_header *head
 
     for (unsigned i = 0; i < header->phnum; i++) {
         struct elf_program program;
-        int err = read_at(file, header->phoff + (uint64_t)i * header->phentsize,
-                          &program, sizeof program);
+        int err = elf_program(file, header, i, &program);
 
         if (err < 0) {
             return err;
@@ -5252,33 +5578,39 @@ static int load_elf_at(const struct fs_file *file, const struct elf_header *head
     return 0;
 }
 
-/* TEF64, Tuxlet's own executable format (src/tcr/tef64.ld): the bytes a
+/* TEF, Tuxlet's own executable format (src/tcr/tef.ld): the bytes a
    program runs as, behind a header saying how much memory it needs; it
    starts right after the header. It goes where a position-independent ELF
-   would and is never relocated - there is nothing in it to relocate. */
+   would and is never relocated - there is nothing in it to relocate. The
+   class byte says 32-bit or 64-bit code, as an ELF's does. Files from
+   before the class byte ("TEF64", a 12-byte header) still load. */
 struct tef_header {
-    char     magic[8];      /* "TEF64" */
+    char     magic[3];      /* "TEF" */
+    uint8_t  class;         /* ELF_CLASS32 or ELF_CLASS64 */
     uint32_t size;          /* the file, then zeroes */
+    uint32_t old_size;      /* where "TEF64" kept it */
 };
 
 static int load_tef(const struct fs_file *file, const struct tef_header *tef,
                     uint64_t *entry) {
-    uint64_t at = vm_base() + USER_EXEC;
+    bool old = tef->class == '6';
+    uint32_t size = old ? tef->old_size : tef->size;
+    uint64_t at = AT(EXEC);
     int err;
 
-    if (file->size <= sizeof *tef || tef->size < file->size || !fits(at, tef->size)) {
+    if (file->size <= sizeof *tef || size < file->size || !fits(at, size)) {
         return PROGRAM_EINVAL;
     }
     /* Read now rather than promised as an ELF's segments are: the files are
        a few kilobytes, and a promise would cost the process a page of its
        own to keep it in. */
-    if (!claim(at, tef->size)) {
+    if (!claim(at, size)) {
         return FS_ENOSPC;
     }
     if ((err = read_at(file, 0, (void *)at, file->size)) < 0) {
         return err;
     }
-    *entry = started_entry = at + sizeof *tef;
+    *entry = started_entry = at + (old ? 12 : 8);
     return 0;
 }
 
@@ -5312,36 +5644,58 @@ int program_load(const struct fs_file *file, uint64_t *entry) {
     started_base = 0;
     started_phdr = started_phent = started_phnum = 0;
 
-    /* Everything on the disk is linked: a TEF64, an ELF, or not a program
-       at all. */
-    if (vm_base() != 0 && file->size >= sizeof(struct tef_header) &&
-        read_at(file, 0, &header, sizeof(struct tef_header)) == 0 &&
-        memcmp(header.ident, "TEF64\0\0", 8) == 0) {
+    /* Everything on the disk is linked: a TEF, an ELF, or not a program
+       at all - 64-bit, or 32-bit, which runs in low memory with
+       compat/ia32 answering its calls. */
+    bool tef = vm_start() && file->size >= sizeof(struct tef_header) &&
+               read_at(file, 0, &header, sizeof(struct tef_header)) == 0 &&
+               memcmp(header.ident, "TEF", 3) == 0;
+
+    if (!tef && (file->size < sizeof header || elf_read(file, &header) != 0 ||
+                 header.ident[0] != 0x7F || header.ident[1] != 'E' ||
+                 header.ident[2] != 'L' || header.ident[3] != 'F')) {
+        dbg("load: not ELF: size %u start %x read %d magic %x\n", (uint64_t)file->size, (uint64_t)file->start,
+            (uint64_t)(int64_t)read_at(file, 0, &header, sizeof header), (uint64_t)header.ident[0]);
+        err = PROGRAM_EINVAL;
+        goto done;
+    }
+    proc->ia32 = header.ident[tef ? 3 : 4] == ELF_CLASS32;
+#ifdef __i386__
+    if (!proc->ia32) {
+        err = PROGRAM_EINVAL;       /* a 64-bit program, which this processor cannot run */
+        goto done;
+    }
+#endif
+    user_cs = proc->ia32 ? user_cs32 : user_cs64;
+    if (proc->ia32) {
+        if (ia32 == NULL && !ia32_ours) {
+            ia32_ours = true;
+            module_need(IA32_MODULE);
+        }
+        if (ia32 == NULL || !vm_low(IA32_LOW, IA32_STACK)) {
+            dbg("load: no compat/ia32, or no low memory\n");
+            err = PROGRAM_EINVAL;
+            goto done;
+        }
+    }
+    if (tef) {
         err = load_tef(file, (const struct tef_header *)&header, entry);
         if (err == 0) {
             program_memory_start();
         }
         goto done;
     }
-    if (file->size < sizeof header || read_at(file, 0, &header, sizeof header) != 0 ||
-        header.ident[0] != 0x7F || header.ident[1] != 'E' ||
-        header.ident[2] != 'L' || header.ident[3] != 'F') {
-        dbg("load: not ELF: size %u start %x read %d magic %x\n", (uint64_t)file->size, (uint64_t)file->start,
-            (uint64_t)(int64_t)read_at(file, 0, &header, sizeof header), (uint64_t)header.ident[0]);
-        err = PROGRAM_EINVAL;
-        goto done;
-    }
-    uint64_t bias = header.type == ET_DYN ? vm_base() + USER_EXEC : 0;
+    uint64_t bias = header.type == ET_DYN ? AT(EXEC) : 0;
     uint64_t low, high;
 
     /* Something linked to run at a fixed address goes there, in low memory;
        anything position-independent goes in its region. */
-    if (vm_base() == 0) {
+    if (!vm_start()) {
         dbg("load: no region\n");
         err = PROGRAM_EINVAL;
         goto done;
     }
-    if (header.type == ET_EXEC &&
+    if (header.type == ET_EXEC && !proc->ia32 &&
         (!elf_span(file, &header, &low, &high) || !vm_low(low, high))) {
         dbg("load: no low memory for %x..%x\n", low, high);
         err = FS_ENOSPC;
@@ -5361,12 +5715,11 @@ int program_load(const struct fs_file *file, uint64_t *entry) {
            rest of the work itself through these same syscalls. */
         dbg("load: interpreter %s\n", interp);
         if (fs_stat(interp, &w->loader) < 0 ||
-            read_at(&w->loader, 0, &w->loader_header,
-                    sizeof w->loader_header) < 0) {
+            elf_read(&w->loader, &w->loader_header) < 0) {
             err = PROGRAM_ENOINTERP;
             goto done;
         }
-        started_base = vm_base() + USER_INTERP;
+        started_base = AT(INTERP);
         err = load_elf_at(&w->loader, &w->loader_header, started_base, entry,
                           NULL, NULL, 0);
         if (err < 0) {
@@ -5414,7 +5767,8 @@ struct stack_work {
 static uint64_t build_stack(unsigned argc, const char *const *argv,
                             unsigned envc, const char *const *envv) {
     struct stack_work *work = NULL;
-    uint64_t top = vm_base() + USER_STACK;
+    uint64_t top = AT(STACK);
+    unsigned word = proc->ia32 ? 4 : 8;     /* a 32-bit program's are half as wide */
     uint64_t random_at, rsp;
     uint64_t *out;
     unsigned n = 0, count = 0;
@@ -5423,7 +5777,8 @@ static uint64_t build_stack(unsigned argc, const char *const *argv,
        touched, like every other page of a region - most programs use a few
        of the sixty-four, and buying them all up front was a quarter of a
        megabyte each program had whether it wanted it or not. */
-    if (!vm_holds(top - USER_STACK_BYTES, USER_STACK_BYTES)) {
+    if (!vm_holds(top - USER_STACK_BYTES, USER_STACK_BYTES) ||
+        !user_range(top - 2 * PAGE_SIZE, 2 * PAGE_SIZE)) {
         return 0;
     }
     if ((work = mem_alloc(sizeof *work)) == NULL) {
@@ -5477,22 +5832,24 @@ static uint64_t build_stack(unsigned argc, const char *const *argv,
     /* argc, the arguments, their terminator, the environment and its
        terminator, then the pairs - and all of it has to leave the stack
        sixteen-byte aligned. */
-    rsp = (top - (1 + argc + 1 + envc + 1 + count * 2) * 8) & ~15ull;
+    rsp = (top - (1 + argc + 1 + envc + 1 + count * 2) * word) & ~15ull;
     out = (uint64_t *)rsp;
 
-    out[n++] = argc;
+#define PUT(v) (word == 8 ? (void)(out[n++] = (v)) : (void)(((uint32_t *)out)[n++] = (uint32_t)(v)))
+    PUT(argc);
     for (unsigned i = 0; i < argc; i++) {
-        out[n++] = strings[i];
+        PUT(strings[i]);
     }
-    out[n++] = 0;
+    PUT(0);
     for (unsigned i = 0; i < envc; i++) {
-        out[n++] = strings[argc + i];
+        PUT(strings[argc + i]);
     }
-    out[n++] = 0;
+    PUT(0);
     for (unsigned i = 0; i < count; i++) {
-        out[n++] = aux[i].type;
-        out[n++] = aux[i].value;
+        PUT(aux[i].type);
+        PUT(aux[i].value);
     }
+#undef PUT
     mem_free(work);
     return rsp;
 }
@@ -6163,6 +6520,7 @@ static uint64_t fork_on(uint64_t stack, bool share) {
     memcpy(child->name, parent->name, sizeof child->name);
     memcpy(child->exe, parent->exe, sizeof child->exe);
     child->cred = parent->cred;
+    child->ia32 = parent->ia32;
     if (share) {
         child->space = parent->space;
         child->borrowed = true;
@@ -6172,7 +6530,7 @@ static uint64_t fork_on(uint64_t stack, bool share) {
         proc_free(child);
         return ERR(ENOMEM);
     }
-    if (!thread_spawn(child, &regs, rdmsr(MSR_FS_BASE), blocked)) {
+    if (!thread_spawn(child, &regs, tls_fs(), blocked)) {
         if (!share) {
             vm_space_free(&child->own);
         }
@@ -6207,7 +6565,7 @@ static uint64_t start_thread(uint64_t flags, uint64_t stack, uint64_t parent_tid
         ((flags & CLONE_CHILD_CLEARTID) && !user_range(child_tid, 4))) {
         return ERR(EFAULT);
     }
-    tid = thread_create(user_frame, stack, (flags & CLONE_SETTLS) ? tls : rdmsr(MSR_FS_BASE),
+    tid = thread_create(user_frame, stack, (flags & CLONE_SETTLS) ? tls : tls_fs(),
                         (flags & CLONE_CHILD_CLEARTID) ? child_tid : 0);
     if (tid < 0) {
         return ERR(-tid);
@@ -6500,7 +6858,7 @@ static unsigned copy_list(uint64_t list, char *line, size_t room, size_t *used,
         return 0;
     }
     for (const uint64_t *p = (const uint64_t *)list;
-         n < max - 1 && user_range((uint64_t)p, 8) && *p != 0; p++) {
+         n < max - 1 && user_range((uint64_t)(uintptr_t)p, 8) && *p != 0; p++) {
         const char *word = user_string(*p);
         size_t len = word == NULL ? 0 : strlen(word) + 1;
 
@@ -6740,7 +7098,7 @@ static uint64_t sys_execve(uint64_t path, uint64_t argv, uint64_t envp) {
         proc_run(cmd, join_args(held->line, argc));
         if (taken != NULL) {
             vga_capture_end();
-            write_to(handle_of(1), (uint64_t)taken, strlen(taken));
+            write_to(handle_of(1), (uint64_t)(uintptr_t)taken, strlen(taken));
             mem_free(taken);
         }
         if (!peak_exec) {
@@ -6760,7 +7118,7 @@ static uint64_t sys_execve(uint64_t path, uint64_t argv, uint64_t envp) {
             const char *say[] = { "mem: peak: ", held->words[0], ": not found\n" };
 
             for (unsigned i = 0; i < 3; i++) {
-                write_to(handle_of(2), (uint64_t)say[i], strlen(say[i]));
+                write_to(handle_of(2), (uint64_t)(uintptr_t)say[i], strlen(say[i]));
             }
             peak_end(proc, false);
             mem_free(held);
@@ -6800,7 +7158,7 @@ static uint64_t sys_execve(uint64_t path, uint64_t argv, uint64_t envp) {
             return ERR(ENOENT);
         }
     } else if (memcmp(held->shebang, "\x7F" "ELF", 4) != 0 &&
-               memcmp(held->shebang, "TEF64", 5) != 0) {
+               memcmp(held->shebang, "TEF", 3) != 0) {
         mem_free(held);
         return ERR(ENOEXEC);        /* while the caller is still there to hear it */
     }
@@ -6845,8 +7203,8 @@ static uint64_t sys_execve(uint64_t path, uint64_t argv, uint64_t envp) {
 
     /* The syscall returns into the new program: its entry, its stack, every
        register clear, no thread data yet. */
-    wrmsr(MSR_FS_BASE, 0);
-    wrmsr(MSR_GS_BASE, 0);
+    tls_fs_set(0);
+    tls_gs_set(0);
     memset(user_frame, 0, sizeof *user_frame);
     user_frame->rip = entry;
     user_frame->rsp = rsp;

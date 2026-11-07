@@ -298,40 +298,50 @@ static bool dynamic(void) {
     return codes();
 }
 
+/* Whether s has more to read. */
+static bool more(struct source *s) {
+    return s->pos < s->len || (!s->bad && s->fill != NULL && s->fill(s) > 0);
+}
+
+/* Every member, one after another: an .apk is three. */
 bool gunzip(struct source *src, sink_fn out) {
     uint8_t h[10];
-    bool ok;
+    bool ok = true;
     unsigned last;
 
     in = src;
-    if (!src_read(in, h, 10) || h[0] != 0x1F || h[1] != 0x8B || h[2] != 8) {
-        return false;
-    }
-    if (h[3] & 4) {
-        unsigned n = src_byte(in);
-
-        src_read(in, NULL, n | (unsigned)src_byte(in) << 8);
-    }
-    for (unsigned flag = 8; flag <= 16; flag <<= 1) {     /* name, comment */
-        while ((h[3] & flag) && src_byte(in) != 0 && !in->bad) {
-        }
-    }
-    if (h[3] & 2) {
-        src_read(in, NULL, 2);
-    }
     if (!window_open(32768, out)) {
         return false;
     }
-    bitbuf = bitcnt = 0;
     do {
-        last = bits(1);
-        switch (bits(2)) {
-        case 0:  ok = stored();  break;
-        case 1:  ok = fixed();   break;
-        case 2:  ok = dynamic(); break;
-        default: ok = false;
+        if (!src_read(in, h, 10) || h[0] != 0x1F || h[1] != 0x8B || h[2] != 8) {
+            ok = false;
+            break;
         }
-    } while (ok && !last);
+        if (h[3] & 4) {
+            unsigned n = src_byte(in);
+
+            src_read(in, NULL, n | (unsigned)src_byte(in) << 8);
+        }
+        for (unsigned flag = 8; flag <= 16; flag <<= 1) {     /* name, comment */
+            while ((h[3] & flag) && src_byte(in) != 0 && !in->bad) {
+            }
+        }
+        if (h[3] & 2) {
+            src_read(in, NULL, 2);
+        }
+        bitbuf = bitcnt = 0;
+        do {
+            last = bits(1);
+            switch (bits(2)) {
+            case 0:  ok = stored();  break;
+            case 1:  ok = fixed();   break;
+            case 2:  ok = dynamic(); break;
+            default: ok = false;
+            }
+        } while (ok && !last && !wstop);
+        ok = ok && src_read(in, NULL, 8);                       /* CRC and size */
+    } while (ok && !wstop && more(in));
     return window_close(ok);
 }
 

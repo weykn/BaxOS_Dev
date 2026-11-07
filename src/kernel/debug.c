@@ -37,7 +37,7 @@ void dbg_screen(char c) {
     out(c);
 }
 
-void dbg(const char *fmt, ...) {
+void (dbg)(const char *fmt, ...) {
     va_list args;
 
     va_start(args, fmt);
@@ -45,7 +45,7 @@ void dbg(const char *fmt, ...) {
         if (*fmt != '%') {
             out(*fmt);
         } else if (*++fmt == 's') {
-            for (const char *s = va_arg(args, const char *); *s != '\0'; s++) {
+            for (const char *s = (const char *)(uintptr_t)va_arg(args, uint64_t); *s != '\0'; s++) {
                 out(*s);
             }
         } else if (*fmt == 'x') {

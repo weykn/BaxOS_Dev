@@ -36,10 +36,27 @@ struct dap {
    program linked to a fixed address may have mapped over is put back for
    the call, since the BIOS lives there. */
 static void call(uint8_t vector) {
+#ifdef __i386__
+    /* bios.asm's 32-bit way back puts every segment back itself. */
     regs->vector = vector;
     vm_firmware_view(true);
     ((void (*)(void))boot->bios_call)();
     vm_firmware_view(false);
+#else
+    uint32_t gs, lo, hi;
+
+    /* GS comes back null, which only a 32-bit program minds: its thread
+       pointer is in the segment GS names. Named again, then the base
+       written back as it was, as a 64-bit program sets it. */
+    __asm__ volatile("mov %%gs, %0" : "=r"(gs));
+    __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(0xC0000101));
+    regs->vector = vector;
+    vm_firmware_view(true);
+    ((void (*)(void))boot->bios_call)();
+    vm_firmware_view(false);
+    __asm__ volatile("mov %0, %%gs" : : "r"(gs));
+    __asm__ volatile("wrmsr" : : "c"(0xC0000101), "a"(lo), "d"(hi));
+#endif
 }
 
 /* count sectors from the start of the disk, at most RUN, through the
@@ -52,8 +69,8 @@ static int disk(bool write, uint64_t lba, unsigned count) {
     memset(regs, 0, sizeof *regs);
     regs->eax = write ? 0x4300 : 0x4200;
     regs->edx = boot->bios_drive;
-    regs->esi = (uint32_t)((uint64_t)dap & 0xF);
-    regs->ds = (uint16_t)((uint64_t)dap >> 4);
+    regs->esi = (uint32_t)((uint64_t)(uintptr_t)dap & 0xF);
+    regs->ds = (uint16_t)((uint64_t)(uintptr_t)dap >> 4);
     call(0x13);
     return (regs->flags & CARRY) ? -1 : 0;
 }
@@ -329,7 +346,7 @@ static const uint8_t *table(const char *name) {
     return NULL;
 }
 
-void bios_power_off(void) {
+static void acpi_off(void) {
     const uint8_t *fadt = table("FACP");
 
     if (fadt == NULL) {
@@ -384,6 +401,13 @@ void bios_power_off(void) {
     for (unsigned i = 0; i < 100000000; i++) {
         __asm__ volatile("pause");
     }
+}
+
+void bios_power_off(void) {
+    /* The tables are where a program may have pages of its own (vm.c). */
+    vm_firmware_view(true);
+    acpi_off();
+    vm_firmware_view(false);
 }
 
 void bios_restart(void) {

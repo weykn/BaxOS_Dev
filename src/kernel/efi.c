@@ -17,6 +17,7 @@
 #include "bios.h"
 #include "share.h"
 #include "pci.h"
+#include "ia32.h"
 
 /* The kernel's side of the firmware.
  *
@@ -230,12 +231,23 @@ void efi_init(struct boot_info *info) {
     } else {
         uint64_t at = 0;
 
-        /* The firmware's interrupts only while it is called (efi_call). */
+        /* The firmware's interrupts only while it is called (efi_call). On
+           i386, kept below where programs go, as all the kernel's is (mem.c). */
         __asm__ volatile("cli");
-        if (!EFI_ERROR(EFI_CALL(boot->system->boot->allocate_pages, EFI_ALLOCATE_ANY,
+#ifdef __i386__
+        at = IA32_EXEC - 1;
+#endif
+        if (!EFI_ERROR(EFI_CALL(boot->system->boot->allocate_pages,
+                                sizeof(void *) == 4 ? EFI_ALLOCATE_MAX : EFI_ALLOCATE_ANY,
                                 4 /* boot services data */, EFI_STACK_PAGES, &at))) {
             efi_stack = at + EFI_STACK_PAGES * 4096;
         }
+#ifdef __i386__
+        /* A 32-bit firmware leaves paging off; the kernel's programs need it. */
+        if (!mem_paging_on()) {
+            halt_forever();
+        }
+#endif
     }
     smbios_read();
 }
@@ -271,6 +283,35 @@ uint64_t efi_free_kib(void) {
     }
     EFI_CALL(bs->free_pool, map);
     return pages * 4;
+}
+
+/* Where the last memory the map lists ends - memory of any use, not the
+   reserved or devices' stretches: past it a program in low memory hides
+   nothing (vm.c). */
+uint64_t efi_ram_top(void) {
+    struct efi_boot_services *bs = boot->system->boot;
+    struct efi_memory_descriptor *map = NULL;
+    efi_uintn size = 0, key, stride;
+    uint64_t top = 0;
+    uint32_t version;
+
+    EFI_CALL(bs->get_memory_map, &size, map, &key, &stride, &version);
+    size += 4 * stride;
+    if (EFI_ERROR(EFI_CALL(bs->allocate_pool, EFI_LOADER_DATA, size, (void **)&map))) {
+        return (uint64_t)-1;
+    }
+    if (!EFI_ERROR(EFI_CALL(bs->get_memory_map, &size, map, &key, &stride, &version))) {
+        for (efi_uintn at = 0; at < size; at += stride) {
+            const struct efi_memory_descriptor *d = (const void *)((char *)map + at);
+            uint64_t end = d->physical + d->pages * 4096;
+
+            if (d->type >= 1 && d->type <= 10 && d->type != 8 && end > top) {     /* memory */
+                top = end;
+            }
+        }
+    }
+    EFI_CALL(bs->free_pool, map);
+    return top != 0 ? top : (uint64_t)-1;
 }
 
 /* In syscall_entry.asm: the RFLAGS a program starts with. */
@@ -483,8 +524,48 @@ int ata_read(uint32_t lba, void *buffer) {
 
 static unsigned block_run = BLOCK_RUN_MAX;
 
+static int read_direct(uint32_t lba, unsigned count, void *buffer);
+static int write_direct(uint32_t lba, unsigned count, const void *buffer);
+
+/* A program's low memory (vm.c) is not always the machine's memory at the
+   same address, and a disk - the firmware's driver, or a module's - moves
+   data to and from where the address says. So there, it goes through pages
+   of the kernel's. */
+#define BOUNCE_PAGES 16
+
+static int bounced(uint32_t lba, unsigned count, void *buffer, bool write) {
+    uint64_t at = mem_pages(BOUNCE_PAGES);
+    int err = 0;
+
+    if (at == 0) {
+        return -1;
+    }
+    while (count > 0 && err == 0) {
+        unsigned n = count < BOUNCE_PAGES * 8 ? count : BOUNCE_PAGES * 8;
+
+        if (write) {
+            memcpy((void *)at, buffer, (size_t)n * 512);
+            err = write_direct(lba, n, (void *)at);
+        } else if ((err = read_direct(lba, n, (void *)at)) == 0) {
+            memcpy(buffer, (void *)at, (size_t)n * 512);
+        }
+        buffer = (char *)buffer + (size_t)n * 512;
+        lba += n;
+        count -= n;
+    }
+    mem_pages_free(at, BOUNCE_PAGES);
+    return err;
+}
+
 /* Straight to the disk, with no cache in the way. */
 static int read_now(uint32_t lba, unsigned count, void *buffer) {
+    if (vm_low_moved((uint64_t)(uintptr_t)buffer, (uint64_t)count * 512)) {
+        return bounced(lba, count, buffer, false);
+    }
+    return read_direct(lba, count, buffer);
+}
+
+static int read_direct(uint32_t lba, unsigned count, void *buffer) {
     struct efi_block_io *disk = boot->disk;
 
     if (disk_base != 0) {
@@ -547,6 +628,15 @@ int ata_write_many(uint32_t lba, unsigned count, const void *buffer) {
         disk_cache->written(lba, count, buffer);
     }
     shared_written(lba, count);     /* pages mapped from there are out of date */
+    if (vm_low_moved((uint64_t)(uintptr_t)buffer, (uint64_t)count * 512)) {
+        return bounced(lba, count, (void *)buffer, true);
+    }
+    return write_direct(lba, count, buffer);
+}
+
+static int write_direct(uint32_t lba, unsigned count, const void *buffer) {
+    struct efi_block_io *disk = boot->disk;
+
     if (disk_base != 0) {
         return disk_driver->write(disk_base + lba, count, buffer);
     }

@@ -6,6 +6,10 @@
 ; goes to long mode and enters the kernel, which is built into the end of
 ; this file (incbin below) and runs where it lies.
 ;
+; Assembled with I386 it is the 32-bit OS's: protected mode with PAE paging
+; instead of long mode, and a kernel called the C way. Either first checks
+; that the processor can run its kernel, and says so if not.
+;
 ; It stays: bios_call is how the kernel gets back into real mode to ask the
 ; BIOS for a sector or a key, until modules drive the disk and the
 ; keyboard. That is the BIOS counterpart of UEFI's boot services.
@@ -16,7 +20,8 @@
 ;   0x00500  the E820 map
 ;   0x00B00  the boot information, then bios_regs
 ;   0x01000  page tables, four directories of 2 MiB pages (the kernel
-;            builds its own and gives these back)
+;            builds its own and gives these back); on i386 no PML4, and
+;            the PDPT's four entries at 0x2000
 ;   0x07000  the real-mode stack, up to 0x7C00
 ;   0x08000  this loader, its IDT, then the kernel's KERNEL_BYTES
 ;   0x60000  64 KiB for INT 13h to read into
@@ -27,7 +32,7 @@ BITS 16
 ORG 0x8000
 DEFAULT ABS
 
-KERNEL_BYTES equ 0x28000            ; boot.h
+KERNEL_BYTES equ 0x30000            ; boot.h
 BOOT_MAGIC   equ 0x536F7861426     ; boot.h
 
 E820       equ 0x0500
@@ -89,6 +94,28 @@ start:
     mov ss, ax
     mov sp, STACK
     cld
+
+    ; ---- the processor -----------------------------------------------------
+%ifdef I386
+    mov eax, 1                          ; PAE for the tables, FXSR for the
+    cpuid                               ; registers a thread keeps
+    and edx, (1 << 6) | (1 << 24)
+    cmp edx, (1 << 6) | (1 << 24)
+    je .cpu
+%else
+    mov eax, 0x80000000
+    cpuid
+    cmp eax, 0x80000001
+    jb .no_cpu
+    mov eax, 0x80000001
+    cpuid
+    test edx, 1 << 29                   ; long mode
+    jnz .cpu
+.no_cpu:
+%endif
+    mov si, msg_cpu
+    jmp fail
+.cpu:
 
     ; ---- A20 ---------------------------------------------------------------
     mov ax, 0x2401
@@ -211,16 +238,23 @@ start:
     jmp fail
 
     ; ---- page tables: 4 GiB one to one -------------------------------------
+    ; A PDPT entry is present and nothing else under PAE, which reserves
+    ; the bits for writable and user there.
+%ifdef I386
+PDPT_BITS equ 1
+%else
+PDPT_BITS equ 3
+%endif
 .tables:
     mov di, PML4
     mov cx, (PD + 4 * 4096 - PML4) / 4
     xor eax, eax
     rep stosd
     mov dword [PML4], PDPT | 3
-    mov dword [PDPT], PD | 3
-    mov dword [PDPT + 8], (PD + 0x1000) | 3
-    mov dword [PDPT + 16], (PD + 0x2000) | 3
-    mov dword [PDPT + 24], (PD + 0x3000) | 3
+    mov dword [PDPT], PD | PDPT_BITS
+    mov dword [PDPT + 8], (PD + 0x1000) | PDPT_BITS
+    mov dword [PDPT + 16], (PD + 0x2000) | PDPT_BITS
+    mov dword [PDPT + 24], (PD + 0x3000) | PDPT_BITS
     mov di, PD
     mov eax, 0x83                       ; present, writable, 2 MiB
     xor edx, edx
@@ -254,6 +288,19 @@ start:
     mov cx, I_SIZE
     rep movsb
 
+%ifdef I386
+    ; ---- protected mode, with PAE paging ------------------------------------
+    cli
+    lgdt [gdt_desc]
+    mov eax, 1 << 5                     ; PAE
+    mov cr4, eax
+    mov eax, PDPT
+    mov cr3, eax
+    mov eax, cr0
+    or eax, 0x80000001                  ; PG, PE
+    mov cr0, eax
+    jmp CODE32:enter
+%else
     ; ---- long mode ---------------------------------------------------------
     cli
     lgdt [gdt_desc]
@@ -269,6 +316,7 @@ start:
     or eax, 0x80000001                  ; PG, PE
     mov cr0, eax
     jmp CODE64:enter
+%endif
 
 fail:
     lodsb
@@ -282,6 +330,27 @@ fail:
     hlt
     jmp .halt
 
+%ifdef I386
+BITS 32
+enter:
+    mov ax, DATA
+    mov ds, ax
+    mov es, ax
+    mov ss, ax
+    xor eax, eax
+    mov fs, ax
+    mov gs, ax
+    lidt [idt_desc]                     ; empty: the kernel fills the traps in
+    mov esp, STACK
+    mov edi, kernel_end                 ; the kernel's .bss
+    mov ecx, kernel + KERNEL_BYTES
+    sub ecx, edi
+    xor eax, eax
+    rep stosb
+    push INFO                           ; kernel_main's one argument
+    push 0                              ; and a return address it never uses
+    jmp kernel
+%else
 BITS 64
 enter:
     mov ax, DATA
@@ -301,6 +370,7 @@ enter:
     rep stosb
     mov rdi, INFO
     jmp kernel
+%endif
 
 ; ---- bios_call ---------------------------------------------------------------
 ;
@@ -311,6 +381,48 @@ enter:
 ; itself - the BIOS needs its timer and its disk and keyboard interrupts -
 ; and the kernel's IDT is out of the way while they are.
 
+%ifdef I386
+; The 32-bit way down: the same as below, from protected mode with paging,
+; every segment register kept to put back - GS a program's thread pointer.
+BITS 32
+bios_call:
+    push ebx
+    push esi
+    push edi
+    push ebp
+    mov [saved_rsp], esp
+    sgdt [saved_gdt]
+    sidt [saved_idt]
+    mov eax, cr0
+    mov [saved_cr0], eax
+    mov eax, cr3
+    mov [saved_cr3], eax
+    mov eax, cr4
+    mov [saved_cr4], eax
+    mov ax, cs
+    mov [saved_cs], ax
+    mov ax, ds
+    mov [saved_ds], ax
+    mov ax, es
+    mov [saved_es], ax
+    mov ax, ss
+    mov [saved_ss], ax
+    mov ax, fs
+    mov [saved_fs], ax
+    mov ax, gs
+    mov [saved_gs], ax
+    lgdt [gdt_desc]
+    jmp CODE32:.compat
+.compat:
+    mov ax, DATA
+    mov ds, ax
+    mov es, ax
+    mov ss, ax
+    mov eax, cr0
+    and eax, 0x7FFEFFFF                 ; paging, and write protection, off
+    mov cr0, eax
+    jmp CODE16:.prot16
+%else
 bios_call:
     push rbx
     push rbp
@@ -371,6 +483,7 @@ BITS 32
     and eax, ~(1 << 8)                  ; and long mode with it
     wrmsr
     jmp CODE16:.prot16
+%endif
 BITS 16
 .prot16:
     mov ax, DATA16
@@ -441,6 +554,33 @@ BITS 32
     mov cr4, eax
     mov eax, [saved_cr3]
     mov cr3, eax
+%ifdef I386
+    mov eax, [saved_cr0]
+    mov cr0, eax
+    lgdt [saved_gdt]
+    lidt [saved_idt]
+    mov ax, [saved_ds]
+    mov ds, ax
+    mov ax, [saved_es]
+    mov es, ax
+    mov ax, [saved_ss]
+    mov ss, ax
+    mov ax, [saved_fs]
+    mov fs, ax
+    mov ax, [saved_gs]
+    mov gs, ax
+    mov esp, [saved_rsp]
+    movzx eax, word [saved_cs]
+    push eax
+    push .back32
+    retf
+.back32:
+    pop ebp
+    pop edi
+    pop esi
+    pop ebx
+    ret
+%else
     mov ecx, 0xC0000080
     mov eax, [saved_efer]
     mov edx, [saved_efer + 4]
@@ -487,6 +627,7 @@ BITS 64
     pop rbp
     pop rbx
     ret
+%endif
 
 ; ---------------------------------------------------------------------------
 
@@ -502,7 +643,11 @@ gdt_desc:
     dw gdt_desc - gdt - 1
     dq gdt
 idt_desc:
+%ifdef I386
+    dw 2048 - 1                         ; 256 gates of 8 bytes
+%else
     dw 4096 - 1
+%endif
     dq idt
 ivt_desc:
     dw 0x3FF
@@ -535,6 +680,11 @@ saved_ss:   dw 0
 info:       times I_SIZE db 0
 
 msg_memory: db "Tuxlet OS: no memory map", 0
+%ifdef I386
+msg_cpu:    db "Tuxlet OS: needs a processor with PAE and FXSR", 0
+%else
+msg_cpu:    db "Tuxlet OS: needs a 64-bit processor", 0
+%endif
 msg_screen: db "Tuxlet OS: no 32-bit VBE mode", 0
 
 align 4096

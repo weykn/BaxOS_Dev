@@ -2267,7 +2267,13 @@ static uint64_t sys_sysinfo(uint64_t out, uint64_t b, uint64_t c) {
 /* The system's name is Tuxlet, unless /etc/tuxlet/uname's first line says
    otherwise - "Linux" for a program that will not run anywhere else. */
 static uint64_t sys_uname(uint64_t out, uint64_t b, uint64_t c) {
-    static const char *const fields[] = { "Tuxlet", "tuxlet", "1", "1", "x86_64", "" };
+    static const char *const fields[] = { "Tuxlet", "tuxlet", "1", "1",
+#ifdef __i386__
+                                          "i686",
+#else
+                                          "x86_64",
+#endif
+                                          "" };
     char *field = (char *)out;
     struct fs_file file;
     const char *name;

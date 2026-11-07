@@ -11,7 +11,10 @@
  * remove is the dbg() lines themselves. */
 
 #ifdef DEBUG
+#include "fmt.h"
+
 void dbg(const char *fmt, ...);     /* %s, %u and %x, as kprintf takes them */
+#define dbg(fmt, ...) dbg(fmt __VA_OPT__(, FMT_ARGS(__VA_ARGS__)))
 
 /* One character of what went on screen, sent the same way: with the console
    mirrored to the port, a boot can be read back from a terminal without a

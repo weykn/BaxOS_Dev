@@ -53,7 +53,7 @@ static void send(const uint8_t *frame, size_t len) {
         memset(tx_buf + len, 0, 60 - len);      /* the card does not pad */
         len = 60;
     }
-    outl(io + TSAD + 4 * tx_slot, (uint32_t)(uint64_t)tx_buf);
+    outl(io + TSAD + 4 * tx_slot, (uint32_t)(uint64_t)(uintptr_t)tx_buf);
     outl(io + TSD + 4 * tx_slot, (uint32_t)len);
     while ((inl(io + TSD + 4 * tx_slot) & TSD_TOK) == 0 && efi_uptime_ms() < until) {
         __asm__ volatile("pause");

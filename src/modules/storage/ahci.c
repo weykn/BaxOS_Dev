@@ -83,7 +83,7 @@ static int command(uint8_t op, uint64_t lba, unsigned count, uint64_t data, bool
     volatile uint32_t *header = (volatile uint32_t *)page;
     volatile uint8_t *table = (volatile uint8_t *)page + 0x500;
     volatile uint32_t *prd = (volatile uint32_t *)(table + 0x80);
-    uint64_t t = (uint64_t)table;
+    uint64_t t = (uint64_t)(uintptr_t)table;
 
     for (unsigned i = 0; i < 0x80; i++) {
         table[i] = 0;

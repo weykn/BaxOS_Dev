@@ -170,7 +170,7 @@ static void ring_room(struct ring *r, unsigned n) {
     if (r->next + n <= RING - 1) {
         return;
     }
-    r->trb[r->next].param = (uint64_t)&r->trb[0];
+    r->trb[r->next].param = (uint64_t)(uintptr_t)&r->trb[0];
     r->trb[r->next].status = 0;
     r->trb[r->next].control = TRB_LINK << 10 | TRB_TOGGLE | r->cycle;
     r->next = 0;
@@ -223,7 +223,7 @@ static void events(struct controller *c) {
             c->event = 0;
             c->cycle ^= 1;
         }
-        wr64(c->run, 0x20 + ERDP, (uint64_t)&ring[c->event] | 8);
+        wr64(c->run, 0x20 + ERDP, (uint64_t)(uintptr_t)&ring[c->event] | 8);
     }
 }
 
@@ -274,8 +274,8 @@ static void endpoint_context(struct device *d, unsigned epid, unsigned type,
 
     e[0] = interval << 16;
     e[1] = 3u << 1 | type << 3 | size << 16;
-    e[2] = (uint32_t)(uint64_t)r | 1;
-    e[3] = (uint32_t)((uint64_t)r >> 32);
+    e[2] = (uint32_t)(uint64_t)(uintptr_t)r | 1;
+    e[3] = (uint32_t)((uint64_t)(uintptr_t)r >> 32);
     e[4] = type == 4 ? 8 : type == 7 ? size | size << 16 : size;
     r->slot = d->slot;
     r->epid = (uint8_t)epid;
@@ -294,7 +294,7 @@ static void unstall(struct device *d, struct ring *r) {
     struct controller *c = d->c;
 
     command(c, 0, TRB_RESET_EP << 10 | (uint32_t)r->epid << 16 | (uint32_t)d->slot << 24);
-    command(c, (uint64_t)&r->trb[r->next] | r->cycle,
+    command(c, (uint64_t)(uintptr_t)&r->trb[r->next] | r->cycle,
             TRB_SET_DEQUEUE << 10 | (uint32_t)r->epid << 16 | (uint32_t)d->slot << 24);
     r->done = r->next;
 }
@@ -318,7 +318,7 @@ static int control(struct device *d, uint8_t type, uint8_t request, uint16_t val
     ring_put(r, setup, 8, TRB_SETUP << 10 | TRB_IDT |
              (length == 0 ? 0 : in ? 3u << 16 : 2u << 16));
     if (length > 0) {
-        ring_put(r, (uint64_t)buffer, length, TRB_DATA << 10 | (in ? TRB_IN : 0));
+        ring_put(r, (uint64_t)(uintptr_t)buffer, length, TRB_DATA << 10 | (in ? TRB_IN : 0));
     }
     ring_put(r, 0, 0, TRB_STATUS << 10 | TRB_IOC | (in && length > 0 ? 0 : TRB_IN));
     c->bells[d->slot] = 1;
@@ -348,7 +348,7 @@ static int host_bulk(const struct usb_device *u, uint8_t address, void *data, ui
     struct device *d = (struct device *)u;
     unsigned epid = (address & 0xF) * 2 + ((address & USB_IN) ? 1 : 0);
     struct ring *r = ep_ring(d, epid);
-    uint64_t at = (uint64_t)data, end = at + length;
+    uint64_t at = (uint64_t)(uintptr_t)data, end = at + length;
     unsigned n = 0;
 
     for (uint64_t p = at; p < end; p = (p | 0xFFFF) + 1) {
@@ -409,7 +409,7 @@ static int host_report(const struct usb_device *u, void *data, unsigned length) 
     }
     r->size = (uint8_t)(u->in_size < sizeof r->report ? u->in_size : sizeof r->report);
     ring_room(r, 1);
-    ring_put(r, (uint64_t)r->report, r->size, TRB_NORMAL << 10 | TRB_IOC);
+    ring_put(r, (uint64_t)(uintptr_t)r->report, r->size, TRB_NORMAL << 10 | TRB_IOC);
     r->queued = 1;
     d->c->bells[d->slot] = d->in_ep;
     return got;

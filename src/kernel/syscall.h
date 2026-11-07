@@ -9,8 +9,9 @@
 
 /* User programs, and the syscalls they make.
  *
- * A program is an ELF64 executable, loaded where its program headers say and
- * entered at the address in its header. A dynamically linked one
+ * A program is an ELF executable, loaded where its program headers say and
+ * entered at the address in its header - 64-bit, or 32-bit, which runs in
+ * compatibility mode with compat/ia32 answering its calls (ia32.h). A dynamically linked one
  * arrives with the path of its loader, and that is loaded too and entered
  * instead.
  *

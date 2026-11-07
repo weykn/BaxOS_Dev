@@ -90,7 +90,7 @@ static void send(const uint8_t *frame, size_t len) {
         return;
     }
     memcpy(tx_buf, frame, len);
-    d->addr = (uint64_t)tx_buf;
+    d->addr = (uint64_t)(uintptr_t)tx_buf;
     d->opts2 = 0;
     __asm__ volatile("" : : : "memory");
     d->opts1 = OWN | FIRST | LAST | (tx_next == TX_COUNT - 1 ? END : 0) | (uint32_t)len;
@@ -156,7 +156,7 @@ static bool start(void) {
     tx_buf = rx_buf + RX_COUNT * BUF;
     rx_next = tx_next = 0;
     for (unsigned i = 0; i < RX_COUNT; i++) {
-        rx[i].addr = (uint64_t)(rx_buf + i * BUF);
+        rx[i].addr = (uint64_t)(uintptr_t)(rx_buf + i * BUF);
         rx[i].opts1 = OWN | (i == RX_COUNT - 1 ? END : 0) | BUF;
     }
 
@@ -169,10 +169,10 @@ static bool start(void) {
     }
     w32(MISC, r32(MISC) & ~RXDV_GATE);  /* or nothing is received */
     w16(RX_MAX_SIZE, BUF);
-    w32(TX_RING + 4, (uint32_t)((uint64_t)tx >> 32));
-    w32(TX_RING, (uint32_t)(uint64_t)tx);
-    w32(RX_RING + 4, (uint32_t)((uint64_t)rx >> 32));
-    w32(RX_RING, (uint32_t)(uint64_t)rx);
+    w32(TX_RING + 4, (uint32_t)((uint64_t)(uintptr_t)tx >> 32));
+    w32(TX_RING, (uint32_t)(uint64_t)(uintptr_t)tx);
+    w32(RX_RING + 4, (uint32_t)((uint64_t)(uintptr_t)rx >> 32));
+    w32(RX_RING, (uint32_t)(uint64_t)(uintptr_t)rx);
     w8(CFG9346, 0);
     w8(CHIP_CMD, CMD_TX | CMD_RX);
     w32(RX_CONFIG, (is_8125 ? 8u << 27 : 1u << 15) | 7u << 8 | ACCEPT);

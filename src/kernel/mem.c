@@ -13,6 +13,7 @@
 #include "syscall.h"
 #include "vga.h"
 #include "vm.h"
+#include "ia32.h"
 
 /* ---- the pages ------------------------------------------------------------
  *
@@ -63,17 +64,111 @@ static void run_remove(unsigned i) {
    It is filled sixteen at a time from the top run, and also takes what the
    list ever has no room for. Only pages above the gigabyte a program at a
    fixed address can hide (FIXED_TOP below): one down there could be under
-   such a program while its first word is written. */
+   such a program while its first word is written - and, on i386, below
+   IA32_EXEC too, the pool where no program goes (take), which on a machine
+   with no more than a gigabyte is where every single page of the kernel's
+   comes from. */
 #define LOOSE_FLOOR (1ull << 30)
+
+#ifdef __i386__
+#define LOOSE_OK(at) ((at) >= LOOSE_FLOOR || ((at) < IA32_EXEC && (at) >= 0x100000))
+#else
+#define LOOSE_OK(at) ((at) >= LOOSE_FLOOR)
+#endif
 
 #define LOOSE_FILL  16
 
 static uint64_t loose, loose_count;
 
+/* Pages of the 32-bit programs' gigabyte (take, below) that the list of
+   runs has no room for: a program frees its pages there one by one, every
+   other one where two programs took turns, and each is a run of its own.
+   They cannot be chained - a program may want any of them back at its own
+   address - so they are a bit each in a map instead, made out of the pool
+   the first time one is needed: 28 KiB for the whole gigabyte. */
+#define POOL_TOP  IA32_EXEC
+#define FIXED_END (1ull << 30)
+#define WIN_PAGES ((uint32_t)((FIXED_END - POOL_TOP) / PAGE))
+
+static uint8_t *spill;
+static uint32_t spill_count, spill_next;
+
+static uint64_t take_below(size_t count, uint64_t limit);
+
+/* The map, made while the pool still has room for it in one piece: as the
+   kernel takes the machine's memory, where there is RAM in the gigabyte. */
+static void spill_make(uint64_t top) {
+    uint64_t map;
+
+    if (spill == NULL && top > POOL_TOP &&
+        (map = take_below((WIN_PAGES / 8 + PAGE - 1) / PAGE, POOL_TOP)) != 0) {
+        spill = (uint8_t *)(uintptr_t)map;
+        memset(spill, 0, WIN_PAGES / 8);
+    }
+}
+
+static bool spill_put(uint64_t at) {
+    static bool making;
+
+    if (at < POOL_TOP || at >= FIXED_END) {
+        return false;
+    }
+    if (spill == NULL) {
+        uint64_t map;
+
+        if (making) {
+            return false;
+        }
+        making = true;
+        map = take_below((WIN_PAGES / 8 + PAGE - 1) / PAGE, POOL_TOP);
+        making = false;
+        if (map == 0) {
+            return false;
+        }
+        spill = (uint8_t *)(uintptr_t)map;
+        memset(spill, 0, WIN_PAGES / 8);
+    }
+    uint32_t i = (uint32_t)((at - POOL_TOP) / PAGE);
+
+    if (!(spill[i >> 3] & 1u << (i & 7))) {
+        spill[i >> 3] |= (uint8_t)(1u << (i & 7));
+        spill_count++;
+    }
+    return true;
+}
+
+static bool spill_take(uint64_t at) {
+    uint32_t i = (uint32_t)((at - POOL_TOP) / PAGE);
+
+    if (spill == NULL || at < POOL_TOP || at >= FIXED_END || !(spill[i >> 3] & 1u << (i & 7))) {
+        return false;
+    }
+    spill[i >> 3] &= (uint8_t)~(1u << (i & 7));
+    spill_count--;
+    return true;
+}
+
+/* One of them that no program has another page at, or 0. */
+static uint64_t spill_any(void) {
+    for (uint32_t n = 0; spill_count > 0 && n < WIN_PAGES; n++) {
+        uint32_t i = (spill_next + n) % WIN_PAGES;
+        uint64_t at = POOL_TOP + (uint64_t)i * PAGE;
+
+        if ((spill[i >> 3] & 1u << (i & 7)) && !vm_low_shadowed(at)) {
+            spill_take(at);
+            spill_next = i;
+            return at;
+        }
+    }
+    return 0;
+}
+
 static void loosen(uint64_t at, uint64_t count) {
     for (uint64_t i = 0; i < count; i++, at += PAGE) {
-        if (at < LOOSE_FLOOR) {
-            dbg("mem: runs full, page %x lost\n", at);
+        if (!LOOSE_OK(at)) {
+            if (!spill_put(at)) {
+                dbg("mem: runs full, page %x lost\n", at);
+            }
             continue;
         }
         *(uint64_t *)at = loose;
@@ -82,10 +177,19 @@ static void loosen(uint64_t at, uint64_t count) {
     }
 }
 
-/* Puts at .. at + count back, joined to whatever it touches. */
+/* Puts at .. at + count back, joined to whatever it touches. On i386 only
+   what is below 4 GiB, all the kernel's tables map. */
 static void run_add(uint64_t at, uint64_t count) {
     unsigned i = 0;
 
+#ifdef __i386__
+    if (at >= (1ull << 32)) {
+        return;
+    }
+    if (at + count * PAGE > (1ull << 32)) {
+        count = ((1ull << 32) - at) / PAGE;
+    }
+#endif
     if (count == 0) {
         return;
     }
@@ -112,15 +216,15 @@ static void run_add(uint64_t at, uint64_t count) {
         unsigned smallest = RUNS;
 
         for (unsigned j = 0; j < RUNS; j++) {
-            bool high = runs[j].at >= LOOSE_FLOOR;
-            bool best_high = smallest < RUNS && runs[smallest].at >= LOOSE_FLOOR;
+            bool high = LOOSE_OK(runs[j].at);
+            bool best_high = smallest < RUNS && LOOSE_OK(runs[smallest].at);
 
             if (smallest == RUNS || (high && !best_high) ||
                 (high == best_high && runs[j].count < runs[smallest].count)) {
                 smallest = j;
             }
         }
-        if (at >= LOOSE_FLOOR && (runs[smallest].at < LOOSE_FLOOR || runs[smallest].count >= count)) {
+        if (LOOSE_OK(at) && (!LOOSE_OK(runs[smallest].at) || runs[smallest].count >= count)) {
             loosen(at, count);                  /* this one is the smallest */
             return;
         }
@@ -156,6 +260,9 @@ static bool run_take(uint64_t page) {
 }
 
 static uint64_t take(size_t count);
+#ifdef __i386__
+static uint64_t take_outside(size_t count);
+#endif
 
 /* The gigabyte a program linked to a fixed address runs in. While one runs,
    its own tables stand in for that stretch of the kernel's view of memory
@@ -163,8 +270,23 @@ static uint64_t take(size_t count);
    instead. On a machine with memory above it, the kernel keeps out. */
 #define FIXED_TOP (1ull << 30)
 
-static uint64_t floor_kept(void) {
+__attribute__((unused)) static uint64_t floor_kept(void) {
     return ours && efi_boot()->ram_kib > (FIXED_TOP >> 10) ? FIXED_TOP : 0;
+}
+
+/* Whether at .. count pages lands where a program in low memory would hide
+   it, on a machine with memory to spare elsewhere: below the gigabyte - on
+   i386, where every program is a 32-bit one, in its gigabyte from IA32_EXEC
+   up, on any machine: the disk cache gives the pool back first, and lends
+   nothing there at all, since a program there wants each page at its own
+   address and cannot have one the cache holds. */
+static bool where_hidden(uint64_t at, size_t count) {
+#ifdef __i386__
+    return at < (1ull << 30) && at + count * 4096 > IA32_EXEC;
+#else
+    (void)count;
+    return at < floor_kept();
+#endif
 }
 
 /* Memory the disk cache holds is free memory lent out: before an allocation
@@ -174,9 +296,9 @@ uint64_t mem_pages(size_t count) {
     for (;;) {
         uint64_t at = take(count);
 
-        if ((at != 0 && at >= floor_kept()) || disk_cache == NULL ||
+        if ((at != 0 && !where_hidden(at, count)) || disk_cache == NULL ||
             disk_cache->shrink(count * PAGE) == 0) {
-            if (ours && at != 0 && at < (64u << 20)) {
+            if (ours && at != 0 && at < (64u << 20) && sizeof(void *) == 8) {
                 dbg("mem: %u pages at %x for %p\n", (uint64_t)count, at, __builtin_return_address(0));
             }
             return at;
@@ -190,22 +312,150 @@ uint64_t mem_pages(size_t count) {
 /* Pages for the disk cache: only from above that gigabyte, where there is
    memory there, so that lending it out never pushes the kernel below. */
 uint64_t mem_pages_lent(size_t count) {
+#ifdef __i386__
+    return take_outside(count);
+#endif
     uint64_t at = take(count);
 
-    if (at != 0 && at < floor_kept()) {
-        run_add(at, count);
+    if (at != 0 && where_hidden(at, count)) {
+        mem_pages_free(at, count);
         return 0;
     }
     return at;
 }
 
-static uint64_t take(size_t count) {
-    if (!ours) {
-        uint64_t at = 0;
+/* A 32-bit program lives in the first gigabyte, from IA32_EXEC up, over
+   the kernel's own view of it (vm.c) - on i386 every program does. So the
+   kernel's pages are kept out of there: above the gigabyte where there is
+   memory, below IA32_EXEC next - nothing goes there but what a program puts
+   at a fixed address itself, and the pool is used from its top down - and
+   only once both are gone among the programs, and never under a page some
+   program has another page at. On i386, while the firmware runs, not among
+   them at all: a program may map over what the firmware holds there (vm.c),
+   which would be the kernel's too. */
+/* count pages of the runs within [lo, hi), from the top, none of them one
+   a program has another page at; 0 if there are none. */
+static uint64_t take_clear(size_t count, uint64_t lo, uint64_t hi) {
+    for (unsigned i = run_count; i-- > 0;) {
+        uint64_t start = runs[i].at > lo ? runs[i].at : lo;
+        uint64_t end = runs[i].at + runs[i].count * PAGE < hi ? runs[i].at + runs[i].count * PAGE : hi;
 
-        return EFI_ERROR(EFI_CALL(firmware()->allocate_pages, EFI_ALLOCATE_ANY, EFI_LOADER_DATA,
-                                     count, &at)) ? 0 : at;
+        while (end >= start + count * PAGE) {
+            uint64_t at = end - count * PAGE, k = 0;
+
+            while (k < count && !vm_low_shadowed(at + k * PAGE)) {
+                k++;
+            }
+            if (k == count) {
+                for (k = 0; k < count; k++) {
+                    run_take(at + k * PAGE);
+                }
+                return at;
+            }
+            end = at + k * PAGE;    /* below the one in the way */
+        }
     }
+    return 0;
+}
+
+#ifdef __i386__
+
+/* Outside the programs' gigabyte, or 0: all the disk cache may have. */
+static uint64_t take_outside(size_t count);
+
+static uint64_t take(size_t count) {
+    uint64_t at = take_outside(count);
+
+    if (at == 0 && ours) {
+        if ((at = take_clear(count, POOL_TOP, FIXED_END)) == 0 && count == 1) {
+            at = spill_any();
+        }
+        dbg("mem: %u pages among the programs, at %x\n", (uint64_t)count, at);
+    }
+    return at;
+}
+
+static uint64_t take_outside(size_t count) {
+    uint64_t at;
+
+    if (ours && count == 1 && loose != 0) {
+        at = loose;                 /* a single page above the gigabyte */
+        loose = *(uint64_t *)at;
+        loose_count--;
+        return at;
+    }
+    if (!ours) {
+        at = POOL_TOP - 1;
+        if (!EFI_ERROR(EFI_CALL(firmware()->allocate_pages, EFI_ALLOCATE_MAX, EFI_LOADER_DATA,
+                                count, &at))) {
+            return at;
+        }
+        if (EFI_ERROR(EFI_CALL(firmware()->allocate_pages, EFI_ALLOCATE_ANY, EFI_LOADER_DATA,
+                               count, &at))) {
+            return 0;
+        }
+        if (at < FIXED_END) {
+            EFI_CALL(firmware()->free_pages, at, count);
+            return 0;               /* the top is the programs' */
+        }
+        return at;
+    }
+    for (bool drained = false;; drained = true) {
+        if ((at = take_clear(count, FIXED_END, ~0ull)) != 0 ||
+            (at = take_below(count, POOL_TOP)) != 0) {
+            return at;
+        }
+        if (drained || loose == 0) {
+            break;
+        }
+        /* Nothing that long outside the programs' gigabyte: the single
+           pages go back into runs first, where neighbours join up again,
+           for as long as the list has room. */
+        while (loose != 0 && run_count < RUNS - 1) {
+            at = loose;
+            loose = *(uint64_t *)at;
+            loose_count--;
+            run_add(at, 1);
+        }
+    }
+    return 0;
+}
+#else
+static uint64_t take_top(size_t count);
+
+/* x86-64's: from the top, as ever - and where that is a 32-bit program's
+   gigabyte, the pool below it first, as on i386. */
+static uint64_t take(size_t count) {
+    uint64_t at = 0;
+
+    if (!ours) {
+        if (EFI_ERROR(EFI_CALL(firmware()->allocate_pages, EFI_ALLOCATE_ANY, EFI_LOADER_DATA,
+                               count, &at))) {
+            return 0;
+        }
+        if (at >= POOL_TOP && at < FIXED_END) {
+            uint64_t low = POOL_TOP - 1;
+
+            if (!EFI_ERROR(EFI_CALL(firmware()->allocate_pages, EFI_ALLOCATE_MAX,
+                                    EFI_LOADER_DATA, count, &low))) {
+                EFI_CALL(firmware()->free_pages, at, count);
+                at = low;
+            }
+        }
+        return at;
+    }
+    if ((at = take_top(count)) == 0 || at >= FIXED_END || at + count * PAGE <= POOL_TOP) {
+        return at;
+    }
+    mem_pages_free(at, count);
+    if ((at = take_below(count, POOL_TOP)) != 0 || (at = take_clear(count, POOL_TOP, FIXED_END)) != 0 ||
+        (count == 1 && (at = spill_any()) != 0)) {
+        return at;
+    }
+    return take_top(count);
+}
+
+static uint64_t take_top(size_t count) {
     if (count == 1 && loose == 0) {
         for (unsigned i = run_count; i-- > 0;) {
             if (runs[i].count >= LOOSE_FILL && runs[i].at + runs[i].count * PAGE >
@@ -258,6 +508,7 @@ static uint64_t take(size_t count) {
         }
     }
 }
+#endif
 
 static uint64_t take_below(size_t count, uint64_t limit);
 
@@ -302,7 +553,17 @@ bool mem_take_page(uint64_t page) {
         return !EFI_ERROR(EFI_CALL(firmware()->allocate_pages, EFI_ALLOCATE_ADDRESS,
                                       EFI_LOADER_DATA, 1, &at));
     }
-    return run_take(page);
+    return run_take(page) || spill_take(page);
+}
+
+/* Where memory ends, as the map at take-over said; 0 until then. */
+static uint64_t ram_top;
+
+bool mem_beyond_ram(uint64_t page) {
+    if (ram_top == 0) {
+        ram_top = ours ? (uint64_t)-1 : efi_ram_top();
+    }
+    return page >= ram_top;
 }
 
 bool mem_firmware_kept(uint64_t page) {
@@ -314,6 +575,15 @@ bool mem_firmware_kept(uint64_t page) {
     return false;
 }
 
+bool mem_firmware_has(uint64_t page) {
+#ifdef __i386__
+    return !ours && page >= POOL_TOP;   /* the kernel takes none there (take) */
+#else
+    (void)page;
+    return false;
+#endif
+}
+
 void mem_give_page(uint64_t page) {
     mem_pages_free(page, 1);
 }
@@ -323,7 +593,7 @@ void mem_pages_free(uint64_t at, size_t count) {
         EFI_CALL(firmware()->free_pages, at, count);
         return;
     }
-    if (count == 1 && at >= LOOSE_FLOOR) {
+    if (count == 1 && LOOSE_OK(at)) {
         loosen(at, 1);                      /* back with the single pages */
         return;
     }
@@ -388,7 +658,7 @@ static void *small_alloc(size_t bytes) {
 }
 
 static void small_free(void *memory) {
-    struct slab *s = (struct slab *)((uint64_t)memory & ~(uint64_t)(PAGE - 1));
+    struct slab *s = (struct slab *)((uint64_t)(uintptr_t)memory & ~(uint64_t)(PAGE - 1));
     unsigned c = 0;
 
     while ((32u << c) < s->size) {
@@ -410,7 +680,7 @@ static void small_free(void *memory) {
             *at = s->next;
         }
         heap_pages--;
-        mem_pages_free((uint64_t)s, 1);
+        mem_pages_free((uint64_t)(uintptr_t)s, 1);
     }
 }
 
@@ -433,11 +703,11 @@ void mem_free(void *memory) {
     if (memory == NULL) {
         return;
     }
-    if (((uint64_t)memory & (PAGE - 1)) != HEADER) {
+    if (((uint64_t)(uintptr_t)memory & (PAGE - 1)) != HEADER) {
         small_free(memory);
         return;
     }
-    uint64_t at = (uint64_t)memory - HEADER;
+    uint64_t at = (uint64_t)(uintptr_t)memory - HEADER;
 
     heap_pages -= *(uint64_t *)at;
     mem_pages_free(at, *(uint64_t *)at);
@@ -520,9 +790,19 @@ static void map_gig(uint64_t *pml4, uint64_t gig) {
     }
 }
 
+static void reload_cr3(void) {
+    uintptr_t cr3;
+
+    __asm__ volatile("mov %%cr3, %0\n\tmov %0, %%cr3" : "=r"(cr3) : : "memory");
+}
+
 void mem_map_io(uint64_t at) {
     uint64_t gig = at & ~((1ull << 30) - 1);
 
+#ifdef __i386__
+    (void)gig;                      /* the four gigabytes there are: all mapped */
+    return;
+#endif
     if (gig < (512ull << 30) && gig_pages()) {
         return;                     /* the first table maps it already */
     }
@@ -536,9 +816,58 @@ void mem_map_io(uint64_t at) {
     }
     if (own_cr3 != 0 && ours) {
         map_gig((uint64_t *)own_cr3, gig);
-        __asm__ volatile("mov %%cr3, %%rax\n\tmov %%rax, %%cr3" : : : "rax", "memory");
+        reload_cr3();
     }
 }
+
+#ifdef __i386__
+/* i386's: a PDPT and its four directories of two-megabyte pages, the four
+   gigabytes one to one - five pages, the PDPT's first. What PAE reserves
+   in a PDPT entry (WRITE, USER) is left out there. */
+bool mem_own_tables(uint64_t top) {
+    (void)top;
+    if (own_cr3 != 0) {
+        return true;                /* built at boot already (mem_paging_on) */
+    }
+    uint64_t at = mem_pages_below(5, POOL_TOP);
+
+    if (at == 0) {
+        return false;
+    }
+    uint64_t *pdpt = (uint64_t *)(uintptr_t)at, *pd = pdpt + 512;
+
+    memset(pdpt, 0, PAGE);
+    for (uint64_t i = 0; i < 4; i++) {
+        pdpt[i] = ((uint64_t)(uintptr_t)&pd[i * 512]) | PRESENT;
+    }
+    for (uint64_t i = 0; i < 4 * 512; i++) {
+        pd[i] = (i << 21) | PRESENT | WRITE | HUGE;
+    }
+    own_cr3 = at;
+    own_pages = 5;
+    return true;
+}
+
+/* Onto those tables now, with PAE paging on whatever was before it: a
+   32-bit firmware runs with paging off, and the kernel needs it from its
+   first program on. One to one, so the firmware runs on as it did. CR4.PGE
+   goes off: vm.c keeps a bit of its own where the global bit would be. */
+bool mem_paging_on(void) {
+    uintptr_t cr0, cr4;
+
+    if (!mem_own_tables(0)) {
+        return false;
+    }
+    vm_move((uint64_t *)(uintptr_t)own_cr3, NULL);
+    __asm__ volatile("mov %%cr0, %0" : "=r"(cr0));
+    __asm__ volatile("mov %%cr4, %0" : "=r"(cr4));
+    __asm__ volatile("mov %0, %%cr0" : : "r"(cr0 & ~0x80000000u) : "memory");
+    __asm__ volatile("mov %0, %%cr4" : : "r"((cr4 | 0x20) & ~(uintptr_t)0x80) : "memory");
+    __asm__ volatile("mov %0, %%cr3" : : "r"((uintptr_t)own_cr3) : "memory");
+    __asm__ volatile("mov %0, %%cr0" : : "r"(cr0 | 0x80000000u) : "memory");
+    return true;
+}
+#else
 
 bool mem_own_tables(uint64_t top) {
     uint32_t a = 0x80000001, b, c = 0, d;
@@ -579,14 +908,15 @@ bool mem_own_tables(uint64_t top) {
     }
     return true;
 }
+#endif
 
 /* The loader takes KERNEL_BYTES for the kernel, which is what it may grow
    to, not what it is: whatever lies past the end of its .bss is handed back
    as soon as it runs. */
 void mem_trim_kernel(void) {
     extern char __kernel_start[], __bss_end[];
-    uint64_t from = ((uint64_t)__bss_end + PAGE - 1) & ~(uint64_t)(PAGE - 1);
-    uint64_t to = (uint64_t)__kernel_start + KERNEL_BYTES;
+    uint64_t from = ((uint64_t)(uintptr_t)__bss_end + PAGE - 1) & ~(uint64_t)(PAGE - 1);
+    uint64_t to = (uint64_t)(uintptr_t)__kernel_start + KERNEL_BYTES;
 
     if (to > from) {
         mem_pages_free(from, (to - from) / PAGE);
@@ -594,14 +924,30 @@ void mem_trim_kernel(void) {
 }
 
 void mem_take_over(const void *map, size_t size, size_t stride) {
-    struct { uint16_t limit; uint64_t base; } __attribute__((packed)) idtr;
+    struct { uint16_t limit; uintptr_t base; } __attribute__((packed)) idtr;
     uint64_t kept[16] = { 0 };      /* KiB not taken, by type: for the log */
 
+#ifdef __i386__
+    /* i386's tables are the ones built at boot, which the firmware has been
+       running on - and may have changed, a page it guarded unmapped: every
+       entry made one to one again, but for a program's table in the first
+       gigabyte (USER marks those). */
+    uint64_t *pdpt = (uint64_t *)(uintptr_t)own_cr3, *pd = pdpt + 512;
+
+    for (uint64_t i = 0; i < 4; i++) {
+        pdpt[i] = ((uint64_t)(uintptr_t)&pd[i * 512]) | PRESENT;
+    }
+    for (uint64_t i = 0; i < 4 * 512; i++) {
+        if (i >= 512 || !(pd[i] & 0x04)) {
+            pd[i] = (i << 21) | PRESENT | WRITE | HUGE;
+        }
+    }
+#endif
     /* Onto the kernel's own tables, and what programs had hung off the
        firmware's with them: the firmware's are then as free as the rest of
        its memory. */
     vm_move((uint64_t *)own_cr3, own_pages > 2 ? (uint64_t *)(own_cr3 + 2 * PAGE) : NULL);
-    __asm__ volatile("mov %0, %%cr3" : : "r"(own_cr3) : "memory");
+    __asm__ volatile("mov %0, %%cr3" : : "r"((uintptr_t)own_cr3) : "memory");
 
     for (size_t at = 0; at < size; at += stride) {
         const struct efi_memory_descriptor *d = (const void *)((const char *)map + at);
@@ -609,6 +955,9 @@ void mem_take_over(const void *map, size_t size, size_t stride) {
 
         if (d->type < 16) {
             kept[d->type] += count * 4;
+        }
+        if (d->type >= 1 && d->type <= 10 && d->type != 8 && start + count * PAGE > ram_top) {
+            ram_top = start + count * PAGE;     /* memory, not reserved or a device's */
         }
 
         if (d->type != EFI_CONVENTIONAL_MEMORY && d->type > 4 && d->type != ACPI_RECLAIM &&
@@ -639,11 +988,12 @@ void mem_take_over(const void *map, size_t size, size_t stride) {
         kept[10], kept[0]);
     /* The firmware's IDT, which the kernel's handlers were put in. */
     __asm__ volatile("sidt %0" : "=m"(idtr));
-    for (uint64_t page = idtr.base & ~(uint64_t)(PAGE - 1); page <= idtr.base + idtr.limit;
+    for (uint64_t page = idtr.base & ~(uintptr_t)(PAGE - 1); page <= idtr.base + idtr.limit;
          page += PAGE) {
         run_take(page);
     }
     ours = true;
+    spill_make(ram_top);
 }
 
 /* The BIOS path: no firmware to allocate from at all, so the kernel's own
@@ -658,8 +1008,11 @@ void mem_take_bios(const struct e820 *map, unsigned count, struct boot_info *inf
         uint64_t end = (map[i].base + map[i].length) & ~(uint64_t)(PAGE - 1);
 
         if (map[i].type == 1 || map[i].type == 3 || map[i].type == 4) {
-            ram += map[i].length / 1024;
+            /* On i386, only what is below 4 GiB: the rest is not reached. */
+            ram += (sizeof(void *) == 4 && end > (1ull << 32) ?
+                    (start < (1ull << 32) ? (1ull << 32) - start : 0) : map[i].length) / 1024;
             top = end > top ? end : top;
+            ram_top = end > ram_top ? end : ram_top;
         }
         if (map[i].type == 4) {
             kept += map[i].length / 1024;   /* ACPI NVS */
@@ -679,12 +1032,13 @@ void mem_take_bios(const struct e820 *map, unsigned count, struct boot_info *inf
         }
     }
     ours = true;
+    spill_make(ram_top);
     info->ram_kib = ram;
     info->firmware_kib = kept + 640;    /* and what is below 1 MiB */
     info->memory_kib = mem_free_kib();
     if (mem_own_tables(top)) {
         vm_move((uint64_t *)own_cr3, own_pages > 2 ? (uint64_t *)(own_cr3 + 2 * PAGE) : NULL);
-        __asm__ volatile("mov %0, %%cr3" : : "r"(own_cr3) : "memory");
+        __asm__ volatile("mov %0, %%cr3" : : "r"((uintptr_t)own_cr3) : "memory");
     }
 }
 
@@ -695,7 +1049,7 @@ uint64_t mem_free_kib(void) {
         for (unsigned i = 0; i < run_count; i++) {
             pages += runs[i].count;
         }
-        return (pages + loose_count) * 4;
+        return (pages + loose_count + spill_count) * 4;
     }
     return efi_free_kib();
 }

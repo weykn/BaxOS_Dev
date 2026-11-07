@@ -24,6 +24,19 @@
 #define S_IFDIR 0040000
 #define S_IFLNK 0120000
 
+#ifdef __i386__
+struct stat {                       /* stat64, i386's */
+    uint64_t dev;
+    uint32_t pad0, ino32, mode, nlink, uid, gid;
+    uint64_t rdev;
+    uint32_t pad3;
+    int64_t  size;
+    uint32_t blksize;
+    uint64_t blocks;
+    uint32_t times[6];
+    uint64_t ino;
+} __attribute__((packed));
+#else
 struct stat {
     uint64_t dev, ino, nlink;
     uint32_t mode, uid, gid, pad;
@@ -32,6 +45,7 @@ struct stat {
     uint64_t times[6];
     int64_t  unused[3];
 };
+#endif
 
 struct pollfd {
     int     fd;

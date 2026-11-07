@@ -16,7 +16,12 @@
  * Every process has its own tables under that slot, and the slot points at
  * whichever process is running: a switch is one entry rewritten, so a
  * process costs its own tables and nothing more - no top table of its own,
- * no copy of the kernel's mappings to keep in step. */
+ * no copy of the kernel's mappings to keep in step.
+ *
+ * On i386 it is PAE paging: the same entries, three levels, four gigabytes.
+ * There is no slot to give programs a region in, so there are no regions:
+ * every program has low memory alone - the first gigabyte - which is what a
+ * 32-bit program on x86-64 has too. REGIONS says which. */
 
 #define PRESENT 0x001
 #define WRITE   0x002
@@ -26,6 +31,12 @@
 
 #define ENTRIES   512
 #define SLOT_SIZE (1ull << 39)      /* what one top-level entry covers */
+
+#ifdef __i386__
+#define REGIONS 0
+#else
+#define REGIONS 1
+#endif
 
 #define SPACES 128                  /* processes at once */
 
@@ -80,11 +91,31 @@ static uint64_t region;                 /* where it starts */
                                        read-only, copied on the first write */
 /* What the program asked a page to be (vm_protect), in bits the processor
    ignores - kept in an entry whether or not a page is mapped there yet. The
-   processor's own WRITE and USER bits are what enforce them. */
+   processor's own WRITE and USER bits are what enforce them.
+   PAE ignores none of the high bits of an entry that is present, only bits
+   8 to 11 - 8 being the global bit, which is ignored too while CR4.PGE is
+   off, as i386's kernel keeps it. Low memory never has SHARED pages (see
+   vm_map_shared), so on i386 its bit says NOACCESS, and SHARED and
+   COMMON_RW are bits never set. */
+#ifdef __i386__
+#undef SHARED
+#define SHARED    (1ull << 52)
+#define NOWRITE   0x100ull
+#define NOACCESS  0x800ull
+#else
 #define NOWRITE   (1ull << 52)
 #define NOACCESS  (1ull << 53)
+#endif
 #define COMMON_RW (1ull << 54)      /* a SHARED page written in common (MAP_SHARED) */
 #define PROT_BITS (NOWRITE | NOACCESS)
+
+/* The machine's own page at its own address, for the kernel alone: what a
+   fault of the kernel's own in a program's low memory gets where the page
+   is neither free nor any program's - the kernel's data or the firmware's,
+   which the program's tables would otherwise hide from it (vm_fault). A
+   device's entry, so nobody gives it back; no USER, so the program cannot
+   reach it. */
+#define KERNEL_VIEW(e) (((e) & (PRESENT | USER | DEVICE)) == (PRESENT | DEVICE))
 
 static uint64_t *low_pd;            /* the firmware's directory for it */
 static uint64_t *low_orig;          /* what that said before anything changed it -
@@ -109,7 +140,9 @@ static uint64_t *table_at(uint64_t entry) {
 }
 
 static void flush_tlb(void) {
-    __asm__ volatile("mov %%cr3, %%rax\n\tmov %%rax, %%cr3" : : : "rax", "memory");
+    uintptr_t cr3;
+
+    __asm__ volatile("mov %%cr3, %0\n\tmov %0, %%cr3" : "=r"(cr3) : : "memory");
 }
 
 /* The firmware write-protects its own tables, CR0.WP, which binds even ring
@@ -117,30 +150,31 @@ static void flush_tlb(void) {
    the kernel is on tables of its own (vm_move) there is no need: a process
    switch edits them, and two CR0 writes a switch - each one serialising,
    and a trip out of a virtual machine - were most of what a switch cost. */
-static bool tables_ours;
+static bool tables_ours = !REGIONS;  /* i386's are the kernel's from the start */
 
-static uint64_t write_protect_off(void) {
-    uint64_t cr0;
+static uintptr_t write_protect_off(void) {
+    uintptr_t cr0;
 
     if (tables_ours) {
         return 0;
     }
     __asm__ volatile("mov %%cr0, %0" : "=r"(cr0));
-    __asm__ volatile("mov %0, %%cr0" : : "r"(cr0 & ~0x10000ull) : "memory");
+    __asm__ volatile("mov %0, %%cr0" : : "r"(cr0 & ~(uintptr_t)0x10000) : "memory");
     return cr0;
 }
 
-static void write_protect_back(uint64_t cr0) {
+static void write_protect_back(uintptr_t cr0) {
     if (cr0 != 0) {
         __asm__ volatile("mov %0, %%cr0" : : "r"(cr0) : "memory");
     }
 }
 
+/* The top table: x86-64's PML4, or i386's four-entry PDPT. */
 static uint64_t *pml4(void) {
-    uint64_t cr3;
+    uintptr_t cr3;
 
     __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
-    return (uint64_t *)(cr3 & ADDR);
+    return (uint64_t *)(cr3 & (uintptr_t)ADDR & ~(uintptr_t)31);
 }
 
 /* One page of memory for a table, or for the program: one the region has
@@ -241,6 +275,9 @@ static void chunks_back(struct space *level) {
 static bool slot_init(void) {
     uint64_t *top = pml4();
 
+    if (!REGIONS) {
+        return true;
+    }
     /* The lower half of the address space, which is where a program may run,
        is the first 256 slots. The firmware maps what the machine has at the
        bottom of it; a slot it leaves alone is ours. */
@@ -264,9 +301,19 @@ static uint64_t low_plain(unsigned i) {
    keeps a copy of it to put back from. Once; false if it cannot be had. */
 static bool low_setup(void) {
     uint64_t *top = pml4(), *pdpt;
-    uint64_t cr0;
+    uintptr_t cr0;
 
     if (low_pd != NULL) {
+        return true;
+    }
+    if (!REGIONS) {
+        /* The kernel's own PDPT, whose first entry is a directory of
+           two-megabyte pages (mem_own_tables) - and an entry that holds
+           neither USER nor WRITE, both of which PAE reserves there. */
+        if (!(top[0] & PRESENT)) {
+            return false;
+        }
+        low_pd = table_at(top[0]);
         return true;
     }
     if (!(top[0] & PRESENT) || !((pdpt = table_at(top[0]))[0] & PRESENT)) {
@@ -284,7 +331,7 @@ static bool low_setup(void) {
             for (unsigned i = 0; i < ENTRIES; i++) {
                 pd[i] = low_plain(i);
             }
-            pdpt[0] = (uint64_t)pd | PRESENT | WRITE;
+            pdpt[0] = (uint64_t)(uintptr_t)pd | PRESENT | WRITE;
             low_fixed = VM_PAGE;
         }
         top[0] |= USER;
@@ -310,7 +357,7 @@ static bool low_setup(void) {
         for (unsigned i = 0; i < ENTRIES; i++) {
             pd[i] = (base + ((uint64_t)i << 21)) | flags | BIG;
         }
-        pdpt[0] = (uint64_t)pd | PRESENT | WRITE;
+        pdpt[0] = (uint64_t)(uintptr_t)pd | PRESENT | WRITE;
         low_fixed += VM_PAGE;
     }
     pdpt[0] |= USER;
@@ -321,14 +368,21 @@ static bool low_setup(void) {
     return true;
 }
 
+/* The space whose tables for low memory are in the directory now, and the
+   one vm_firmware_view has taken them out of for a call into the firmware -
+   to put back only what it took: a space being emptied takes its own out
+   for good, and makes calls of its own while it does. */
+static struct space *applied, *hidden;
+
 /* Puts level's tables for its low range in the directory, or takes them out
    again for what the firmware had there. */
 static void low_apply(struct space *level, bool on) {
-    uint64_t cr0;
+    uintptr_t cr0;
 
     if (level->low_tables == NULL) {
         return;
     }
+    applied = on ? level : applied == level ? NULL : applied;
     cr0 = write_protect_off();
     for (uint64_t i = level->low_start >> 21; i <= (level->low_end - 1) >> 21; i++) {
         uint64_t table = level->low_tables[i];
@@ -371,7 +425,24 @@ bool vm_low(uint64_t start, uint64_t end) {
     }
     level->low_start = start;
     level->low_end = end;
+    applied = level;                /* empty yet: its tables go in as they are made */
     return true;
+}
+
+bool vm_low_shadowed(uint64_t page) {
+    for (unsigned i = 0; i < SPACES; i++) {
+        struct space *l = spaces[i];
+
+        if (l != NULL && l->low_tables != NULL && page >= l->low_start && page < l->low_end &&
+            l->low_tables[page >> 21] != 0) {
+            uint64_t e = ((uint64_t *)l->low_tables[page >> 21])[(page >> 12) & (ENTRIES - 1)];
+
+            if ((e & PRESENT) && (e & ADDR) != page) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 bool vm_low_used(void) {
@@ -387,6 +458,16 @@ void vm_move(uint64_t *top, uint64_t *pd) {
         top[slot] = old[slot];
     }
     if (low_pd == NULL) {
+        return;
+    }
+    if (!REGIONS) {
+        pd = table_at(top[0]);      /* i386's: the same directory, moved */
+        for (unsigned i = 0; i < ENTRIES; i++) {
+            if (low_pd[i] != low_plain(i)) {
+                pd[i] = low_pd[i];
+            }
+        }
+        low_pd = pd;
         return;
     }
     /* The directory is all two-megabyte pages, which is what is put back from
@@ -405,8 +486,12 @@ void vm_move(uint64_t *top, uint64_t *pd) {
 }
 
 void vm_firmware_view(bool on) {
-    if (low_pd != NULL && cur != NULL) {
-        low_apply(cur, !on);
+    if (on && applied != NULL) {
+        hidden = applied;
+        low_apply(hidden, false);
+    } else if (!on && hidden != NULL) {
+        low_apply(hidden, true);
+        hidden = NULL;
     }
 }
 
@@ -419,11 +504,11 @@ bool vm_start(void) {
 }
 
 uint64_t vm_base(void) {
-    return cur != NULL ? region : 0;
+    return cur != NULL && REGIONS ? region : 0;
 }
 
 uint64_t vm_end(void) {
-    return cur != NULL ? region + SLOT_SIZE : 0;
+    return cur != NULL && REGIONS ? region + SLOT_SIZE : 0;
 }
 
 bool vm_holds(uint64_t addr, uint64_t size) {
@@ -451,16 +536,16 @@ static uint64_t *entry_in(struct space *level, uint64_t addr, bool make) {
             return NULL;
         }
         if (level->low_tables[addr >> 21] == 0) {
-            uint64_t cr0;
+            uintptr_t cr0;
 
             if (!make || (pt = page_from(level)) == NULL) {
                 return NULL;
             }
-            level->low_tables[addr >> 21] = (uint64_t)pt;
+            level->low_tables[addr >> 21] = (uint64_t)(uintptr_t)pt;
             level->tables += VM_PAGE;
-            if (level == cur) {
+            if (level == applied) {
                 cr0 = write_protect_off();
-                low_pd[addr >> 21] = (uint64_t)pt | PRESENT | WRITE | USER;
+                low_pd[addr >> 21] = (uint64_t)(uintptr_t)pt | PRESENT | WRITE | USER;
                 write_protect_back(cr0);
                 flush_tlb();
             }
@@ -469,6 +554,9 @@ static uint64_t *entry_in(struct space *level, uint64_t addr, bool make) {
         return &pt[(addr >> 12) & (ENTRIES - 1)];
     }
 
+    if (!REGIONS) {
+        return NULL;
+    }
     uint64_t *table = level->pdpt;
     unsigned index[3] = {
         (unsigned)(addr >> 30) & (ENTRIES - 1),
@@ -485,7 +573,7 @@ static uint64_t *entry_in(struct space *level, uint64_t addr, bool make) {
             if (!make || (next = page_from(level)) == NULL) {
                 return NULL;
             }
-            *at = (uint64_t)next | PRESENT | WRITE | USER;
+            *at = (uint64_t)(uintptr_t)next | PRESENT | WRITE | USER;
             level->tables += VM_PAGE;
         }
         table = table_at(*at);
@@ -497,7 +585,26 @@ static uint64_t *entry_for(uint64_t addr, bool make) {
     return entry_in(cur, addr, make);
 }
 
+bool vm_low_moved(uint64_t addr, uint64_t size) {
+    return cur != NULL && cur->low_tables != NULL && addr < cur->low_end &&
+           addr + size > cur->low_start;
+}
+
 bool vm_fault(uint64_t addr) {
+    return vm_fault_as(addr, true);
+}
+
+bool vm_low_unfilled(uint64_t addr) {
+    uint64_t *at;
+
+    if (cur == NULL || cur->low_tables == NULL || addr < cur->low_start || addr >= cur->low_end) {
+        return false;
+    }
+    at = entry_in(cur, addr, false);
+    return at == NULL || !(*at & PRESENT) || KERNEL_VIEW(*at);
+}
+
+bool vm_fault_as(uint64_t addr, bool user) {
     struct space *level = cur;
     uint64_t page = addr & ~(uint64_t)(VM_PAGE - 1);
     uint64_t *at;
@@ -520,16 +627,28 @@ bool vm_fault(uint64_t addr) {
         if (level->chunks == 0 && page >= LOW_LIMIT && shared_take(common)) {
             *at = common | PRESENT | WRITE | USER | kept;
             level->bought += VM_PAGE;
-            __asm__ volatile("invlpg (%0)" : : "r"(page) : "memory");
+            __asm__ volatile("invlpg (%0)" : : "r"((uintptr_t)page) : "memory");
             return true;
         }
         if ((fresh = page_from(level)) == NULL) {
             return false;
         }
         memcpy(fresh, (const void *)page, VM_PAGE);
-        *at = (uint64_t)fresh | PRESENT | WRITE | USER | kept;
-        __asm__ volatile("invlpg (%0)" : : "r"(page) : "memory");
+        *at = (uint64_t)(uintptr_t)fresh | PRESENT | WRITE | USER | kept;
+        __asm__ volatile("invlpg (%0)" : : "r"((uintptr_t)page) : "memory");
         shared_drop(common);
+        return true;
+    }
+    if (KERNEL_VIEW(*at) && user) {
+        /* The program wants a page the kernel has been reading as the
+           machine's: only if it has become free since. */
+        if (!mem_take_page(page)) {
+            return false;
+        }
+        level->low_owned++;
+        *at = page | PRESENT | WRITE | USER | OWNED;
+        __asm__ volatile("invlpg (%0)" : : "r"((uintptr_t)page) : "memory");
+        memset((void *)page, 0, VM_PAGE);
         return true;
     }
     if (*at & PRESENT) {
@@ -537,20 +656,37 @@ bool vm_fault(uint64_t addr) {
     }
     if (page < LOW_LIMIT) {
         /* The page at its own address, so that nothing else is hidden -
-           or, over one a program underneath has, any page at all. */
+           or, over one a program underneath has, any page at all. A
+           page that is the kernel's or the running firmware's is a
+           program's only where the program reached for it; where the
+           kernel did, it is reading its own, or the firmware's, data -
+           user_range has made every page of a program's that it reaches
+           for the program's first. */
         uint64_t owned = 0;
 
+        /* While the firmware runs the kernel cannot ask it whether the page
+           is free: what it would read to ask may be the very page. */
+        if (!user && !mem_ours()) {
+            *at = page | PRESENT | WRITE | DEVICE;
+            __asm__ volatile("invlpg (%0)" : : "r"((uintptr_t)page) : "memory");
+            return true;
+        }
         if (mem_take_page(page)) {
             owned = OWNED;
             level->low_owned++;
             fresh = (uint64_t *)page;
-        } else if (!(low_below(page) || mem_firmware_kept(page)) ||
+        } else if (!user && !(low_below(page) || mem_firmware_kept(page) || mem_beyond_ram(page))) {
+            *at = page | PRESENT | WRITE | DEVICE;
+            __asm__ volatile("invlpg (%0)" : : "r"((uintptr_t)page) : "memory");
+            return true;
+        } else if (!(low_below(page) || mem_firmware_kept(page) || mem_beyond_ram(page) ||
+                     mem_firmware_has(page)) ||
                    (fresh = page_from(level)) == NULL) {
             dbg("vm: low page %x not ours: below %u kept %u\n", page, (uint64_t)low_below(page), (uint64_t)mem_firmware_kept(page));
             return false;           /* someone's, and in use: not to be hidden */
         }
-        *at = (uint64_t)fresh | PRESENT | WRITE | USER | owned | (*at & PROT_BITS);
-        __asm__ volatile("invlpg (%0)" : : "r"(page) : "memory");
+        *at = (uint64_t)(uintptr_t)fresh | PRESENT | WRITE | USER | owned | (*at & PROT_BITS);
+        __asm__ volatile("invlpg (%0)" : : "r"((uintptr_t)page) : "memory");
         memset((void *)page, 0, VM_PAGE);
         return true;
     }
@@ -558,8 +694,8 @@ bool vm_fault(uint64_t addr) {
     if (fresh == NULL) {
         return false;
     }
-    *at = (uint64_t)fresh | PRESENT | WRITE | USER | (*at & PROT_BITS);
-    __asm__ volatile("invlpg (%0)" : : "r"(page) : "memory");
+    *at = (uint64_t)(uintptr_t)fresh | PRESENT | WRITE | USER | (*at & PROT_BITS);
+    __asm__ volatile("invlpg (%0)" : : "r"((uintptr_t)page) : "memory");
     return true;
 }
 
@@ -663,7 +799,7 @@ bool vm_mapped(uint64_t addr) {
         return false;
     }
     at = entry_for(addr, false);
-    return at != NULL && (*at & PRESENT) != 0;
+    return at != NULL && (*at & PRESENT) != 0 && !KERNEL_VIEW(*at);
 }
 
 bool vm_map_shared(uint64_t addr, uint64_t page, bool writable) {
@@ -678,7 +814,7 @@ bool vm_map_shared(uint64_t addr, uint64_t page, bool writable) {
     /* Writable is memory processes share on purpose (MAP_SHARED): every
        write is everyone's, so it is never copied. */
     *at = page | PRESENT | USER | SHARED | (writable ? WRITE | COMMON_RW : 0) | (*at & PROT_BITS);
-    __asm__ volatile("invlpg (%0)" : : "r"(addr) : "memory");
+    __asm__ volatile("invlpg (%0)" : : "r"((uintptr_t)addr) : "memory");
     return true;
 }
 
@@ -792,7 +928,7 @@ static void walk(struct space *level, void (*visit)(uint64_t *at, uint64_t addr)
         }
     }
 
-    for (unsigned i = 0; i < ENTRIES; i++) {
+    for (unsigned i = 0; REGIONS && i < ENTRIES; i++) {
         uint64_t *pd;
 
         if (!(pdpt[i] & PRESENT)) {
@@ -824,7 +960,7 @@ static void level_empty(struct space *level, bool whole) {
     uint64_t *pdpt = level->pdpt;
 
     if (level->low_tables != NULL) {
-        if (level == cur) {
+        if (level == applied) {
             low_apply(level, false);
         }
         for (uint64_t i = level->low_start >> 21; i <= (level->low_end - 1) >> 21; i++) {
@@ -836,15 +972,15 @@ static void level_empty(struct space *level, bool whole) {
                 }
             }
             if (pt != NULL) {
-                page_back(level, (uint64_t)pt);
+                page_back(level, (uint64_t)(uintptr_t)pt);
                 level->tables -= VM_PAGE;
             }
         }
-        page_back(level, (uint64_t)level->low_tables);
+        page_back(level, (uint64_t)(uintptr_t)level->low_tables);
         level->low_tables = NULL;
         level->low_start = level->low_end = 0;
     }
-    for (unsigned i = 0; i < ENTRIES; i++) {
+    for (unsigned i = 0; REGIONS && i < ENTRIES; i++) {
         uint64_t *pd;
 
         if (!(pdpt[i] & PRESENT)) {
@@ -879,7 +1015,9 @@ static void level_empty(struct space *level, bool whole) {
     chunks_back(level);
     level->protects = false;
     if (whole) {
-        pages_back_to_firmware((uint64_t)pdpt, 1);
+        if (REGIONS) {
+            pages_back_to_firmware((uint64_t)(uintptr_t)pdpt, 1);
+        }
         level->pdpt = NULL;
     }
     flush_tlb();
@@ -898,7 +1036,10 @@ bool vm_space_new(struct space *s) {
     while (i < SPACES && spaces[i] != NULL) {
         i++;
     }
-    if (i == SPACES || !slot_init() || (s->pdpt = (uint64_t *)table_page()) == NULL) {
+    /* With no regions the space has no table of its own, and pdpt only
+       says it is in use: it points at nothing that is ever read. */
+    if (i == SPACES || !slot_init() ||
+        (s->pdpt = REGIONS ? (uint64_t *)table_page() : (uint64_t *)s) == NULL) {
         return false;
     }
     spaces[i] = s;
@@ -906,7 +1047,7 @@ bool vm_space_new(struct space *s) {
 }
 
 void vm_space_use(struct space *s) {
-    uint64_t cr0;
+    uintptr_t cr0;
 
     if (s == cur) {
         return;
@@ -914,9 +1055,11 @@ void vm_space_use(struct space *s) {
     if (cur != NULL) {
         low_apply(cur, false);
     }
-    cr0 = write_protect_off();
-    pml4()[slot] = s != NULL ? (uint64_t)s->pdpt | PRESENT | WRITE | USER : 0;
-    write_protect_back(cr0);
+    if (REGIONS) {
+        cr0 = write_protect_off();
+        pml4()[slot] = s != NULL ? (uint64_t)(uintptr_t)s->pdpt | PRESENT | WRITE | USER : 0;
+        write_protect_back(cr0);
+    }
     cur = s;
     if (s != NULL) {
         low_apply(s, true);
@@ -983,7 +1126,7 @@ static void fork_page(uint64_t *at, uint64_t addr) {
         return;
     }
     memcpy(page, (const void *)addr, VM_PAGE);
-    *to = (uint64_t)page | (*at & (PRESENT | WRITE | USER | PROT_BITS));
+    *to = (uint64_t)(uintptr_t)page | (*at & (PRESENT | WRITE | USER | PROT_BITS));
 }
 
 bool vm_fork(struct space *child) {
@@ -1026,7 +1169,7 @@ size_t vm_memory(void) {
 size_t vm_tables(void) {
     size_t total = 0;
 
-    for (unsigned i = 0; i < SPACES; i++) {
+    for (unsigned i = 0; REGIONS && i < SPACES; i++) {
         total += spaces[i] != NULL ? VM_PAGE : 0;
     }
     return total;

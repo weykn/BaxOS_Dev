@@ -23,20 +23,24 @@
    wherever the firmware has room. The kernel is position-independent and
    applies its own relocations first thing, so no address is fixed - a
    fixed one is exactly what a firmware short of memory has already used. */
-#define KERNEL_BYTES  0x28000
+#define KERNEL_BYTES  0x30000
+
+/* A pointer in a 64-bit slot, so that the layout is the same for a 32-bit
+   kernel and its loaders as for a 64-bit one. */
+#define BOOT_PTR(type, name) union { type name; uint64_t name##_slot; }
 
 struct boot_info {
     uint64_t magic;
 
-    struct efi_system_table *system;    /* firmware, still in boot services */
-    efi_handle               image;     /* the loader's own image handle */
+    BOOT_PTR(struct efi_system_table *, system);   /* firmware, still in boot services */
+    BOOT_PTR(efi_handle, image);                   /* the loader's own image handle */
 
     uint64_t framebuffer;               /* physical address, already mapped */
     uint32_t width, height;
     uint32_t pitch;                     /* bytes from one scan line to the next */
     uint32_t pixel_format;              /* EFI_PIXEL_BGRX or EFI_PIXEL_RGBX */
 
-    struct efi_block_io *disk;          /* the partition holding the filesystem */
+    BOOT_PTR(struct efi_block_io *, disk);  /* the partition holding the filesystem */
     uint32_t             media_id;
     uint32_t             reserved;
 
@@ -59,7 +63,7 @@ struct boot_info {
     uint64_t e820;                      /* struct e820 entries */
     uint32_t e820_count;
     uint32_t bios_drive;
-    uint64_t bios_call;                 /* void (*)(void), SysV */
+    uint64_t bios_call;                 /* void (*)(void), the C convention */
     uint64_t bios_regs;                 /* struct bios_regs */
     uint64_t bios_buffer;               /* 64 KiB below 1 MiB, for INT 13h */
 };
@@ -76,3 +80,6 @@ struct bios_regs {
     uint16_t flags;                     /* back out: carry is bit 0 */
     uint8_t  vector;
 } __attribute__((packed));
+
+_Static_assert(__builtin_offsetof(struct boot_info, framebuffer) == 24, "boot_info");
+_Static_assert(__builtin_offsetof(struct boot_info, bios_buffer) == 128, "boot_info");

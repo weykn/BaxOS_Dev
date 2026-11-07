@@ -38,6 +38,7 @@ const char *efi_machine(unsigned which);
 /* RAM free right now, as the firmware's memory map has it, in KiB. Only
    while the firmware is still running; mem_free_kib knows which to ask. */
 uint64_t efi_free_kib(void);
+uint64_t efi_ram_top(void);       /* where the memory map's last memory ends */
 
 /* Lets the firmware go, as an operating system does once it is up: its
    drivers and everything it kept for itself become the kernel's memory. It

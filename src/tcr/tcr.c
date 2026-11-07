@@ -4,8 +4,65 @@
 
 /* ---- start-up and syscalls ----------------------------------------------- */
 
-/* Where the kernel starts a TEF64 program: argc, the arguments and the
+/* Where the kernel starts a TEF program: argc, the arguments and the
  * environment are on the stack the way they are for any Linux program. */
+#ifdef __i386__
+__asm__(
+    ".section .text._start,\"ax\"\n"
+    ".globl _start\n"
+    "_start:\n"
+    "    mov (%esp), %eax\n"
+    "    lea 4(%esp), %ecx\n"
+    "    lea 8(%esp,%eax,4), %edx\n"
+    "    and $-16, %esp\n"
+    "    sub $4, %esp\n"
+    "    push %edx\n"
+    "    push %ecx\n"
+    "    push %eax\n"
+    "    call main\n"
+    "    mov %eax, %ebx\n"
+    "    mov $252, %eax\n"
+    "    int $0x80\n"
+
+    ".section .text.sys,\"ax\"\n"
+    ".globl sys\n"
+    ".hidden sys\n"
+    "sys:\n"
+    "    push %ebx\n"
+    "    push %esi\n"
+    "    mov 12(%esp), %eax\n"
+    "    mov 16(%esp), %ebx\n"
+    "    mov 20(%esp), %ecx\n"
+    "    mov 24(%esp), %edx\n"
+    "    mov 28(%esp), %esi\n"
+    "    int $0x80\n"
+    "    pop %esi\n"
+    "    pop %ebx\n"
+    "    ret\n"
+
+    /* vfork itself, which takes nothing: the child runs first on this
+       stack, so the return address waits in a register. */
+    ".section .text.vfork,\"ax\"\n"
+    ".globl vfork\n"
+    ".hidden vfork\n"
+    "vfork:\n"
+    "    pop %edx\n"
+    "    mov $190, %eax\n"
+    "    int $0x80\n"
+    "    push %edx\n"
+    "    ret\n"
+
+    /* A handler without SA_SIGINFO returns through sigreturn, past the
+       signal number the frame holds. */
+    ".section .text.tcr_restorer,\"ax\"\n"
+    ".globl tcr_restorer\n"
+    ".hidden tcr_restorer\n"
+    "tcr_restorer:\n"
+    "    pop %eax\n"
+    "    mov $119, %eax\n"
+    "    int $0x80\n"
+);
+#else
 __asm__(
     ".section .text._start,\"ax\"\n"
     ".globl _start\n"
@@ -51,6 +108,7 @@ __asm__(
     "    mov $15, %eax\n"
     "    syscall\n"
 );
+#endif
 
 /* ---- strings --------------------------------------------------------------- */
 

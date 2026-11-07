@@ -405,13 +405,13 @@ static uint32_t in_size(const struct sock *k) {
 
 static void sock_free(struct sock *k) {
     if (k->in != NULL) {
-        mem_pages_free((uint64_t)k->in, in_size(k) / 4096);
+        mem_pages_free((uint64_t)(uintptr_t)k->in, in_size(k) / 4096);
     }
     if (k->out != NULL) {
-        mem_pages_free((uint64_t)k->out, SBUF / 4096);
+        mem_pages_free((uint64_t)(uintptr_t)k->out, SBUF / 4096);
     }
     if (k->errq != NULL) {
-        mem_pages_free((uint64_t)k->errq, 1);
+        mem_pages_free((uint64_t)(uintptr_t)k->errq, 1);
     }
     *k = (struct sock){ 0 };
 }
@@ -2806,6 +2806,6 @@ MODULE_EXPORT int module_exit(void) {
     }
     proc_remove(&net_cmd);
     net_register(NULL);
-    mem_pages_free((uint64_t)arp_buf, 1);
+    mem_pages_free((uint64_t)(uintptr_t)arp_buf, 1);
     return 0;
 }

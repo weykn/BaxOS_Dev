@@ -643,7 +643,7 @@ uint64_t sock_ioctl(struct handle *h, uint64_t request, uint64_t out) {
                 continue;
             }
             if (c->buf != 0) {
-                if ((n + 1) * sizeof *to > (uint32_t)c->len || !user_range((uint64_t)to, sizeof *to)) {
+                if ((n + 1) * sizeof *to > (uint32_t)c->len || !user_range((uint64_t)(uintptr_t)to, sizeof *to)) {
                     break;
                 }
                 memset(to, 0, sizeof *to);

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "fmt.h"
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -141,3 +143,7 @@ void kprintf(const char *fmt, ...);
 
 /* The same into buf, NUL-terminated. buf must be big enough. */
 void ksprintf(char *buf, const char *fmt, ...);
+
+/* Both are called with every argument a uint64_t (fmt.h). */
+#define kprintf(fmt, ...) kprintf(fmt __VA_OPT__(, FMT_ARGS(__VA_ARGS__)))
+#define ksprintf(buf, fmt, ...) ksprintf(buf, fmt __VA_OPT__(, FMT_ARGS(__VA_ARGS__)))

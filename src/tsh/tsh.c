@@ -308,7 +308,7 @@ static __attribute__((noreturn)) void login(char *boot) {
 }
 
 int main(int argc, char **argv, char **envp) {
-    struct { void *handler; unsigned long flags; void *restorer, *mask; } act = { 0 };
+    struct { void *handler; unsigned long flags; void *restorer; unsigned long long mask; } act = { 0 };
 
     for (; *envp != NULL; envp++) {
         env_set(*envp);
@@ -316,7 +316,7 @@ int main(int argc, char **argv, char **envp) {
     act.handler = on_signal;
     act.flags = 0x04000000;         /* SA_RESTORER */
     act.restorer = tcr_restorer;
-    sys(13, 2, (long)&act, 0, 8);   /* rt_sigaction(SIGINT) */
+    rt_sigaction(2, &act);          /* SIGINT */
 
     if (argv[0][0] == '-') {
         login(argc > 1 ? argv[1] : NULL);

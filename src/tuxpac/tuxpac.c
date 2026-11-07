@@ -1,4 +1,4 @@
-/* tuxpac: installs and manages Debian packages.
+/* tuxpac: installs and manages packages - Debian's, and Alpine's.
  *
  *   tuxpac -y              sync the package list
  *   tuxpac -s <pkg>...     install, with what they depend on
@@ -11,13 +11,22 @@
  *   tuxpac -q [text]       installed packages
  *   tuxpac -i <pkg>        about one
  *
- * /etc/tuxlet/mirror has a line per source, as sources.list has them
- * ("deb" in front or not): http://deb.debian.org/debian trixie main.
+ * The mirrors are /etc/tuxlet/<prio>.<backend>.mirror: 100.debian.mirror,
+ * 200.alpine.mirror. A package more than one has comes from the lowest
+ * prio, and within one file from the newest version. Each line is a source:
+ *
+ *     debian   http://deb.debian.org/debian trixie main    (as sources.list,
+ *                                                           "deb" or not)
+ *     alpine   http://dl-cdn.alpinelinux.org/alpine v3.22 main community
+ *
+ * "[arch=i386]" before the URL takes another architecture's packages -
+ * i386 or x86 for 32-bit ones; amd64 and x86_64 are the default, and on
+ * the 32-bit OS i386 and x86.
  * An https:// one is fetched by /usr/bin/curl, so it works once curl and
  * ca-certificates are installed - over http.
  *
  * Everything stays on the disk. -y streams each Packages.gz (or .xz, where
- * a suite has only that) into /var/lib/tuxpac/index, a line per package,
+ * a suite has only that), or APKINDEX.tar.gz, into /var/lib/tuxpac/index, a line per package,
  * of only what tuxpac reads; a lookup reads that through, and a dependency
  * tree is resolved a level a pass. /var/lib/tuxpac/installed has a line per package installed,
  * <name>.list beside it the paths it put there ('*' before a conffile).
@@ -27,13 +36,17 @@
  * before its files go in, postinst once a command has unpacked everything
  * it installs, and file and named triggers after that. /var/lib/dpkg/status
  * says what is installed, so dpkg-query and the scripts that ask it agree.
+ * An .apk is three gzip streams that read as one tar: its .pre-install,
+ * .post-install, .pre-deinstall and .post-deinstall are kept and run as
+ * preinst, postinst, prerm and postrm.
  *
  * Not done: versions in dependencies, signatures, zstd.
  * Documentation, man pages and translations are not unpacked. */
 
 #include "tuxpac.h"
 
-#define MIRROR  "/etc/tuxlet/mirror"
+#define ETC     "/etc/tuxlet"
+#define MIRROR  ETC "/<prio>.<backend>.mirror"
 #define LIB     "/var/lib/tuxpac"
 #define INFO    "/var/lib/dpkg/info"  /* each package's scripts, where dpkg keeps them */
 #define INDEX   LIB "/index"
@@ -50,7 +63,8 @@
 #define FBUF    65536               /* reading the disk, and downloads */
 #define NBUF    16384               /* the socket */
 #define LINE    5120                /* a line of the index */
-#define MIRRORS 8
+#define MIRRORS 16
+#define MFILES  16                  /* mirror files */
 #define PLAN    1024                /* packages one command installs */
 #define WANTS   2048                /* dependencies one round looks for */
 #define VER     40
@@ -342,22 +356,19 @@ static long write_file(const char *path, const void *d, uint32_t n) {
 
 /* ---- mirrors --------------------------------------------------------------- */
 
+enum { DEBIAN, ALPINE };
+
 static struct mirror {
-    char *url, *suite, *comps;
+    char    *url, *suite, *comps, *arch;
+    uint32_t prio;
+    uint8_t  kind;
 } mirrors[MIRRORS];
 static unsigned nmirrors;
 
-static bool load_mirrors(void) {
-    uint32_t size;
-    char *t = load(MIRROR, &size);
-
-    nmirrors = 0;
-    if (t == NULL) {
-        fail("tuxpac: no " MIRROR "\n");
-        return false;
-    }
+/* The lines of one mirror file, kind of backend and prio, into mirrors. */
+static void mirror_lines(char *t, uint8_t kind, uint32_t prio) {
     for (char *l = t; *l != '\0' && nmirrors < MIRRORS;) {
-        char *end = l + span(l, "\n"), *rest = l, *url;
+        char *end = l + span(l, "\n"), *rest = l, *url, *arch = NULL;
         bool last = *end == '\0';
 
         *end = '\0';
@@ -373,6 +384,11 @@ static bool load_mirrors(void) {
         if (strcmp(url, "deb") == 0) {
             url = str_word(&rest);
         }
+        if (memcmp_n(url, "[arch=", 6)) {
+            arch = url + 6;
+            arch[span(arch, "]")] = '\0';
+            url = str_word(&rest);
+        }
         if (*url != '\0' && *url != '#') {
             struct mirror *m = &mirrors[nmirrors];
             size_t n = strlen(url);
@@ -383,11 +399,69 @@ static bool load_mirrors(void) {
             m->url = url;
             m->suite = str_word(&rest);
             m->comps = *rest != '\0' && *rest != '#' ? rest : "main";
+            m->arch = arch != NULL ? arch : kind == ALPINE ? APK_ARCH : DEB_ARCH;
+            m->kind = kind;
+            m->prio = prio;
             if (*m->suite != '\0') {
                 nmirrors++;
             }
         }
         l = last ? end : end + 1;
+    }
+}
+
+/* Every <prio>.<backend>.mirror in /etc/tuxlet, lowest prio first. */
+static bool load_mirrors(void) {
+    static uint8_t dents[2048];
+    static char names[MFILES][64];
+    unsigned nfiles = 0;
+    long dir = sys_open(ETC, O_RDONLY | O_DIRECTORY, 0), got;
+
+    nmirrors = 0;
+    while (dir >= 0 && (got = sys_getdents((int)dir, dents, sizeof dents)) > 0) {
+        for (long at = 0; at < got; at += *(uint16_t *)(dents + at + 16)) {
+            const char *name = (const char *)dents + at + 19;
+            size_t n = strlen(name);
+
+            if (n > 7 && n < sizeof names[0] && strcmp(name + n - 7, ".mirror") == 0 &&
+                name[0] >= '0' && name[0] <= '9' && name[span(name, ".")] == '.' &&
+                nfiles < MFILES) {
+                strcpy(names[nfiles++], name);
+            }
+        }
+    }
+    if (dir >= 0) {
+        sys_close((int)dir);
+    }
+    for (unsigned i = 1; i < nfiles; i++) {         /* by prio, then name */
+        for (unsigned j = i; j > 0; j--) {
+            uint32_t a = number(names[j - 1]), b = number(names[j]);
+
+            if (a < b || (a == b && strcmp(names[j - 1], names[j]) <= 0)) {
+                break;
+            }
+            char t[sizeof names[0]];
+
+            memcpy(t, names[j], sizeof t);
+            memcpy(names[j], names[j - 1], sizeof t);
+            memcpy(names[j - 1], t, sizeof t);
+        }
+    }
+    for (unsigned i = 0; i < nfiles; i++) {
+        char *backend = names[i] + span(names[i], ".") + 1, file[96];
+        uint32_t size, n = span(backend, ".");
+        uint8_t kind = same(backend, n, "debian", 6) ? DEBIAN :
+                       same(backend, n, "alpine", 6) ? ALPINE : 255;
+        char *t;
+
+        if (kind == 255) {
+            fail("tuxpac: %s: unknown backend\n", names[i]);
+            continue;
+        }
+        format(file, ETC "/%s", names[i]);
+        if ((t = load(file, &size)) != NULL) {
+            mirror_lines(t, kind, number(names[i]));
+        }
     }
     if (nmirrors == 0) {
         fail("tuxpac: no mirror in " MIRROR "\n");
@@ -449,8 +523,9 @@ static void close_url(const char *url, struct source *s) {
 /* ---- -y: the package list -------------------------------------------------- */
 
 static char r_name[128], r_ver[128], r_file[256], r_size[16], r_isize[16];
-static char r_deps[3072], r_prov[1024], r_desc[160], r_ess[8];
+static char r_deps[3072], r_prov[1024], r_desc[160], r_ess[32];
 static unsigned   r_mirror;
+static bool       r_apk;            /* the list is an APKINDEX */
 static uint32_t   r_count, linelen, ixlen;
 static struct out ix;
 
@@ -515,7 +590,34 @@ static void deps_add(char *to, size_t cap, const char *v) {
     to[n] = '\0';
 }
 
+/* An Alpine list, "so:libc.musl-x86_64.so.1 cmd:sh=1.2 !foo", as deps_add
+   makes Debian's: "so:libc.musl-x86_64.so.1,cmd:sh"; conflicts left out. */
+static void apk_list(char *to, size_t cap, char *v) {
+    size_t n = strlen(to);
+
+    for (char *word = str_word(&v); *word != '\0'; word = str_word(&v)) {
+        uint32_t k = span(word, "<>=~");
+
+        if (*word == '!' || k == 0 || n + k + 2 >= cap) {
+            continue;
+        }
+        if (n > 0) {
+            to[n++] = ',';
+        }
+        memcpy(to + n, word, k);
+        n += k;
+    }
+    to[n] = '\0';
+}
+
 static void record_end(void) {
+    if (r_apk && r_name[0] != '\0' && r_ver[0] != '\0') {
+        const struct mirror *m = &mirrors[r_mirror];
+
+        if (strlen(m->suite) + strlen(r_name) + strlen(r_ver) + 64 < sizeof r_file) {
+            format(r_file, "%s/%s/%s/%s-%s.apk", m->suite, r_ess, m->arch, r_name, r_ver);
+        }
+    }
     if (r_name[0] != '\0' && r_file[0] != '\0') {
         char m[2] = { (char)('0' + r_mirror), '\0' };
         const char *f[FIELDS] = { r_name, r_ver, m, r_size, r_isize, r_file, r_deps, r_prov, r_desc,
@@ -528,7 +630,10 @@ static void record_end(void) {
         r_count++;
     }
     r_name[0] = r_ver[0] = r_file[0] = r_size[0] = r_isize[0] = '\0';
-    r_deps[0] = r_prov[0] = r_desc[0] = r_ess[0] = '\0';
+    r_deps[0] = r_prov[0] = r_desc[0] = '\0';
+    if (!r_apk) {
+        r_ess[0] = '\0';
+    }
 }
 
 static const char *field(const char *l, const char *name) {
@@ -542,6 +647,22 @@ static void record_line(void) {
 
     if (linelen == 0) {
         record_end();
+    } else if (r_apk) {
+        /* An APKINDEX: a letter and a colon for each field. */
+        char *a = line + 2;
+
+        if (line[1] != ':') {
+            return;
+        }
+        switch (line[0]) {
+        case 'P': take(r_name, sizeof r_name, a); break;
+        case 'V': take(r_ver, sizeof r_ver, a); break;
+        case 'S': take(r_size, sizeof r_size, a); break;
+        case 'I': format(r_isize, "%u", (number(a) + 1023) / 1024); break;
+        case 'T': take(r_desc, sizeof r_desc, a); break;
+        case 'D': apk_list(r_deps, sizeof r_deps, a); break;
+        case 'p': apk_list(r_prov, sizeof r_prov, a); break;
+        }
     } else if (line[0] == ' ') {
         /* the rest of a description */
     } else if ((v = field(line, "Package:")) != NULL) {
@@ -563,6 +684,51 @@ static void record_line(void) {
     } else if ((v = field(line, "Essential:")) != NULL) {
         take(r_ess, sizeof r_ess, v);
     }
+}
+
+/* An APKINDEX.tar.gz unpacked: a tar - the signature's, then the index's -
+   of which only the member named APKINDEX is the list. */
+static struct {
+    uint8_t  hdr[512];
+    uint32_t hlen, pad;
+    uint64_t left;
+    bool     want;
+} apkix;
+
+static bool index_sink(const uint8_t *d, uint32_t n);
+
+static bool apkix_sink(const uint8_t *d, uint32_t n) {
+    while (n > 0) {
+        uint32_t k;
+
+        if (apkix.left > 0) {
+            k = apkix.left < n ? (uint32_t)apkix.left : n;
+            if (apkix.want && !index_sink(d, k)) {
+                return false;
+            }
+            apkix.left -= k;
+        } else if (apkix.pad > 0) {
+            k = apkix.pad < n ? apkix.pad : n;
+            apkix.pad -= k;
+        } else {
+            k = 512 - apkix.hlen < n ? 512 - apkix.hlen : n;
+            memcpy(apkix.hdr + apkix.hlen, d, k);
+            if ((apkix.hlen += k) == 512) {
+                uint64_t size = 0;
+
+                apkix.hlen = 0;
+                for (unsigned i = 124; i < 136 && apkix.hdr[i] >= '0' && apkix.hdr[i] <= '7'; i++) {
+                    size = size * 8 + (apkix.hdr[i] - '0');
+                }
+                apkix.left = size;
+                apkix.pad = (uint32_t)((512 - size % 512) % 512);
+                apkix.want = strcmp((const char *)apkix.hdr, "APKINDEX") == 0;
+            }
+        }
+        d += k;
+        n -= k;
+    }
+    return true;
 }
 
 static bool index_sink(const uint8_t *d, uint32_t n) {
@@ -598,16 +764,22 @@ static void sync(void) {
         }
         strcpy(comps, mirrors[m].comps);
         for (c = str_word(&rest); *c != '\0' && *c != '#' && ok; c = str_word(&rest)) {
-            if (strlen(mirrors[m].url) + strlen(mirrors[m].suite) + strlen(c) + 48 > sizeof url) {
+            const struct mirror *mm = &mirrors[m];
+            bool apk = mm->kind == ALPINE, gz, xz = false;
+
+            if (strlen(mm->url) + strlen(mm->suite) + strlen(c) + strlen(mm->arch) + 48 > sizeof url) {
                 fail("tuxpac: " MIRROR ": line too long\n");
                 ok = false;
                 break;
             }
             /* .gz if there is one: its window is 32 KiB, xz's megabytes. */
-            format(url, "%s/dists/%s/%s/binary-amd64/Packages.gz", mirrors[m].url, mirrors[m].suite, c);
-            bool gz = open_url(url, &nsrc), xz = false;
-
-            if (!gz && http_status == 404) {
+            if (apk) {
+                format(url, "%s/%s/%s/%s/APKINDEX.tar.gz", mm->url, mm->suite, c, mm->arch);
+            } else {
+                format(url, "%s/dists/%s/%s/binary-%s/Packages.gz", mm->url, mm->suite, c, mm->arch);
+            }
+            gz = open_url(url, &nsrc);
+            if (!gz && !apk && http_status == 404) {
                 url[strlen(url) - 2] = 'x';             /* Packages.xz */
                 xz = open_url(url, &nsrc);
             }
@@ -620,8 +792,15 @@ static void sync(void) {
             }
             r_mirror = m;
             r_count = linelen = 0;
+            r_apk = false;
             record_end();
-            ok = gz ? gunzip(&nsrc, index_sink) : unxz(&nsrc, 0, index_sink);
+            r_apk = apk;
+            if (apk) {
+                take(r_ess, sizeof r_ess, c);       /* the repository, for its files' paths */
+                apkix.hlen = apkix.pad = 0;
+                apkix.left = 0;
+            }
+            ok = !gz ? unxz(&nsrc, 0, index_sink) : gunzip(&nsrc, apk ? apkix_sink : index_sink);
             close_url(url, &nsrc);
             line[linelen] = '\0';
             record_line();
@@ -631,6 +810,9 @@ static void sync(void) {
             }
             if (ok) {
                 print("%s/%s %u\n", mirrors[m].suite, c, r_count);
+            }
+            if (apk) {
+                r_ess[0] = '\0';
             }
         }
     }
@@ -834,6 +1016,7 @@ enum { DEP, TARGET, UPGRADE };
 struct want {
     uint16_t at, len;
     uint8_t  rank, kind;
+    uint32_t prio;                  /* of the mirror the line at off is from */
     uint32_t off;
     char     ver[VER];              /* of the line at off */
 };
@@ -872,7 +1055,7 @@ static bool want(const char *g, uint32_t n, uint8_t kind) {
         return false;
     }
     memcpy(w->wtext + wused, g, n);
-    w->wants[nwants++] = (struct want){ (uint16_t)wused, (uint16_t)n, NONE, kind, 0, "" };
+    w->wants[nwants++] = (struct want){ (uint16_t)wused, (uint16_t)n, NONE, kind, 0, 0, "" };
     wused += n;
     return true;
 }
@@ -898,14 +1081,28 @@ static bool satisfied(const char *g, uint32_t n) {
     return false;
 }
 
-/* Line l answers x at rank r: taken if that is better, or as good and a
-   newer version - the same package in two suites. */
+/* The prio of the mirror line l of the index is from. */
+static uint32_t prio_of(const char *l) {
+    unsigned m;
+
+    l += span(l, "\t");
+    l += *l == '\t';
+    l += span(l, "\t");
+    m = (unsigned)(l[*l == '\t'] - '0');
+    return m < nmirrors ? mirrors[m].prio : (uint32_t)-1;
+}
+
+/* Line l answers x at rank r: taken if that is better, or as good from a
+   mirror of a lower prio, or of the same and a newer version - the same
+   package in two suites. */
 static bool better(struct want *x, unsigned r, uint32_t at, const char *l) {
     char ver[VER];
+    uint32_t p = prio_of(l);
 
     version_of(l, ver);
-    if (r < x->rank || vcmp(ver, x->ver) > 0) {
+    if (r < x->rank || p < x->prio || (p == x->prio && vcmp(ver, x->ver) > 0)) {
         x->rank = (uint8_t)r;
+        x->prio = p;
         x->off = at;
         strcpy(x->ver, ver);
     }
@@ -1038,6 +1235,7 @@ static struct {
     int      fd;                    /* the file being written */
     uint64_t left;
     uint8_t  kind, mode;
+    bool     apk;                   /* an Alpine package: its control files start with a dot */
     bool     first, has_name, has_link;     /* first: the file's data starts next */
     char     longname[256], longlink[256];
 } tar;
@@ -1203,7 +1401,23 @@ static void tar_entry(void) {
     tar.has_name = tar.has_link = false;
     absolute(name, path);
 
-    if (tar.mode == CONTROL) {
+    bool control = tar.mode == CONTROL;
+
+    if (tar.apk && path[1] == '.' && strchr(path + 1, '/') == NULL) {
+        /* .PKGINFO, .SIGN.*, the scripts: kept under dpkg's names or not at all. */
+        static const char *const apk_scripts[][2] = {
+            { "/.pre-install", "/preinst" }, { "/.post-install", "/postinst" },
+            { "/.pre-deinstall", "/prerm" }, { "/.post-deinstall", "/postrm" },
+        };
+        const char *as = "/";
+
+        for (unsigned i = 0; i < 4; i++) {
+            as = strcmp(path, apk_scripts[i][0]) == 0 ? apk_scripts[i][1] : as;
+        }
+        strcpy(path, as);
+        control = true;
+    }
+    if (control) {
         if (strcmp(path, "/conffiles") == 0) {
             tar.kind = K_CONF;
             return;
@@ -1389,7 +1603,7 @@ static void elf_needed(const char *file) {
 
 static bool lib_present(const char *so) {
     static const char *const dirs[] = {
-        "/usr/lib/x86_64-linux-gnu", "/lib/x86_64-linux-gnu", "/usr/lib", "/lib",
+        "/usr/lib/" LIB_TRIPLE, "/lib/" LIB_TRIPLE, "/usr/lib", "/lib",
     };
     char at[PATH];
     struct stat st;
@@ -1433,7 +1647,7 @@ static bool tar_sink(const uint8_t *d, uint32_t n) {
         if (tar.left > 0) {
             k = tar.left < n ? (uint32_t)tar.left : n;
             if (tar.kind == K_FILE && tar.fd >= 0) {
-                if (tar.first && k >= 4 && memcmp_n((const char *)d, "\177ELF", 4)) {
+                if (tar.first && !tar.apk && k >= 4 && memcmp_n((const char *)d, "\177ELF", 4)) {
                     elf_add(path);  /* a program or a library: what it links to is checked */
                 }
                 tar.first = false;
@@ -1687,7 +1901,7 @@ static bool run_script(const char *pkg, const char *script, const char *a1, cons
                        const char *a3) {
     static char sp[PATH], ev_pkg[160], ev_name[48];
     const char *argv[] = { sp, a1, a2, a3, NULL };
-    const char *env[] = { ev_pkg, ev_name, "DPKG_MAINTSCRIPT_ARCH=amd64", "DPKG_ROOT=",
+    const char *env[] = { ev_pkg, ev_name, "DPKG_MAINTSCRIPT_ARCH=" DEB_ARCH, "DPKG_ROOT=",
                           "DPKG_ADMINDIR=/var/lib/dpkg", "DPKG_RUNNING_VERSION=1.22.21",
                           "DEBIAN_FRONTEND=noninteractive", NULL };
     int code;
@@ -1753,7 +1967,7 @@ static void status_write(void) {
             continue;
         }
         format(tmp, "Package: %s\nStatus: install ok installed\nPriority: optional\n"
-                    "Section: misc\nMaintainer: tuxpac\nArchitecture: amd64\nVersion: %s\n"
+                    "Section: misc\nMaintainer: tuxpac\nArchitecture: " DEB_ARCH "\nVersion: %s\n"
                     "Description: installed by tuxpac\n\n", db[i].name, db[i].ver);
         out_put(&o, tmp, (uint32_t)strlen(tmp));
     }
@@ -1790,22 +2004,34 @@ static bool unpack(const char *pkg) {
     return true;
 }
 
-/* The control and data members of the package, unpacked. */
+/* The control and data members of the package, unpacked. An .apk is gzip
+   from the start, a tar whose control files come first. */
 static bool unpack_members(const char *pkg, char *h, char *member) {
     uint32_t failed = 0;
 
     if ((deb = open_read(DEB, &deb_size)) < 0) {
         return false;
     }
+    conf_len = post_len = list_len = 0;
+    post[0] = '\0';
+    conf[0] = '\0';
+    unpacking = pkg;
+    src_file(&fsrc, deb, 0, deb_size);
+    if (src_read(&fsrc, h, 2) && h[0] == 0x1F && (uint8_t)h[1] == 0x8B) {
+        scripts_drop(pkg);
+        tar = (__typeof__(tar)){ .mode = DATA, .apk = true };
+        src_file(&fsrc, deb, 0, deb_size);
+        if (!gunzip(&fsrc, tar_sink)) {
+            fail("tuxpac: %s: damaged\n", pkg);
+            return false;
+        }
+        return true;
+    }
     src_file(&fsrc, deb, 0, deb_size);
     if (!src_read(&fsrc, h, 8) || !memcmp_n(h, "!<arch>\n", 8)) {
         fail("tuxpac: %s: not a package\n", pkg);
         return false;
     }
-    conf_len = post_len = list_len = 0;
-    post[0] = '\0';
-    conf[0] = '\0';
-    unpacking = pkg;
     scripts_drop(pkg);              /* an upgrade's are the new version's */
 
     for (uint32_t at = 8; at + 60 <= deb_size;) {
@@ -1922,7 +2148,7 @@ static bool install(uint32_t off, char flag) {
     split(read_line(off, tmp), f, FIELDS);
     m = (unsigned)(f[F_MIRROR][0] - '0');
     if (m >= nmirrors) {
-        fail("tuxpac: " MIRROR " changed, run tuxpac -y\n");
+        fail("tuxpac: the mirrors changed, run tuxpac -y\n");
         return false;
     }
     if (strlen(mirrors[m].url) + strlen(f[F_FILE]) + 2 > sizeof url) {

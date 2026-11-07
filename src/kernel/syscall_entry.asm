@@ -6,10 +6,10 @@ BITS 64
 DEFAULT REL
 
 SECTION .text
-GLOBAL user_enter, user_resume, user_exit, syscall_entry, trap_stubs, page_fault_entry
+GLOBAL user_enter, user_resume, user_exit, syscall_entry, trap_stubs, page_fault_entry, int80_entry
 GLOBAL user_frame, user_cs, user_ss, user_flags, thread_switch
 GLOBAL tick_entry, stray_entry, full_return, full_rcx, full_r11
-EXTERN syscall_dispatch, page_fault, trap_signal, tss, process_exit
+EXTERN syscall_dispatch, page_fault, trap_signal, tss, process_exit, ia32_dispatch
 
 ; A program's RFLAGS, in user_flags below: the always-one bit, and IF while
 ; the firmware is running. Interrupts have to stay on in ring 3 then: the
@@ -57,6 +57,9 @@ user_enter:
     sub rsp, 8                          ; syscall_entry wants RSP0 8 off 16
     mov [kernel_rsp], rsp
 
+    mov ecx, [user_ss]                  ; DS and ES too: a 32-bit program
+    mov ds, ecx                         ; reads through them
+    mov es, ecx
     push qword [user_ss]                ; the frame IRETQ returns through
     push rsi                            ; the program's stack
     push qword [user_flags]
@@ -100,6 +103,9 @@ user_resume:
     mov [kernel_rsp], rsp
     mov r15, rdi                        ; the frame, while the registers load
     mov rax, rsi                        ; what the syscall gives back
+    mov ecx, [user_ss]
+    mov ds, ecx
+    mov es, ecx
 
     push qword [user_ss]                ; the frame IRETQ returns through
     push qword [r15 + 16*8]             ; the program's own stack
@@ -240,6 +246,69 @@ syscall_entry:
     mov byte [full_return], 0
     mov rcx, [full_rcx]
     mov r11, [full_r11]
+    iretq
+
+;; A 32-bit program's syscall: int 0x80, i386's way, with the number in EAX
+; and the arguments in EBX, ECX, EDX, ESI, EDI and EBP. The frame is the
+; one syscall_entry makes - struct user_regs - so fork, signals and execve
+; find everything where they look for it, except that the program's ECX,
+; which i386 keeps across a call, has the slot that is padding there.
+; ia32_dispatch reads the call out of it and answers in RAX; everything
+; else goes back as it was, or as a signal or execve left it.
+int80_entry:
+    push qword [rsp + 24]               ; its stack, out of the processor's frame
+    push qword [rsp + 8]                ; where it was
+    push qword [rsp + 32]               ; its flags
+    push rdi
+    push rsi
+    push rdx
+    push r8
+    push r9
+    push r10
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    push rcx                            ; the padding slot
+    push rax
+    mov [user_frame], rsp
+    cld
+    call ia32_dispatch
+    add rsp, 8
+    pop rcx
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    pop r10
+    pop r9
+    pop r8
+    pop rdx
+    pop rsi
+    pop rdi
+    ; Its flags, where it was and its stack are left, and above them the
+    ; processor's frame, which is rewritten from them: execve or a signal
+    ; may have moved it anywhere, even into a 64-bit program.
+    mov r11, [rsp + 8]
+    mov [rsp + 24], r11
+    mov r11, [user_cs]
+    mov [rsp + 32], r11
+    mov r11, [rsp]
+    and r11, -0x201
+    or r11, [user_flags]
+    mov [rsp + 40], r11
+    mov r11, [rsp + 16]
+    mov [rsp + 48], r11
+    mov r11, [user_ss]
+    mov [rsp + 56], r11
+    mov ds, r11d
+    mov es, r11d
+    xor r11d, r11d
+    add rsp, 24
     iretq
 
 ; Every CPU exception but the page fault lands here: one stub per vector, all
